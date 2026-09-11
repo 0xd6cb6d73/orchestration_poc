@@ -5,6 +5,7 @@
   const initialNode = document.getElementById("initial-status");
   const connection = document.getElementById("connection-state");
   let timer = null;
+  let refreshInFlight = false;
 
   const element = (tag, className, text) => {
     const node = document.createElement(tag);
@@ -331,10 +332,15 @@
   };
 
   const refresh = async () => {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 5000);
     try {
       const response = await fetch(`/runs/${encodeURIComponent(runId)}`, {
         headers: { Accept: "application/json" },
         cache: "no-store",
+        signal: controller.signal,
       });
       if (!response.ok) throw new Error(`status ${response.status}`);
       connection.innerHTML = "<span class=\"live-dot\"></span> live";
@@ -343,6 +349,9 @@
     } catch (_error) {
       connection.classList.add("is-stale");
       connection.innerHTML = "<span class=\"live-dot\"></span> reconnecting";
+    } finally {
+      window.clearTimeout(timeout);
+      refreshInFlight = false;
     }
   };
 

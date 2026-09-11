@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from poc.execution.workflow_compiler import WorkflowCompiler, WorkflowGraph
+from poc.execution.workflow_compiler import WorkflowCompiler, WorkflowGraph, WorkflowState
 from poc.models import WorkflowSpec
 from poc.persistence.database import Database
 
@@ -25,9 +26,27 @@ class WorkflowRunner:
         self.checkpointer.setup()
         self._locks: dict[str, asyncio.Lock] = {}
         self._graphs: dict[tuple[str, int], WorkflowGraph] = {}
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="workflow-runner")
 
     def close(self) -> None:
+        self._executor.shutdown(wait=True)
         self.checkpoint_connection.close()
+
+    async def _invoke(
+        self,
+        graph: WorkflowGraph,
+        invocation: WorkflowState | Command[Any] | None,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(self._executor, graph.invoke, invocation, config)
+        try:
+            while not future.done():
+                await asyncio.sleep(0.05)
+            return future.result()
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
 
     async def start(self, spec: WorkflowSpec) -> dict[str, Any]:
         thread_id = f"{spec.run_id}:{spec.workflow_id}:r{spec.revision}"
@@ -62,7 +81,7 @@ class WorkflowRunner:
         else:
             invocation = {"run_id": spec.run_id, "results": {}}
         async with self._locks.setdefault(thread_id, asyncio.Lock()):
-            result = graph.invoke(invocation, config)
+            result = await self._invoke(graph, invocation, config)
         if result.get("__interrupt__"):
             self.db.update_workflow(spec.workflow_id, spec.revision, "paused")
         else:
@@ -84,7 +103,7 @@ class WorkflowRunner:
         }
         self.db.update_workflow(spec.workflow_id, spec.revision, "resumed")
         async with self._locks.setdefault(thread_id, asyncio.Lock()):
-            result = graph.invoke(Command(resume=resolution), config)
+            result = await self._invoke(graph, Command(resume=resolution), config)
         if result.get("__interrupt__"):
             self.db.update_workflow(spec.workflow_id, spec.revision, "paused")
         else:

@@ -83,9 +83,10 @@ async def test_web_ui_drives_run_and_exposes_agent_relationships(tmp_path: Path)
         proposed = await client.get(run_url)
         assert proposed.status_code == 200
         assert "Review and approve the plan" in proposed.text
-        assert (
-            "Agents appear after the plan is approved" in (await client.get("/static/run.js")).text
-        )
+        run_script = (await client.get("/static/run.js")).text
+        assert "Agents appear after the plan is approved" in run_script
+        assert "AbortController" in run_script
+        assert "refreshInFlight" in run_script
 
         approved = await client.post(
             f"/ui/runs/{run_id}/approval",
