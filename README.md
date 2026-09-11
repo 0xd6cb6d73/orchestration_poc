@@ -177,6 +177,54 @@ providers on each role (`provider` and `model`) and install the corresponding
 Pydantic AI provider extra, or inject a `PydanticModelFactory` into `Runtime`. Tests
 inject Pydantic AI's `FunctionModel`, so they remain offline and deterministic.
 
+## Agent evaluations
+
+The `poc.evaluation` package uses Pydantic Evals to run repeatable agent experiments
+through the same orchestration boundary as production. An evaluation variant can
+change the agent backend, provider/model, system prompt, per-role allowed tools, and
+execution limits without changing a golden dataset. The standard evaluators grade:
+
+- successful outcome and expected result fields;
+- required and forbidden tool use;
+- tool argument fragments; and
+- tool success and maximum tool-call budgets.
+
+Reports include the effective provider, model, allowed tools, and a SHA-256 prompt
+fingerprint for each case. Prompt text itself is not persisted in reports.
+
+Run the built-in offline baseline and save its full report:
+
+```bash
+uv run hierarchical-ooda-eval \
+  --backend custom_python \
+  --name custom-baseline \
+  --report eval-reports/custom-baseline.json
+```
+
+The deterministic `custom_python` backend is useful as an infrastructure baseline.
+Prompt and provider/model experiments should use `pydantic_ai` (or another executor
+that consumes those `RoleSpec` fields).
+
+Evaluate a Pydantic AI prompt/model variant and compare it with a previous report:
+
+```bash
+uv run hierarchical-ooda-eval \
+  --backend pydantic_ai \
+  --provider openai \
+  --model your-model-name \
+  --prompt-file prompts/manifest-worker.txt \
+  --tools manifest_reader=read_manifest \
+  --name manifest-prompt-v2 \
+  --baseline eval-reports/manifest-prompt-v1.json \
+  --report eval-reports/manifest-prompt-v2.json
+```
+
+Install the provider extra required by the selected Pydantic AI model. The command
+returns a non-zero exit status if a case, evaluator, or assertion fails, making it
+suitable for CI quality gates. Use `--repeat` to measure nondeterministic variants.
+New typed datasets and custom evaluators can be supplied programmatically through
+`create_agent_dataset` or registered with `AgentEvaluationDatasetRegistry`.
+
 The PoC intentionally excludes live infrastructure access, arbitrary code execution,
 distributed queues, and hot graph mutation. Swarm coordination is implemented and
 tested in-process; worker process materialization remains a trusted runtime concern.

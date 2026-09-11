@@ -12,12 +12,14 @@ dependencies = [
   "opentelemetry-sdk==1.36.0",
   "pydantic==2.12.5",
   "pydantic-ai-slim==2.36.0",
+  "pydantic-evals==2.36.0",
   "python-multipart==0.0.20",
   "uvicorn==0.35.0",
 ]
 
 [project.scripts]
 hierarchical-ooda-poc = "poc.__main__:main"
+hierarchical-ooda-eval = "poc.evaluation.cli:main"
 
 [project.optional-dependencies]
 telemetry = [
