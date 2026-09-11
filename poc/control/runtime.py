@@ -16,6 +16,7 @@ from poc.execution.hierarchical_strategy import HierarchicalDAGStrategy
 from poc.execution.managed_pool import ManagedPoolStrategy
 from poc.execution.ooda_graph import OODAHarness
 from poc.execution.pydantic_ai_executor import PydanticAIAgentExecutor, PydanticModelFactory
+from poc.execution.semantic_pydantic_ai_executor import SemanticPydanticAIAgentExecutor
 from poc.execution.speculative import SpeculativeStrategy
 from poc.execution.strategy import ExecutionCoordinator, StrategyRegistry
 from poc.execution.worker_adapter import WorkerAdapter
@@ -64,6 +65,7 @@ class Runtime:
         *,
         roles: RoleRegistry | None = None,
         pydantic_model_factory: PydanticModelFactory | None = None,
+        semantic_pydantic_model_factory: PydanticModelFactory | None = None,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +95,16 @@ class Runtime:
                 self.tools,
                 self.artifacts,
                 pydantic_model_factory,
+            )
+        )
+        self.agent_executors.register(
+            SemanticPydanticAIAgentExecutor(
+                self.db,
+                self.roles,
+                self.tools,
+                self.artifacts,
+                pydantic_model_factory,
+                semantic_model_factory=semantic_pydantic_model_factory,
             )
         )
         self.policy_resolver = SwarmPolicyResolver()

@@ -14,7 +14,7 @@ from poc.evaluation.benchmark_models import (
     OrchestrationBenchmarkReport,
     OrchestrationBenchmarkVariant,
 )
-from poc.models import AgentBackend, ExecutionMode, SwarmStrategy
+from poc.models import AgentBackend, ExecutionMode, SwarmStrategy, is_pydantic_ai_backend
 
 _API_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -92,12 +92,12 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     provider = args.provider
     if provider is None and args.model and ":" in args.model:
         provider = args.model.split(":", 1)[0]
-    if args.backend == AgentBackend.PYDANTIC_AI:
+    if is_pydantic_ai_backend(args.backend):
         if args.model is None:
-            parser.error("the pydantic_ai backend requires --model")
+            parser.error(f"the {args.backend} backend requires --model")
         if provider is None:
             parser.error(
-                "the pydantic_ai backend requires --provider or a provider:model identifier"
+                f"the {args.backend} backend requires --provider or a provider:model identifier"
             )
         _check_provider_environment(parser, provider)
     try:

@@ -9,7 +9,7 @@
   const fields = document.querySelectorAll("[data-model-field]");
 
   const syncModelFields = () => {
-    const usesPydanticAI = backend.value === "pydantic_ai";
+    const usesPydanticAI = ["pydantic_ai", "semantic_pydantic_ai"].includes(backend.value);
     const usesExternalModel = backend.value !== "custom_python";
     fields.forEach((field) => field.classList.toggle("is-disabled", !usesExternalModel));
     provider.disabled = !usesExternalModel;

@@ -27,7 +27,8 @@ workflow progress, artifacts, and durable trajectory. The JSON API remains avail
 at <http://localhost:8000/docs>.
 
 The launch form selects the worker runtime and orchestration mode for the run. When
-`pydantic_ai` is selected, it also requires the provider and model identifier. That
+`pydantic_ai` or `semantic_pydantic_ai` is selected, it also requires the provider
+and model identifier. That
 configuration is stored in the immutable mission plan, submitted to each domain's
 execution strategy, propagated to every generated task, and shown on the run page.
 The built-in `custom_python` runtime always uses the offline deterministic fixture
@@ -267,6 +268,20 @@ event journal. Per-run `agent_runtime.options` are passed to Pydantic AI as mode
 settings, so values such as `temperature` are configurable independently of the
 orchestration mode. Tests inject Pydantic AI's `FunctionModel`, so they remain
 offline and deterministic.
+
+The `semantic_pydantic_ai` subtype runs the same typed Pydantic AI worker and tool
+boundary, then validates the result before creating its output artifact. It first
+checks deterministic protocol invariants such as assigned hypothesis identity,
+arithmetic consistency, record counts, and exact publication metadata. A second,
+tool-free Pydantic AI invocation independently assesses every acceptance criterion,
+internal consistency, evidence sufficiency, and schema-specific semantic criteria.
+The executor derives acceptance from the structured assessment; the reviewer does
+not return the worker's final status directly. On rejection, the executor sends the
+validation issues back to the same worker with its original conversation history and
+asks for a complete corrected output. One semantic revision is allowed by default;
+roles can override `max_semantic_revisions`. Each rejection is recorded as
+`agent.semantic_validation_completed`, each retry as `agent.output_revision_requested`,
+and a repeatedly invalid result returns a failed `WorkerResult`.
 
 ## Agent evaluations
 

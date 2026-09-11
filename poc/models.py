@@ -61,6 +61,14 @@ class AgentBackend(StrEnum):
 
     CUSTOM_PYTHON = "custom_python"
     PYDANTIC_AI = "pydantic_ai"
+    SEMANTIC_PYDANTIC_AI = "semantic_pydantic_ai"
+
+
+def is_pydantic_ai_backend(backend: str) -> bool:
+    return backend in {
+        AgentBackend.PYDANTIC_AI,
+        AgentBackend.SEMANTIC_PYDANTIC_AI,
+    }
 
 
 class SwarmStrategy(StrEnum):
@@ -117,15 +125,15 @@ class AgentRuntimeConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_pydantic_ai_model(self) -> AgentRuntimeConfig:
-        if self.backend != AgentBackend.PYDANTIC_AI:
+        if not is_pydantic_ai_backend(self.backend):
             return self
         provider_from_model = (
             self.model.split(":", 1)[0] if self.model and ":" in self.model else None
         )
         if self.model is None:
-            raise ValueError("pydantic_ai requires a model")
+            raise ValueError(f"{self.backend} requires a model")
         if self.provider is None and provider_from_model is None:
-            raise ValueError("pydantic_ai requires a provider or provider:model identifier")
+            raise ValueError(f"{self.backend} requires a provider or provider:model identifier")
         return self
 
 

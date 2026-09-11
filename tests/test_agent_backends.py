@@ -1,7 +1,9 @@
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
-from pydantic_ai import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai import ModelMessage, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from poc.control.runtime import Runtime
@@ -11,6 +13,7 @@ from poc.execution.pydantic_ai_executor import model_from_role
 from poc.execution.workflow_compiler import WorkflowBindingError
 from poc.models import (
     AgentBackend,
+    AgentRuntimeConfig,
     ApprovalRequest,
     ExecutionMode,
     ExecutionPolicy,
@@ -79,6 +82,77 @@ def _output_model(*outputs: dict[str, object]) -> FunctionModel:
     return FunctionModel(respond)
 
 
+def _publishing_output_model(content: Mapping[str, Any]) -> FunctionModel:
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_returns = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "execute_allowed_tool"
+        ]
+        if not tool_returns:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "execute_allowed_tool",
+                        {
+                            "tool_name": "write_artifact",
+                            "arguments": {
+                                "content": content,
+                                "media_type": "application/json",
+                            },
+                        },
+                    )
+                ]
+            )
+        publication = cast(dict[str, object], tool_returns[-1].content)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "result": {"content": content, "published": publication},
+                        "completion_summary": "Produced a candidate assessment.",
+                    },
+                )
+            ]
+        )
+
+    return FunctionModel(respond)
+
+
+def _semantic_review_model(
+    criteria: list[str],
+    *,
+    internally_consistent: bool = True,
+    contradictions: list[str] | None = None,
+) -> FunctionModel:
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "internally_consistent": internally_consistent,
+                        "criteria": [
+                            {
+                                "criterion": criterion,
+                                "status": "satisfied",
+                                "evidence_refs": [],
+                                "rationale": "The supplied result and evidence satisfy it.",
+                            }
+                            for criterion in criteria
+                        ],
+                        "contradictions": contradictions or [],
+                    },
+                )
+            ]
+        )
+
+    return FunctionModel(respond)
+
+
 def test_executor_registry_accepts_extension_backend_ids() -> None:
     registry = AgentExecutorRegistry()
 
@@ -100,6 +174,18 @@ def test_openai_compatible_model_suffix_is_not_treated_as_provider_prefix() -> N
 
     prefixed = role.model_copy(update={"model": "openai:google/gemma-4-26b-a4b-it:free"})
     assert model_from_role(prefixed) == "openai:google/gemma-4-26b-a4b-it:free"
+
+
+def test_semantic_pydantic_backend_requires_model_configuration() -> None:
+    with pytest.raises(ValueError, match="semantic_pydantic_ai requires a model"):
+        AgentRuntimeConfig(backend=AgentBackend.SEMANTIC_PYDANTIC_AI)
+
+    configured = AgentRuntimeConfig(
+        backend=AgentBackend.SEMANTIC_PYDANTIC_AI,
+        provider="openai",
+        model="gpt-5",
+    )
+    assert configured.backend == AgentBackend.SEMANTIC_PYDANTIC_AI
 
 
 @pytest.mark.asyncio
@@ -619,5 +705,370 @@ async def test_workflow_rejects_binding_missing_from_output_contract(tmp_path: P
 
         with pytest.raises(WorkflowBindingError, match="missing_window"):
             await runtime.runner.start(workflow)
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_pydantic_backend_accepts_independently_reviewed_result(
+    tmp_path: Path,
+) -> None:
+    criterion = "timezone statement is explicit"
+    runtime = Runtime(
+        tmp_path / "semantic-valid",
+        pydantic_model_factory=lambda role: _output_model(
+            {
+                "fact": "timezone-less fixture timestamps are UTC",
+                "manifest": {
+                    "fixture": "incident_example",
+                    "timestamp_timezone": "UTC",
+                    "note": "Fixture timestamps are UTC.",
+                },
+            }
+        ),
+        semantic_pydantic_model_factory=lambda role: _semantic_review_model([criterion]),
+    )
+    try:
+        run, _ = runtime.create_run(RunCreate())
+        plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
+        main = runtime.db.get_agent(run["main_agent_id"])
+        assert main is not None
+        supervisor = runtime.spawns.spawn(
+            run_id=run["run_id"],
+            parent=main,
+            child_role="metrics_supervisor",
+            plan_version=plan.version,
+            stable_key="semantic-valid-supervisor",
+        )
+        workflow = WorkflowSpec(
+            workflow_id=f"{run['run_id']}-semantic-valid",
+            run_id=run["run_id"],
+            owner=supervisor.agent_instance_id,
+            approved_plan_version=plan.version,
+            authorized_worker_roles=["manifest_reader"],
+            tasks=[
+                TaskSpec(
+                    id="manifest",
+                    role="manifest_reader",
+                    agent_backend=AgentBackend.SEMANTIC_PYDANTIC_AI,
+                    agent_provider="test-provider",
+                    agent_model="test-model",
+                    goal="Read the fixture timezone declaration.",
+                    output_schema="ManifestFact",
+                    acceptance_criteria=[criterion],
+                )
+            ],
+        )
+
+        result = await runtime.runner.start(workflow)
+
+        worker = result["results"]["manifest"]
+        assert worker["outcome"] == "succeeded"
+        assert worker["acceptance_checks"] == [
+            {
+                "criterion": criterion,
+                "passed": True,
+                "semantic_status": "satisfied",
+                "evidence_refs": [],
+                "rationale": "The supplied result and evidence satisfy it.",
+            }
+        ]
+        semantic_event = next(
+            event
+            for event in runtime.db.events(run["run_id"])
+            if event["event_type"] == "agent.semantic_validation_completed"
+        )
+        assert semantic_event["data"]["valid"] is True
+        assert semantic_event["data"]["stage"] == "model_review"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_rejection_is_returned_to_worker_for_revision(tmp_path: Path) -> None:
+    criterion = "timezone fact matches the supplied manifest"
+    primary_outputs = iter(
+        [
+            {
+                "fact": "timezone-less fixture timestamps are local time",
+                "manifest": {
+                    "fixture": "incident_example",
+                    "timestamp_timezone": "UTC",
+                    "note": "Fixture timestamps are UTC.",
+                },
+            },
+            {
+                "fact": "timezone-less fixture timestamps are UTC",
+                "manifest": {
+                    "fixture": "incident_example",
+                    "timestamp_timezone": "UTC",
+                    "note": "Fixture timestamps are UTC.",
+                },
+            },
+        ]
+    )
+    worker_messages: list[list[ModelMessage]] = []
+
+    async def revising_worker(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        worker_messages.append(messages)
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    info.output_tools[0].name,
+                    {
+                        "result": next(primary_outputs),
+                        "completion_summary": "Reassessed the timezone fact.",
+                    },
+                )
+            ]
+        )
+
+    review_payloads: list[dict[str, Any]] = [
+        {
+            "internally_consistent": True,
+            "criteria": [
+                {
+                    "criterion": criterion,
+                    "status": "violated",
+                    "evidence_refs": [],
+                    "rationale": "The fact conflicts with the UTC manifest value.",
+                }
+            ],
+            "contradictions": [],
+        },
+        {
+            "internally_consistent": True,
+            "criteria": [
+                {
+                    "criterion": criterion,
+                    "status": "satisfied",
+                    "evidence_refs": [],
+                    "rationale": "The revised fact matches the UTC manifest value.",
+                }
+            ],
+            "contradictions": [],
+        },
+    ]
+    reviews: Iterator[dict[str, Any]] = iter(review_payloads)
+
+    async def reviewing_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        del messages
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, next(reviews))])
+
+    worker_model = FunctionModel(revising_worker)
+    reviewer_model = FunctionModel(reviewing_model)
+    runtime = Runtime(
+        tmp_path / "semantic-revision",
+        pydantic_model_factory=lambda role: worker_model,
+        semantic_pydantic_model_factory=lambda role: reviewer_model,
+    )
+    try:
+        run, _ = runtime.create_run(RunCreate())
+        plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
+        main = runtime.db.get_agent(run["main_agent_id"])
+        assert main is not None
+        supervisor = runtime.spawns.spawn(
+            run_id=run["run_id"],
+            parent=main,
+            child_role="metrics_supervisor",
+            plan_version=plan.version,
+            stable_key="semantic-revision-supervisor",
+        )
+        workflow = WorkflowSpec(
+            workflow_id=f"{run['run_id']}-semantic-revision",
+            run_id=run["run_id"],
+            owner=supervisor.agent_instance_id,
+            approved_plan_version=plan.version,
+            authorized_worker_roles=["manifest_reader"],
+            tasks=[
+                TaskSpec(
+                    id="manifest",
+                    role="manifest_reader",
+                    agent_backend=AgentBackend.SEMANTIC_PYDANTIC_AI,
+                    agent_provider="test-provider",
+                    agent_model="test-model",
+                    goal="Report the fixture timezone.",
+                    output_schema="ManifestFact",
+                    acceptance_criteria=[criterion],
+                )
+            ],
+        )
+
+        result = await runtime.runner.start(workflow)
+
+        worker = result["results"]["manifest"]
+        assert worker["outcome"] == "succeeded"
+        assert worker["result"]["fact"] == "timezone-less fixture timestamps are UTC"
+        assert len(worker_messages) == 2
+        assert "semantic_validation_issues" in str(worker_messages[1])
+        events = runtime.db.events(run["run_id"])
+        revision = next(
+            event for event in events if event["event_type"] == "agent.output_revision_requested"
+        )
+        assert "criterion" in revision["data"]["reason"]
+        semantic_events = [
+            event
+            for event in events
+            if event["event_type"] == "agent.semantic_validation_completed"
+        ]
+        assert [event["data"]["valid"] for event in semantic_events] == [False, True]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_pydantic_backend_rejects_internally_inconsistent_critique(
+    tmp_path: Path,
+) -> None:
+    acceptance = "assumption and evidence check are explicit"
+    consistency = (
+        "The supported verdict, evidence checks, caveat, and completion summary are mutually "
+        "consistent."
+    )
+    evidence_strength = (
+        "The verdict distinguishes evidence that contradicts the claim from evidence that is "
+        "merely insufficient to establish causation."
+    )
+    draft = {
+        "hypothesis_key": "cache_queueing",
+        "claim": "A cold cache is a plausible cause of the latency regression.",
+        "confidence": "medium",
+        "alternatives": ["payment provider latency"],
+    }
+    critique = {
+        "hypothesis_key": "cache_queueing",
+        "claim": draft["claim"],
+        "supported": False,
+        "checks": ["The cache evidence supports the candidate."],
+        "caveat": "The evidence supports the candidate.",
+    }
+    runtime = Runtime(
+        tmp_path / "semantic-invalid",
+        pydantic_model_factory=lambda role: _publishing_output_model(critique),
+        semantic_pydantic_model_factory=lambda role: _semantic_review_model(
+            [acceptance, consistency, evidence_strength],
+            internally_consistent=False,
+            contradictions=["supported=false conflicts with the affirmative evidence checks"],
+        ),
+    )
+    try:
+        run, _ = runtime.create_run(RunCreate())
+        plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
+        main = runtime.db.get_agent(run["main_agent_id"])
+        assert main is not None
+        supervisor = runtime.spawns.spawn(
+            run_id=run["run_id"],
+            parent=main,
+            child_role="reporting_supervisor",
+            plan_version=plan.version,
+            stable_key="semantic-invalid-supervisor",
+        )
+        workflow = WorkflowSpec(
+            workflow_id=f"{run['run_id']}-semantic-invalid",
+            run_id=run["run_id"],
+            owner=supervisor.agent_instance_id,
+            approved_plan_version=plan.version,
+            authorized_worker_roles=["claim_checker"],
+            tasks=[
+                TaskSpec(
+                    id="critique",
+                    role="claim_checker",
+                    agent_backend=AgentBackend.SEMANTIC_PYDANTIC_AI,
+                    agent_provider="test-provider",
+                    agent_model="test-model",
+                    goal="Challenge one candidate against the original evidence.",
+                    output_schema="CheckedClaim",
+                    acceptance_criteria=[acceptance],
+                    static_inputs={
+                        "draft": draft,
+                        "hypothesis_key": "cache_queueing",
+                    },
+                )
+            ],
+        )
+
+        result = await runtime.runner.start(workflow)
+
+        worker = result["results"]["critique"]
+        assert worker["outcome"] == "failed"
+        assert worker["output_artifact"] is None
+        assert "internally inconsistent" in worker["completion_summary"]
+        semantic_event = next(
+            event
+            for event in runtime.db.events(run["run_id"])
+            if event["event_type"] == "agent.semantic_validation_completed"
+        )
+        assert semantic_event["data"]["valid"] is False
+        assert semantic_event["data"]["contradictions"] == [
+            "supported=false conflicts with the affirmative evidence checks"
+        ]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_pydantic_backend_rejects_changed_hypothesis_focus(tmp_path: Path) -> None:
+    semantic_reviewer_called = False
+
+    def semantic_factory(role: RoleSpec) -> FunctionModel:
+        nonlocal semantic_reviewer_called
+        semantic_reviewer_called = True
+        return _semantic_review_model([])
+
+    draft = {
+        "hypothesis_key": "checkout_latency_increase",
+        "claim": "Checkout latency increased.",
+        "confidence": "high",
+        "alternatives": ["cache queueing"],
+    }
+    runtime = Runtime(
+        tmp_path / "semantic-focus-drift",
+        pydantic_model_factory=lambda role: _publishing_output_model(draft),
+        semantic_pydantic_model_factory=semantic_factory,
+    )
+    try:
+        run, _ = runtime.create_run(RunCreate())
+        plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
+        main = runtime.db.get_agent(run["main_agent_id"])
+        assert main is not None
+        supervisor = runtime.spawns.spawn(
+            run_id=run["run_id"],
+            parent=main,
+            child_role="reporting_supervisor",
+            plan_version=plan.version,
+            stable_key="semantic-focus-supervisor",
+        )
+        workflow = WorkflowSpec(
+            workflow_id=f"{run['run_id']}-semantic-focus",
+            run_id=run["run_id"],
+            owner=supervisor.agent_instance_id,
+            approved_plan_version=plan.version,
+            authorized_worker_roles=["claim_drafter"],
+            tasks=[
+                TaskSpec(
+                    id="draft",
+                    role="claim_drafter",
+                    agent_backend=AgentBackend.SEMANTIC_PYDANTIC_AI,
+                    agent_provider="test-provider",
+                    agent_model="test-model",
+                    goal="Draft the assigned payment-timeout hypothesis.",
+                    output_schema="DraftClaim",
+                    static_inputs={"hypothesis_focus": "payment_timeout"},
+                )
+            ],
+        )
+
+        result = await runtime.runner.start(workflow)
+
+        worker = result["results"]["draft"]
+        assert worker["outcome"] == "failed"
+        assert "does not match assigned focus" in worker["completion_summary"]
+        assert semantic_reviewer_called is False
+        semantic_event = next(
+            event
+            for event in runtime.db.events(run["run_id"])
+            if event["event_type"] == "agent.semantic_validation_completed"
+        )
+        assert semantic_event["data"]["stage"] == "deterministic"
     finally:
         await runtime.close()

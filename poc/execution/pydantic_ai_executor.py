@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, create_model
-from pydantic_ai import Agent, RunContext, UsageLimits
+from pydantic_ai import Agent, ModelMessage, RunContext, UsageLimits
 from pydantic_ai.capabilities import PrepareTools
 from pydantic_ai.models import Model
 from pydantic_ai.tools import ToolDefinition
@@ -63,7 +63,7 @@ class PydanticAgentDependencies:
             arguments=arguments,
             grant=self.request.ownership_grant,
         )
-        self.tool_results.append({"tool_name": tool_name, "result": result})
+        self.tool_results.append({"tool_name": tool_name, "arguments": arguments, "result": result})
         artifact_id = result.get("artifact_id")
         if isinstance(artifact_id, str):
             self.evidence_artifacts.append(artifact_id)
@@ -132,12 +132,55 @@ class PydanticAIAgentExecutor:
             "agent.execution_started",
             {"provider": role.provider, "model": role.model},
         )
-        try:
-            output, usage = self._run(role, request, dependencies)
-            validated_result = validate_output(request.task.output_schema, output.result)
-        except Exception as exc:
-            return self._failed(request, str(exc))
-        self._record(request, "agent.execution_usage", {"usage": usage})
+        history: list[ModelMessage] | None = None
+        revision_prompt: str | None = None
+        max_output_attempts = self._max_output_attempts(role)
+        for output_attempt in range(1, max_output_attempts + 1):
+            try:
+                output, usage, history = self._run(
+                    role,
+                    request,
+                    dependencies,
+                    user_prompt=revision_prompt,
+                    message_history=history,
+                )
+                self._record(
+                    request,
+                    "agent.execution_usage",
+                    {"usage": usage, "output_attempt": output_attempt},
+                )
+                validated_result = validate_output(request.task.output_schema, output.result)
+                acceptance_checks = self._validate_semantics(
+                    role,
+                    request,
+                    validated_result,
+                    output.completion_summary,
+                    dependencies,
+                )
+            except Exception as exc:
+                feedback = self._output_revision_feedback(
+                    role,
+                    request,
+                    exc,
+                    output_attempt=output_attempt,
+                    max_output_attempts=max_output_attempts,
+                )
+                if feedback is None:
+                    return self._failed(request, str(exc))
+                revision_prompt = feedback
+                self._record(
+                    request,
+                    "agent.output_revision_requested",
+                    {
+                        "output_attempt": output_attempt,
+                        "next_output_attempt": output_attempt + 1,
+                        "reason": str(exc),
+                    },
+                )
+                continue
+            break
+        else:  # pragma: no cover - every rejected final attempt returns above
+            return self._failed(request, "worker exhausted output revision attempts")
         artifact = self.artifacts.write(
             request.run_id, validated_result, producer_task_id=request.task.id
         )
@@ -159,10 +202,7 @@ class PydanticAIAgentExecutor:
             result=validated_result,
             output_artifact=artifact.artifact_id,
             evidence_artifacts=evidence,
-            acceptance_checks=[
-                {"criterion": criterion, "passed": True}
-                for criterion in request.task.acceptance_criteria
-            ],
+            acceptance_checks=acceptance_checks,
             completion_summary=output.completion_summary,
         )
         self._record(
@@ -182,12 +222,46 @@ class PydanticAIAgentExecutor:
             "worker_result": worker_result.model_dump(mode="json"),
         }
 
+    def _validate_semantics(
+        self,
+        role: RoleSpec,
+        request: AgentExecutionRequest,
+        result: dict[str, Any],
+        completion_summary: str,
+        dependencies: PydanticAgentDependencies,
+    ) -> list[dict[str, Any]]:
+        """Extension hook for executors that add validation above the typed contract."""
+        del role, result, completion_summary, dependencies
+        return [
+            {"criterion": criterion, "passed": True}
+            for criterion in request.task.acceptance_criteria
+        ]
+
+    def _max_output_attempts(self, role: RoleSpec) -> int:
+        del role
+        return 1
+
+    def _output_revision_feedback(
+        self,
+        role: RoleSpec,
+        request: AgentExecutionRequest,
+        error: Exception,
+        *,
+        output_attempt: int,
+        max_output_attempts: int,
+    ) -> str | None:
+        del role, request, error, output_attempt, max_output_attempts
+        return None
+
     def _run(
         self,
         role: RoleSpec,
         request: AgentExecutionRequest,
         dependencies: PydanticAgentDependencies,
-    ) -> tuple[PydanticWorkerOutput, dict[str, int]]:
+        *,
+        user_prompt: str | None = None,
+        message_history: list[ModelMessage] | None = None,
+    ) -> tuple[PydanticWorkerOutput, dict[str, int], list[ModelMessage]]:
         agent = Agent(
             self.model_factory(role),
             deps_type=PydanticAgentDependencies,
@@ -197,7 +271,7 @@ class PydanticAIAgentExecutor:
             tools=[execute_allowed_tool],
             capabilities=[PrepareTools(prepare_tools_within_budget)],
         )
-        prompt = json.dumps(
+        prompt = user_prompt or json.dumps(
             {
                 "goal": request.task.goal,
                 "expected_output_schema": request.task.output_schema,
@@ -209,24 +283,29 @@ class PydanticAIAgentExecutor:
             default=str,
         )
 
-        def run() -> tuple[PydanticWorkerOutput, dict[str, int]]:
+        def run() -> tuple[PydanticWorkerOutput, dict[str, int], list[ModelMessage]]:
             result = agent.run_sync(
                 prompt,
                 deps=dependencies,
                 infer_name=False,
+                message_history=message_history,
                 usage_limits=UsageLimits(
                     request_limit=role.execution_limits.get("max_ooda_cycles", 3),
                     tool_calls_limit=role.execution_limits.get("max_tool_calls", 2),
                 ),
             )
             usage = result.usage
-            return result.output, {
-                "requests": usage.requests,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_read_tokens": usage.cache_read_tokens,
-                "cache_write_tokens": usage.cache_write_tokens,
-            }
+            return (
+                result.output,
+                {
+                    "requests": usage.requests,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_read_tokens": usage.cache_read_tokens,
+                    "cache_write_tokens": usage.cache_write_tokens,
+                },
+                result.all_messages(),
+            )
 
         try:
             asyncio.get_running_loop()

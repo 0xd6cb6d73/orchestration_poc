@@ -287,7 +287,10 @@ def _final_report(runtime: Runtime, events: list[dict[str, Any]]) -> tuple[str, 
 def _aggregate_usage(events: list[dict[str, Any]]) -> TokenUsage:
     totals: Counter[str] = Counter()
     for event in events:
-        if event["event_type"] != "agent.execution_usage":
+        if event["event_type"] not in {
+            "agent.execution_usage",
+            "agent.semantic_validation_completed",
+        }:
             continue
         for key, value in event["data"].get("usage", {}).items():
             if isinstance(value, int):

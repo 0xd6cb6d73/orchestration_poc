@@ -65,6 +65,7 @@ async def test_web_ui_drives_run_and_exposes_agent_relationships(tmp_path: Path)
         assert 'action="/ui/runs"' in dashboard.text
         assert 'name="agent_backend"' in dashboard.text
         assert 'value="pydantic_ai"' in dashboard.text
+        assert 'value="semantic_pydantic_ai"' in dashboard.text
         assert 'name="execution_mode"' in dashboard.text
         assert 'name="agent_model"' in dashboard.text
 

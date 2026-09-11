@@ -7,6 +7,7 @@ from poc.models import (
     ExecutionMode,
     HybridConfig,
     SwarmStrategy,
+    is_pydantic_ai_backend,
 )
 
 
@@ -27,15 +28,15 @@ class OrchestrationBenchmarkVariant(BaseModel):
 
     @model_validator(mode="after")
     def validate_runtime(self) -> OrchestrationBenchmarkVariant:
-        if self.agent_backend == AgentBackend.PYDANTIC_AI:
+        if is_pydantic_ai_backend(self.agent_backend):
             provider_from_model = (
                 self.model.split(":", 1)[0] if self.model and ":" in self.model else None
             )
             if self.model is None:
-                raise ValueError("pydantic_ai benchmark variants require a model")
+                raise ValueError(f"{self.agent_backend} benchmark variants require a model")
             if self.provider is None and provider_from_model is None:
                 raise ValueError(
-                    "pydantic_ai benchmark variants require a provider or provider:model"
+                    f"{self.agent_backend} benchmark variants require a provider or provider:model"
                 )
         if (
             self.swarm_strategy == SwarmStrategy.HYBRID_V1

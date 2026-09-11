@@ -9,7 +9,7 @@ from typing import Any
 from poc.evaluation.datasets import default_dataset_registry
 from poc.evaluation.models import AgentEvaluationVariant
 from poc.evaluation.runner import AgentEvaluationRunner, load_report, report_passed, save_report
-from poc.models import AgentBackend
+from poc.models import AgentBackend, is_pydantic_ai_backend
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,10 +68,12 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     provider = args.provider
     if provider is None and args.model and ":" in args.model:
         provider = args.model.split(":", 1)[0]
-    if args.backend == AgentBackend.PYDANTIC_AI and args.model is None:
-        parser.error("the pydantic_ai backend requires --model")
-    if args.backend == AgentBackend.PYDANTIC_AI and provider is None:
-        parser.error("the pydantic_ai backend requires --provider or a provider:model identifier")
+    if is_pydantic_ai_backend(args.backend) and args.model is None:
+        parser.error(f"the {args.backend} backend requires --model")
+    if is_pydantic_ai_backend(args.backend) and provider is None:
+        parser.error(
+            f"the {args.backend} backend requires --provider or a provider:model identifier"
+        )
 
     name = args.name or _default_name(args.backend, provider, args.model, args.prompt_file)
     variant = AgentEvaluationVariant(
