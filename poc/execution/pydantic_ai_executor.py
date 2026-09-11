@@ -7,11 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, create_model
 from pydantic_ai import Agent, RunContext, UsageLimits
+from pydantic_ai.capabilities import PrepareTools
 from pydantic_ai.models import Model
+from pydantic_ai.tools import ToolDefinition
 
 from poc.execution.agent_executor import AgentExecutionRequest
+from poc.execution.output_contracts import output_model_for, validate_output
 from poc.models import AgentBackend, AgentInstance, EventRecord, Outcome, RoleSpec, WorkerResult
 from poc.persistence.database import Database
 from poc.roles.registry import RoleRegistry
@@ -28,11 +31,12 @@ class PydanticWorkerOutput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    result: dict[str, Any]
+    result: BaseModel
     completion_summary: str
 
 
 PydanticModelFactory = Callable[[RoleSpec], Model | str]
+_WORKER_OUTPUT_MODELS: dict[str, type[PydanticWorkerOutput]] = {}
 
 
 @dataclass
@@ -75,6 +79,15 @@ async def execute_allowed_tool(
     return ctx.deps.execute_tool(tool_name, arguments)
 
 
+async def prepare_tools_within_budget(
+    ctx: RunContext[PydanticAgentDependencies], tool_defs: list[ToolDefinition]
+) -> list[ToolDefinition]:
+    """Stop advertising function tools after the role's bounded budget is spent."""
+    if len(ctx.deps.tool_results) >= ctx.deps.max_tool_calls:
+        return []
+    return tool_defs
+
+
 class PydanticAIAgentExecutor:
     """Runs a Pydantic AI agent behind the common synchronous worker contract."""
 
@@ -92,7 +105,7 @@ class PydanticAIAgentExecutor:
         self.roles = roles
         self.tools = tools
         self.artifacts = artifacts
-        self.model_factory = model_factory or _model_from_role
+        self.model_factory = model_factory or model_from_role
 
     def execute(self, request: AgentExecutionRequest) -> dict[str, Any]:
         actor = request.agent
@@ -121,11 +134,12 @@ class PydanticAIAgentExecutor:
         )
         try:
             output, usage = self._run(role, request, dependencies)
+            validated_result = validate_output(request.task.output_schema, output.result)
         except Exception as exc:
             return self._failed(request, str(exc))
         self._record(request, "agent.execution_usage", {"usage": usage})
         artifact = self.artifacts.write(
-            request.run_id, output.result, producer_task_id=request.task.id
+            request.run_id, validated_result, producer_task_id=request.task.id
         )
         evidence = list(
             dict.fromkeys(
@@ -142,7 +156,7 @@ class PydanticAIAgentExecutor:
             attempt_id=request.attempt_id,
             outcome=Outcome.SUCCEEDED,
             output_schema=request.task.output_schema,
-            result=output.result,
+            result=validated_result,
             output_artifact=artifact.artifact_id,
             evidence_artifacts=evidence,
             acceptance_checks=[
@@ -163,7 +177,7 @@ class PydanticAIAgentExecutor:
             },
         )
         return {
-            "result": output.result,
+            "result": validated_result,
             "evidence_artifacts": evidence,
             "worker_result": worker_result.model_dump(mode="json"),
         }
@@ -177,10 +191,11 @@ class PydanticAIAgentExecutor:
         agent = Agent(
             self.model_factory(role),
             deps_type=PydanticAgentDependencies,
-            output_type=PydanticWorkerOutput,
+            output_type=_worker_output_model_for(request.task.output_schema),
             instructions=_instructions(role, request),
             model_settings=cast(Any, role.provider_options or None),
             tools=[execute_allowed_tool],
+            capabilities=[PrepareTools(prepare_tools_within_budget)],
         )
         prompt = json.dumps(
             {
@@ -259,21 +274,24 @@ class PydanticAIAgentExecutor:
         )
 
 
-def _model_from_role(role: RoleSpec) -> Model | str:
+def model_from_role(role: RoleSpec) -> Model | str:
     if role.provider in {"deterministic", "local"}:
         raise PydanticAgentConfigurationError(
             f"role {role.role_id!r} needs a Pydantic AI provider/model configuration"
         )
-    if ":" in role.model:
+    if role.model.startswith(f"{role.provider}:"):
         return role.model
     return f"{role.provider}:{role.model}"
 
 
 def _instructions(role: RoleSpec, request: AgentExecutionRequest) -> str:
+    max_tool_calls = role.execution_limits.get("max_tool_calls", 2)
     return (
         f"{role.system_prompt}\n"
         "You are running under the pydantic_ai backend. Use execute_allowed_tool only when "
         f"evidence is needed. Available tools: {', '.join(role.allowed_tools) or 'none'}. "
+        f"You have at most {max_tool_calls} tool calls; once the required evidence is available, "
+        "return the final result instead of calling another tool. "
         f"Tool contracts:\n{_tool_contracts(role.allowed_tools)}\n"
         f"Required result shape for {request.task.output_schema}: "
         f"{_output_contract(request.task.output_schema)}. "
@@ -360,3 +378,17 @@ def _tool_contracts(tool_names: list[str]) -> str:
 
 def _output_contract(schema: str) -> str:
     return _OUTPUT_CONTRACTS.get(schema, "a JSON object satisfying every acceptance criterion")
+
+
+def _worker_output_model_for(schema: str) -> type[PydanticWorkerOutput]:
+    cached = _WORKER_OUTPUT_MODELS.get(schema)
+    if cached is not None:
+        return cached
+    domain_model = output_model_for(schema)
+    worker_model = create_model(
+        f"{schema}WorkerOutput",
+        __base__=PydanticWorkerOutput,
+        result=(domain_model, ...),
+    )
+    _WORKER_OUTPUT_MODELS[schema] = worker_model
+    return worker_model

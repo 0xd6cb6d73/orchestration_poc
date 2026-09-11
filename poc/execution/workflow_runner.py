@@ -32,8 +32,8 @@ class WorkflowRunner:
     async def start(self, spec: WorkflowSpec) -> dict[str, Any]:
         thread_id = f"{spec.run_id}:{spec.workflow_id}:r{spec.revision}"
         existing = self.db.get_workflow(spec.workflow_id, spec.revision)
-        self.db.put_workflow(spec, thread_id)
         graph = self.compiler.compile(spec, self.checkpointer)
+        self.db.put_workflow(spec, thread_id)
         self._graphs[(spec.workflow_id, spec.revision)] = graph
         config: dict[str, Any] = {
             "configurable": {"thread_id": thread_id},

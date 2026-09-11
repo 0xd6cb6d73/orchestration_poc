@@ -6,6 +6,7 @@ from typing import Annotated, Any, Protocol, TypedDict, cast
 from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import Command
 
+from poc.execution.output_contracts import OutputContractError, validate_output_field
 from poc.execution.worker_adapter import WorkerAdapter
 from poc.models import AgentInstance, TaskSpec, WorkflowSpec
 
@@ -20,6 +21,10 @@ def merge_task_results(left: dict[str, Any], right: dict[str, Any]) -> dict[str,
 class WorkflowState(TypedDict, total=False):
     run_id: str
     results: Annotated[dict[str, Any], merge_task_results]
+
+
+class WorkflowBindingError(ValueError):
+    pass
 
 
 class TaskSnapshot(Protocol):
@@ -48,6 +53,7 @@ class WorkflowCompiler:
         self.role_lookup = role_lookup
 
     def compile(self, spec: WorkflowSpec, checkpointer: Any) -> WorkflowGraph:
+        self._validate_bindings(spec)
         # LangGraph exposes partially unknown internal generic parameters to Pyright.
         graph = cast(Any, StateGraph(WorkflowState))
         task_ids = {task.id for task in spec.tasks}
@@ -90,9 +96,22 @@ class WorkflowCompiler:
             for result in predecessor_results.values():
                 input_artifacts.extend(result.get("evidence_artifacts", []))
             for binding in task.input_bindings:
-                value: Any = predecessor_results[binding.source_task]["result"]
-                for component in binding.field.split("."):
-                    value = value[component]
+                source_result = predecessor_results[binding.source_task]["result"]
+                value: Any = source_result
+                try:
+                    for component in binding.field.split("."):
+                        value = value[component]
+                except (KeyError, TypeError) as exc:
+                    available = (
+                        sorted(cast(dict[str, Any], source_result))
+                        if isinstance(source_result, dict)
+                        else []
+                    )
+                    raise WorkflowBindingError(
+                        f"workflow {spec.workflow_id!r} task {task.id!r} could not bind "
+                        f"{binding.source_task!r}.{binding.field} to {binding.target!r}; "
+                        f"available source fields: {available}"
+                    ) from exc
                 inputs[binding.target] = value
             output = self.adapter.execute(
                 task=task,
@@ -110,3 +129,29 @@ class WorkflowCompiler:
             return {"results": {task.id: output["worker_result"]}}
 
         return run_task
+
+    @staticmethod
+    def _validate_bindings(spec: WorkflowSpec) -> None:
+        tasks = {task.id: task for task in spec.tasks}
+        for task in spec.tasks:
+            targets: set[str] = set()
+            for binding in task.input_bindings:
+                if binding.source_task not in task.depends_on:
+                    raise WorkflowBindingError(
+                        f"workflow {spec.workflow_id!r} task {task.id!r} binds from "
+                        f"{binding.source_task!r}, which is not one of its dependencies"
+                    )
+                if binding.target in targets:
+                    raise WorkflowBindingError(
+                        f"workflow {spec.workflow_id!r} task {task.id!r} has duplicate "
+                        f"binding target {binding.target!r}"
+                    )
+                targets.add(binding.target)
+                source_schema = tasks[binding.source_task].output_schema
+                try:
+                    validate_output_field(source_schema, binding.field)
+                except OutputContractError as exc:
+                    raise WorkflowBindingError(
+                        f"workflow {spec.workflow_id!r} task {task.id!r} has invalid binding "
+                        f"{binding.source_task!r}.{binding.field}: {exc}"
+                    ) from exc

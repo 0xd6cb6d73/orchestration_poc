@@ -60,7 +60,14 @@ async def _manifest_model(messages: list[ModelMessage], info: AgentInfo) -> Mode
             ToolCallPart(
                 info.output_tools[0].name,
                 {
-                    "result": {"fact": "timezone-less fixture timestamps are UTC"},
+                    "result": {
+                        "fact": "timezone-less fixture timestamps are UTC",
+                        "manifest": {
+                            "fixture": "incident_example",
+                            "timestamp_timezone": "UTC",
+                            "note": "Fixture timestamps are UTC.",
+                        },
+                    },
                     "completion_summary": "Read the manifest through the approved tool.",
                 },
             )
