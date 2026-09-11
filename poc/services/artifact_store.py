@@ -15,8 +15,14 @@ class ArtifactStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.db = db
 
-    def write(self, run_id: str, value: Any, *, producer_task_id: str | None = None,
-              media_type: str = "application/json") -> ArtifactRecord:
+    def write(
+        self,
+        run_id: str,
+        value: Any,
+        *,
+        producer_task_id: str | None = None,
+        media_type: str = "application/json",
+    ) -> ArtifactRecord:
         if isinstance(value, bytes):
             content = value
         elif isinstance(value, str) and media_type.startswith("text/"):
@@ -29,8 +35,14 @@ class ArtifactStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_bytes(content)
-        record = ArtifactRecord(artifact_id=f"artifact-{digest[:16]}", run_id=run_id, media_type=media_type,
-                                sha256=digest, path=str(path), producer_task_id=producer_task_id)
+        record = ArtifactRecord(
+            artifact_id=f"artifact-{digest[:16]}",
+            run_id=run_id,
+            media_type=media_type,
+            sha256=digest,
+            path=str(path),
+            producer_task_id=producer_task_id,
+        )
         self.db.put_artifact(record)
         return record
 
@@ -39,4 +51,3 @@ class ArtifactStore:
         if not record:
             raise KeyError(artifact_id)
         return record, Path(record.path).read_bytes()
-

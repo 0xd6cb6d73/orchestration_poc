@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
-from poc.models import AgentInstance, ArtifactRecord, EventRecord, MessageEnvelope, MissionPlan, RunStatus, utc_now
-
+from poc.models import (
+    AgentInstance,
+    ArtifactRecord,
+    EventRecord,
+    MessageEnvelope,
+    MissionPlan,
+    RunStatus,
+    utc_now,
+)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -326,26 +334,45 @@ class Database:
                 self.conn.rollback()
                 raise
 
-    def create_run(self, run_id: str, objective: str, main_agent_id: str, plan: MissionPlan) -> None:
+    def create_run(
+        self, run_id: str, objective: str, main_agent_id: str, plan: MissionPlan
+    ) -> None:
         now = utc_now()
         with self.transaction() as tx:
             tx.execute(
                 "INSERT INTO runs VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)",
-                (run_id, objective, RunStatus.AWAITING_APPROVAL, plan.version, main_agent_id, now, now),
+                (
+                    run_id,
+                    objective,
+                    RunStatus.AWAITING_APPROVAL,
+                    plan.version,
+                    main_agent_id,
+                    now,
+                    now,
+                ),
             )
             tx.execute(
                 "INSERT INTO plans VALUES (?, ?, ?, ?)",
                 (run_id, plan.version, plan.status, plan.model_dump_json()),
             )
-            self._append_event(tx, EventRecord(run_id=run_id, event_type="plan.proposed", actor_id=main_agent_id,
-                                                data={"plan_id": plan.plan_id, "plan_version": plan.version}))
+            self._append_event(
+                tx,
+                EventRecord(
+                    run_id=run_id,
+                    event_type="plan.proposed",
+                    actor_id=main_agent_id,
+                    data={"plan_id": plan.plan_id, "plan_version": plan.version},
+                ),
+            )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         return dict(row) if row else None
 
     def list_runs(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.conn.execute("SELECT * FROM runs ORDER BY created_at DESC")]
+        return [
+            dict(row) for row in self.conn.execute("SELECT * FROM runs ORDER BY created_at DESC")
+        ]
 
     def get_plan(self, run_id: str, version: int | None = None) -> MissionPlan | None:
         if version is None:
@@ -354,12 +381,17 @@ class Database:
                 (run_id,),
             ).fetchone()
         else:
-            row = self.conn.execute("SELECT payload FROM plans WHERE run_id=? AND version=?", (run_id, version)).fetchone()
+            row = self.conn.execute(
+                "SELECT payload FROM plans WHERE run_id=? AND version=?", (run_id, version)
+            ).fetchone()
         return MissionPlan.model_validate_json(row[0]) if row else None
 
     def approve_plan(self, old_plan: MissionPlan, approved: MissionPlan) -> None:
         with self.transaction() as tx:
-            tx.execute("UPDATE plans SET status='superseded' WHERE run_id=? AND version=?", (old_plan.run_id, old_plan.version))
+            tx.execute(
+                "UPDATE plans SET status='superseded' WHERE run_id=? AND version=?",
+                (old_plan.run_id, old_plan.version),
+            )
             if approved.version == old_plan.version:
                 tx.execute(
                     "UPDATE plans SET status='approved', payload=? WHERE run_id=? AND version=?",
@@ -374,27 +406,46 @@ class Database:
                 "UPDATE runs SET status=?, active_plan_version=?, updated_at=? WHERE run_id=?",
                 (RunStatus.RUNNING, approved.version, utc_now(), approved.run_id),
             )
-            self._append_event(tx, EventRecord(run_id=approved.run_id, event_type="plan.approved",
-                                                data={"plan_id": approved.plan_id, "plan_version": approved.version}))
+            self._append_event(
+                tx,
+                EventRecord(
+                    run_id=approved.run_id,
+                    event_type="plan.approved",
+                    data={"plan_id": approved.plan_id, "plan_version": approved.version},
+                ),
+            )
 
     def update_run_status(self, run_id: str, status: RunStatus, error: str | None = None) -> None:
         with self.transaction() as tx:
-            tx.execute("UPDATE runs SET status=?, error=?, updated_at=? WHERE run_id=?", (status, error, utc_now(), run_id))
-            self._append_event(tx, EventRecord(run_id=run_id, event_type=f"run.{status}", data={"error": error}))
+            tx.execute(
+                "UPDATE runs SET status=?, error=?, updated_at=? WHERE run_id=?",
+                (status, error, utc_now(), run_id),
+            )
+            self._append_event(
+                tx, EventRecord(run_id=run_id, event_type=f"run.{status}", data={"error": error})
+            )
 
     def request_cancellation(self, run_id: str) -> bool:
         with self.transaction() as tx:
             row = tx.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
             if not row:
                 return False
-            tx.execute("UPDATE runs SET cancellation_requested=1, status=?, updated_at=? WHERE run_id=?",
-                       (RunStatus.CANCELLED, utc_now(), run_id))
-            self._append_event(tx, EventRecord(run_id=run_id, event_type="workflow.cancelled", data={"authority_revoked": True}))
+            tx.execute(
+                "UPDATE runs SET cancellation_requested=1, status=?, updated_at=? WHERE run_id=?",
+                (RunStatus.CANCELLED, utc_now(), run_id),
+            )
+            self._append_event(
+                tx,
+                EventRecord(
+                    run_id=run_id, event_type="workflow.cancelled", data={"authority_revoked": True}
+                ),
+            )
         return True
 
     def authority_active(self, run_id: str, plan_version: int) -> bool:
         row = self.conn.execute(
-            "SELECT status, active_plan_version, cancellation_requested FROM runs WHERE run_id=?", (run_id,)
+            "SELECT status, active_plan_version, cancellation_requested FROM runs WHERE run_id=?",
+            (run_id,),
         ).fetchone()
         return bool(row and row[0] == RunStatus.RUNNING and row[1] == plan_version and not row[2])
 
@@ -402,109 +453,230 @@ class Database:
         with self.transaction() as tx:
             inserted = tx.execute(
                 "INSERT OR IGNORE INTO agents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (agent.agent_instance_id, agent.run_id, agent.parent_agent_id, agent.tier, agent.role_id,
-                 agent.role_version, agent.plan_version, agent.status, agent.model_dump_json()),
+                (
+                    agent.agent_instance_id,
+                    agent.run_id,
+                    agent.parent_agent_id,
+                    agent.tier,
+                    agent.role_id,
+                    agent.role_version,
+                    agent.plan_version,
+                    agent.status,
+                    agent.model_dump_json(),
+                ),
             )
             if inserted.rowcount:
                 if agent.tier != "worker":
-                    tx.execute("INSERT OR IGNORE INTO supervisor_state VALUES (?, ?, 0, '{}', ?)",
-                               (agent.agent_instance_id, agent.run_id, utc_now()))
-                self._append_event(tx, EventRecord(run_id=agent.run_id, event_type="agent.started",
-                                                    actor_id=agent.agent_instance_id,
-                                                    data={"tier": agent.tier, "role_id": agent.role_id,
-                                                          "parent_agent_id": agent.parent_agent_id}))
+                    tx.execute(
+                        "INSERT OR IGNORE INTO supervisor_state VALUES (?, ?, 0, '{}', ?)",
+                        (agent.agent_instance_id, agent.run_id, utc_now()),
+                    )
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=agent.run_id,
+                        event_type="agent.started",
+                        actor_id=agent.agent_instance_id,
+                        data={
+                            "tier": agent.tier,
+                            "role_id": agent.role_id,
+                            "parent_agent_id": agent.parent_agent_id,
+                        },
+                    ),
+                )
 
     def list_agents(self, run_id: str) -> list[dict[str, Any]]:
-        return [AgentInstance.model_validate_json(row[0]).model_dump(mode="json") for row in self.conn.execute(
-            "SELECT payload FROM agents WHERE run_id=? ORDER BY rowid", (run_id,))]
+        return [
+            AgentInstance.model_validate_json(row[0]).model_dump(mode="json")
+            for row in self.conn.execute(
+                "SELECT payload FROM agents WHERE run_id=? ORDER BY rowid", (run_id,)
+            )
+        ]
 
     def get_agent(self, agent_id: str) -> AgentInstance | None:
-        row = self.conn.execute("SELECT payload FROM agents WHERE agent_instance_id=?", (agent_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT payload FROM agents WHERE agent_instance_id=?", (agent_id,)
+        ).fetchone()
         return AgentInstance.model_validate_json(row[0]) if row else None
 
     def put_workflow(self, spec: Any, thread_id: str) -> None:
         with self.transaction() as tx:
-            inserted = tx.execute("INSERT OR IGNORE INTO workflows VALUES (?, ?, ?, ?, 'submitted', ?, NULL, ?)",
-                                  (spec.run_id, spec.workflow_id, spec.revision, spec.owner,
-                                   spec.model_dump_json(), thread_id))
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO workflows VALUES (?, ?, ?, ?, 'submitted', ?, NULL, ?)",
+                (
+                    spec.run_id,
+                    spec.workflow_id,
+                    spec.revision,
+                    spec.owner,
+                    spec.model_dump_json(),
+                    thread_id,
+                ),
+            )
             for task in spec.tasks:
-                tx.execute("INSERT OR IGNORE INTO tasks VALUES (?, ?, ?, NULL, 'pending', NULL, NULL)",
-                           (spec.workflow_id, spec.revision, task.id))
+                tx.execute(
+                    "INSERT OR IGNORE INTO tasks VALUES (?, ?, ?, NULL, 'pending', NULL, NULL)",
+                    (spec.workflow_id, spec.revision, task.id),
+                )
             if inserted.rowcount:
-                self._append_event(tx, EventRecord(run_id=spec.run_id, event_type="workflow.submitted", actor_id=spec.owner,
-                                                    data={"workflow_id": spec.workflow_id, "revision": spec.revision}))
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=spec.run_id,
+                        event_type="workflow.submitted",
+                        actor_id=spec.owner,
+                        data={"workflow_id": spec.workflow_id, "revision": spec.revision},
+                    ),
+                )
 
     def get_workflow(self, workflow_id: str, revision: int) -> dict[str, Any] | None:
-        row = self.conn.execute("SELECT * FROM workflows WHERE workflow_id=? AND revision=?",
-                                (workflow_id, revision)).fetchone()
+        row = self.conn.execute(
+            "SELECT * FROM workflows WHERE workflow_id=? AND revision=?", (workflow_id, revision)
+        ).fetchone()
         return dict(row) if row else None
 
-    def update_workflow(self, workflow_id: str, revision: int, status: str, result: Any = None) -> None:
+    def update_workflow(
+        self, workflow_id: str, revision: int, status: str, result: Any = None
+    ) -> None:
         with self.transaction() as tx:
-            row = tx.execute("SELECT run_id,owner FROM workflows WHERE workflow_id=? AND revision=?",
-                             (workflow_id, revision)).fetchone()
-            tx.execute("UPDATE workflows SET status=?, result=? WHERE workflow_id=? AND revision=?",
-                       (status, json.dumps(result) if result is not None else None, workflow_id, revision))
+            row = tx.execute(
+                "SELECT run_id,owner FROM workflows WHERE workflow_id=? AND revision=?",
+                (workflow_id, revision),
+            ).fetchone()
+            tx.execute(
+                "UPDATE workflows SET status=?, result=? WHERE workflow_id=? AND revision=?",
+                (status, json.dumps(result) if result is not None else None, workflow_id, revision),
+            )
             if row:
-                self._append_event(tx, EventRecord(run_id=row[0], event_type=f"workflow.{status}", actor_id=row[1],
-                                                    data={"workflow_id": workflow_id, "revision": revision}))
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=row[0],
+                        event_type=f"workflow.{status}",
+                        actor_id=row[1],
+                        data={"workflow_id": workflow_id, "revision": revision},
+                    ),
+                )
 
-    def update_task(self, workflow_id: str, revision: int, task_id: str, status: str,
-                    agent_id: str | None = None, attempt_id: str | None = None, result: Any = None) -> None:
+    def update_task(
+        self,
+        workflow_id: str,
+        revision: int,
+        task_id: str,
+        status: str,
+        agent_id: str | None = None,
+        attempt_id: str | None = None,
+        result: Any = None,
+    ) -> None:
         with self.transaction() as tx:
             tx.execute(
                 "UPDATE tasks SET status=?, agent_instance_id=COALESCE(?,agent_instance_id), "
                 "attempt_id=COALESCE(?,attempt_id), result=COALESCE(?,result) WHERE workflow_id=? AND revision=? AND task_id=?",
-                (status, agent_id, attempt_id, json.dumps(result) if result is not None else None,
-                 workflow_id, revision, task_id),
+                (
+                    status,
+                    agent_id,
+                    attempt_id,
+                    json.dumps(result) if result is not None else None,
+                    workflow_id,
+                    revision,
+                    task_id,
+                ),
             )
 
     def list_workflows(self, run_id: str) -> list[dict[str, Any]]:
         workflows = []
-        for row in self.conn.execute("SELECT * FROM workflows WHERE run_id=? ORDER BY rowid", (run_id,)):
+        for row in self.conn.execute(
+            "SELECT * FROM workflows WHERE run_id=? ORDER BY rowid", (run_id,)
+        ):
             item = dict(row)
-            item["tasks"] = [dict(task) for task in self.conn.execute(
-                "SELECT task_id,agent_instance_id,status,attempt_id,result FROM tasks WHERE workflow_id=? AND revision=? ORDER BY rowid",
-                (row["workflow_id"], row["revision"]))]
+            item["tasks"] = [
+                dict(task)
+                for task in self.conn.execute(
+                    "SELECT task_id,agent_instance_id,status,attempt_id,result FROM tasks WHERE workflow_id=? AND revision=? ORDER BY rowid",
+                    (row["workflow_id"], row["revision"]),
+                )
+            ]
             workflows.append(item)
         return workflows
 
     def put_message(self, message: MessageEnvelope) -> None:
         with self.transaction() as tx:
-            tx.execute("INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)",
-                       (message.message_id, message.run_id, message.recipient_id, message.delivered_at,
-                        message.consumed_at, message.model_dump_json()))
-            self._append_event(tx, EventRecord(run_id=message.run_id, event_type="message.sent", actor_id=message.sender_id,
-                                                correlation_id=message.correlation_id, causation_id=message.causation_id,
-                                                data={"message_id": message.message_id,
-                                                      "recipient_id": message.recipient_id,
-                                                      "message_type": message.message_type,
-                                                      "task_id": message.task_id,
-                                                      "attempt_id": message.attempt_id,
-                                                      "assignment_id": message.assignment_id,
-                                                      "payload_ref": message.payload_ref}))
+            tx.execute(
+                "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    message.message_id,
+                    message.run_id,
+                    message.recipient_id,
+                    message.delivered_at,
+                    message.consumed_at,
+                    message.model_dump_json(),
+                ),
+            )
+            self._append_event(
+                tx,
+                EventRecord(
+                    run_id=message.run_id,
+                    event_type="message.sent",
+                    actor_id=message.sender_id,
+                    correlation_id=message.correlation_id,
+                    causation_id=message.causation_id,
+                    data={
+                        "message_id": message.message_id,
+                        "recipient_id": message.recipient_id,
+                        "message_type": message.message_type,
+                        "task_id": message.task_id,
+                        "attempt_id": message.attempt_id,
+                        "assignment_id": message.assignment_id,
+                        "payload_ref": message.payload_ref,
+                    },
+                ),
+            )
             if message.delivered_at:
-                self._append_event(tx, EventRecord(run_id=message.run_id, event_type="message.delivered",
-                                                    actor_id=message.recipient_id,
-                                                    data={"message_id": message.message_id}))
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=message.run_id,
+                        event_type="message.delivered",
+                        actor_id=message.recipient_id,
+                        data={"message_id": message.message_id},
+                    ),
+                )
             if message.consumed_at:
-                self._append_event(tx, EventRecord(run_id=message.run_id, event_type="message.consumed",
-                                                    actor_id=message.recipient_id,
-                                                    data={"message_id": message.message_id}))
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=message.run_id,
+                        event_type="message.consumed",
+                        actor_id=message.recipient_id,
+                        data={"message_id": message.message_id},
+                    ),
+                )
 
     def supervisor_version(self, agent_id: str) -> int:
-        row = self.conn.execute("SELECT state_version FROM supervisor_state WHERE agent_instance_id=?", (agent_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT state_version FROM supervisor_state WHERE agent_instance_id=?", (agent_id,)
+        ).fetchone()
         return int(row[0]) if row else 0
 
-    def commit_supervisor_turn(self, *, agent_id: str, run_id: str, input_version: int,
-                               snapshot: dict[str, Any], accepted_commands: list[dict[str, Any]],
-                               event: EventRecord) -> int:
+    def commit_supervisor_turn(
+        self,
+        *,
+        agent_id: str,
+        run_id: str,
+        input_version: int,
+        snapshot: dict[str, Any],
+        accepted_commands: list[dict[str, Any]],
+        event: EventRecord,
+    ) -> int:
         """Atomically commit the snapshot, decision record, and idempotent command outbox."""
         with self.transaction() as tx:
-            row = tx.execute("SELECT state_version FROM supervisor_state WHERE agent_instance_id=?", (agent_id,)).fetchone()
+            row = tx.execute(
+                "SELECT state_version FROM supervisor_state WHERE agent_instance_id=?", (agent_id,)
+            ).fetchone()
             current = int(row[0]) if row else 0
             if current != input_version:
-                raise RuntimeError(f"stale supervisor snapshot: expected {input_version}, found {current}")
+                raise RuntimeError(
+                    f"stale supervisor snapshot: expected {input_version}, found {current}"
+                )
             resulting = current + 1
             tx.execute(
                 "INSERT INTO supervisor_state VALUES (?, ?, ?, ?, ?) "
@@ -513,9 +685,11 @@ class Database:
                 (agent_id, run_id, resulting, json.dumps(snapshot), utc_now()),
             )
             for command in accepted_commands:
-                tx.execute("INSERT OR IGNORE INTO command_outbox(command_id,run_id,supervisor_id,payload,created_at) "
-                           "VALUES(?,?,?,?,?)", (command["command_id"], run_id, agent_id,
-                                                json.dumps(command), utc_now()))
+                tx.execute(
+                    "INSERT OR IGNORE INTO command_outbox(command_id,run_id,supervisor_id,payload,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (command["command_id"], run_id, agent_id, json.dumps(command), utc_now()),
+                )
             event.data["resulting_state_version"] = resulting
             self._append_event(tx, event)
         return resulting
@@ -528,56 +702,97 @@ class Database:
         inserted = tx.execute(
             "INSERT OR IGNORE INTO events(event_id,run_id,event_type,actor_id,correlation_id,causation_id,data,created_at) "
             "VALUES(?,?,?,?,?,?,?,?)",
-            (event.event_id, event.run_id, event.event_type, event.actor_id, event.correlation_id,
-             event.causation_id, json.dumps(event.data), event.created_at),
+            (
+                event.event_id,
+                event.run_id,
+                event.event_type,
+                event.actor_id,
+                event.correlation_id,
+                event.causation_id,
+                json.dumps(event.data),
+                event.created_at,
+            ),
         )
         tx.execute("INSERT OR IGNORE INTO outbox(event_id) VALUES (?)", (event.event_id,))
         # Best-effort telemetry is intentionally downstream of the durable journal write.
-        if inserted.rowcount:
+        if inserted.rowcount and inserted.lastrowid is not None:
             from poc.telemetry.domain_spans import emit_event_span
-            try:
-                emit_event_span(event, event_seq=int(inserted.lastrowid))
-            except Exception:
-                # The outbox retains the durable event for a later exporter retry.
-                pass
+
+            with suppress(Exception):
+                emit_event_span(event, event_seq=inserted.lastrowid)
 
     def events(self, run_id: str) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM events WHERE run_id=? ORDER BY seq", (run_id,)).fetchall()
+        rows = self.conn.execute(
+            "SELECT * FROM events WHERE run_id=? ORDER BY seq", (run_id,)
+        ).fetchall()
         return [{**dict(row), "data": json.loads(row["data"])} for row in rows]
 
     def put_artifact(self, artifact: ArtifactRecord) -> None:
         with self.transaction() as tx:
-            inserted = tx.execute("INSERT OR IGNORE INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                  (artifact.artifact_id, artifact.run_id, artifact.sha256, artifact.media_type,
-                                   artifact.path, artifact.producer_task_id, artifact.model_dump_json()))
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    artifact.artifact_id,
+                    artifact.run_id,
+                    artifact.sha256,
+                    artifact.media_type,
+                    artifact.path,
+                    artifact.producer_task_id,
+                    artifact.model_dump_json(),
+                ),
+            )
             if inserted.rowcount:
-                self._append_event(tx, EventRecord(run_id=artifact.run_id, event_type="artifact.created",
-                                                    data={"artifact_id": artifact.artifact_id,
-                                                          "sha256": artifact.sha256,
-                                                          "producer_task_id": artifact.producer_task_id}))
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=artifact.run_id,
+                        event_type="artifact.created",
+                        data={
+                            "artifact_id": artifact.artifact_id,
+                            "sha256": artifact.sha256,
+                            "producer_task_id": artifact.producer_task_id,
+                        },
+                    ),
+                )
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord | None:
-        row = self.conn.execute("SELECT payload FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT payload FROM artifacts WHERE artifact_id=?", (artifact_id,)
+        ).fetchone()
         return ArtifactRecord.model_validate_json(row[0]) if row else None
 
     def list_artifacts(self, run_id: str) -> list[ArtifactRecord]:
-        return [ArtifactRecord.model_validate_json(row[0]) for row in self.conn.execute(
-            "SELECT payload FROM artifacts WHERE run_id=? ORDER BY rowid", (run_id,))]
+        return [
+            ArtifactRecord.model_validate_json(row[0])
+            for row in self.conn.execute(
+                "SELECT payload FROM artifacts WHERE run_id=? ORDER BY rowid", (run_id,)
+            )
+        ]
 
-    def begin_operation(self, operation_id: str, run_id: str, task_id: str, kind: str, request: Any) -> str:
+    def begin_operation(
+        self, operation_id: str, run_id: str, task_id: str, kind: str, request: Any
+    ) -> str:
         with self.transaction() as tx:
-            existing = tx.execute("SELECT status,response FROM operations WHERE operation_id=?", (operation_id,)).fetchone()
+            existing = tx.execute(
+                "SELECT status,response FROM operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
             if existing:
                 return existing[0]
-            tx.execute("INSERT INTO operations VALUES (?, ?, ?, ?, 'started', ?, NULL, ?, NULL)",
-                       (operation_id, run_id, task_id, kind, json.dumps(request), utc_now()))
+            tx.execute(
+                "INSERT INTO operations VALUES (?, ?, ?, ?, 'started', ?, NULL, ?, NULL)",
+                (operation_id, run_id, task_id, kind, json.dumps(request), utc_now()),
+            )
         return "started"
 
     def finish_operation(self, operation_id: str, status: str, response: Any) -> None:
         with self.transaction() as tx:
-            tx.execute("UPDATE operations SET status=?,response=?,finished_at=? WHERE operation_id=?",
-                       (status, json.dumps(response), utc_now(), operation_id))
+            tx.execute(
+                "UPDATE operations SET status=?,response=?,finished_at=? WHERE operation_id=?",
+                (status, json.dumps(response), utc_now(), operation_id),
+            )
 
     def get_operation(self, operation_id: str) -> dict[str, Any] | None:
-        row = self.conn.execute("SELECT * FROM operations WHERE operation_id=?", (operation_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT * FROM operations WHERE operation_id=?", (operation_id,)
+        ).fetchone()
         return dict(row) if row else None

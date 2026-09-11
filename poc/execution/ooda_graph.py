@@ -1,3 +1,6 @@
+# pyright: reportTypedDictNotRequiredAccess=false
+"""OODA nodes intentionally receive partial LangGraph state updates."""
+
 from __future__ import annotations
 
 from typing import Any, TypedDict
@@ -5,7 +8,7 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from poc.models import AgentInstance, EventRecord, Outcome, ValidationRequest, WorkerResult, new_id
+from poc.models import AgentInstance, EventRecord, Outcome, ValidationRequest, WorkerResult
 from poc.persistence.database import Database
 from poc.roles.registry import RoleRegistry
 from poc.services.artifact_store import ArtifactStore
@@ -40,8 +43,14 @@ class WorkerState(TypedDict, total=False):
 
 
 class OODAHarness:
-    def __init__(self, db: Database, roles: RoleRegistry, model: DeterministicModelAdapter,
-                 tools: ToolGateway, artifacts: ArtifactStore):
+    def __init__(
+        self,
+        db: Database,
+        roles: RoleRegistry,
+        model: DeterministicModelAdapter,
+        tools: ToolGateway,
+        artifacts: ArtifactStore,
+    ):
         self.db = db
         self.roles = roles
         self.model = model
@@ -61,25 +70,44 @@ class OODAHarness:
         graph.add_edge(START, "observe")
         graph.add_edge("observe", "orient")
         graph.add_edge("orient", "decide")
-        graph.add_conditional_edges("decide", lambda state: state["decision"]["kind"], {
-            "act": "authorize_act", "request_validation": "request_validation",
-            "finish": "check_output", "fail": "failed_result",
-        })
-        graph.add_conditional_edges("authorize_act", lambda state: "done" if state.get("result") else "continue", {
-            "done": "check_output", "continue": "observe",
-        })
+        graph.add_conditional_edges(
+            "decide",
+            lambda state: state["decision"]["kind"],
+            {
+                "act": "authorize_act",
+                "request_validation": "request_validation",
+                "finish": "check_output",
+                "fail": "failed_result",
+            },
+        )
+        graph.add_conditional_edges(
+            "authorize_act",
+            lambda state: "done" if state.get("result") else "continue",
+            {
+                "done": "check_output",
+                "continue": "observe",
+            },
+        )
         graph.add_edge("request_validation", "observe")
         graph.add_edge("check_output", END)
         graph.add_edge("failed_result", END)
         return graph.compile()
 
     def _event(self, state: WorkerState, event_type: str, data: dict[str, Any]) -> None:
-        self.db.record_event(EventRecord(run_id=state["run_id"], event_type=event_type,
-                                         actor_id=state["agent"]["agent_instance_id"],
-                                         data={"workflow_id": state["workflow_id"],
-                                               "workflow_revision": state["workflow_revision"],
-                                               "task_id": state["task_id"],
-                                               "attempt_id": state["attempt_id"], **data}))
+        self.db.record_event(
+            EventRecord(
+                run_id=state["run_id"],
+                event_type=event_type,
+                actor_id=state["agent"]["agent_instance_id"],
+                data={
+                    "workflow_id": state["workflow_id"],
+                    "workflow_revision": state["workflow_revision"],
+                    "task_id": state["task_id"],
+                    "attempt_id": state["attempt_id"],
+                    **data,
+                },
+            )
+        )
 
     def observe(self, state: WorkerState) -> dict[str, Any]:
         cycle = state.get("cycle", 0) + 1
@@ -95,16 +123,30 @@ class OODAHarness:
             "timezone_ambiguous": ambiguous,
             "received_message_ids": [],
         }
-        self._event(state, "ooda.observe", {"ooda_phase": "observe", "ooda_cycle": cycle,
-                                             "input_artifacts": state.get("input_artifacts", [])})
+        self._event(
+            state,
+            "ooda.observe",
+            {
+                "ooda_phase": "observe",
+                "ooda_cycle": cycle,
+                "input_artifacts": state.get("input_artifacts", []),
+            },
+        )
         return {"cycle": cycle, "observation": observation}
 
     def orient(self, state: WorkerState) -> dict[str, Any]:
         role = state["agent"]["role_id"]
         oriented = self.model.orient(role, state["goal"], state["observation"])
-        self._event(state, "ooda.orient", {"ooda_phase": "orient", "ooda_cycle": state["cycle"],
-                                            "summary": oriented["summary"],
-                                            "uncertainties": oriented["uncertainties"]})
+        self._event(
+            state,
+            "ooda.orient",
+            {
+                "ooda_phase": "orient",
+                "ooda_cycle": state["cycle"],
+                "summary": oriented["summary"],
+                "uncertainties": oriented["uncertainties"],
+            },
+        )
         return {"orientation": oriented}
 
     def decide(self, state: WorkerState) -> dict[str, Any]:
@@ -112,24 +154,42 @@ class OODAHarness:
         limits = role_spec.execution_limits
         if state["cycle"] > limits["max_ooda_cycles"]:
             decision = {"kind": "fail", "justification": "OODA cycle budget exhausted"}
-        elif state.get("observation", {}).get("timezone_ambiguous") and not state.get("validation_response"):
+        elif state.get("observation", {}).get("timezone_ambiguous") and not state.get(
+            "validation_response"
+        ):
             if state.get("validations", 0) >= limits["max_validations"]:
                 decision = {"kind": "fail", "justification": "validation budget exhausted"}
             else:
-                decision = {"kind": "request_validation",
-                            "question": "May the timezone-less incident timestamps be treated as UTC?",
-                            "justification": "The fixture timestamp is ambiguous and affects the selected slice."}
+                decision = {
+                    "kind": "request_validation",
+                    "question": "May the timezone-less incident timestamps be treated as UTC?",
+                    "justification": "The fixture timestamp is ambiguous and affects the selected slice.",
+                }
         elif self._is_complete(state):
-            decision = {"kind": "finish", "justification": "Typed output is ready for acceptance checking."}
+            decision = {
+                "kind": "finish",
+                "justification": "Typed output is ready for acceptance checking.",
+            }
         elif state.get("tool_calls", 0) >= limits["max_tool_calls"]:
             decision = {"kind": "fail", "justification": "tool execution budget exhausted"}
         else:
             tool_name, arguments = self._next_action(state)
-            decision = {"kind": "act", "tool_name": tool_name, "arguments": arguments,
-                        "justification": "Execute the next narrow deterministic evidence operation."}
-        self._event(state, "ooda.decide", {"ooda_phase": "decide", "ooda_cycle": state["cycle"],
-                                            "decision_kind": decision["kind"],
-                                            "justification": decision["justification"]})
+            decision = {
+                "kind": "act",
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "justification": "Execute the next narrow deterministic evidence operation.",
+            }
+        self._event(
+            state,
+            "ooda.decide",
+            {
+                "ooda_phase": "decide",
+                "ooda_cycle": state["cycle"],
+                "decision_kind": decision["kind"],
+                "justification": decision["justification"],
+            },
+        )
         return {"decision": decision}
 
     def authorize_act(self, state: WorkerState) -> dict[str, Any]:
@@ -137,14 +197,27 @@ class OODAHarness:
         call_index = state.get("tool_calls", 0) + 1
         operation_id = f"{state['attempt_id']}:{call_index}:{decision['tool_name']}"
         actor = AgentInstance.model_validate(state["agent"])
-        result = self.tools.execute(operation_id=operation_id, actor=actor, task_id=state["task_id"],
-                                    tool_name=decision["tool_name"], arguments=decision["arguments"])
+        result = self.tools.execute(
+            operation_id=operation_id,
+            actor=actor,
+            task_id=state["task_id"],
+            tool_name=decision["tool_name"],
+            arguments=decision["arguments"],
+        )
         working = dict(state.get("working", {}))
         working[decision["tool_name"]] = result
         working["latest_tool_result"] = result
         produced = self._derive_result(state, working)
-        self._event(state, "ooda.act", {"ooda_phase": "act", "ooda_cycle": state["cycle"],
-                                         "tool_name": decision["tool_name"], "operation_id": operation_id})
+        self._event(
+            state,
+            "ooda.act",
+            {
+                "ooda_phase": "act",
+                "ooda_cycle": state["cycle"],
+                "tool_name": decision["tool_name"],
+                "operation_id": operation_id,
+            },
+        )
         update: dict[str, Any] = {"tool_calls": call_index, "working": working}
         if produced is not None:
             update["result"] = produced
@@ -152,41 +225,78 @@ class OODAHarness:
 
     def request_validation(self, state: WorkerState) -> dict[str, Any]:
         request_id = f"validation:{state['workflow_id']}:{state['task_id']}:{state['attempt_id']}"
-        request = ValidationRequest(request_id=request_id, workflow_id=state["workflow_id"],
-                                    task_id=state["task_id"],
-                                    agent_instance_id=state["agent"]["agent_instance_id"],
-                                    question=state["decision"]["question"],
-                                    evidence_artifacts=state.get("input_artifacts", []))
-        self._event(state, "validation.requested", {"request_id": request_id, "question": request.question})
+        request = ValidationRequest(
+            request_id=request_id,
+            workflow_id=state["workflow_id"],
+            task_id=state["task_id"],
+            agent_instance_id=state["agent"]["agent_instance_id"],
+            question=state["decision"]["question"],
+            evidence_artifacts=state.get("input_artifacts", []),
+        )
+        self._event(
+            state, "validation.requested", {"request_id": request_id, "question": request.question}
+        )
         resolution = interrupt(request.model_dump())
-        self._event(state, "validation.resolved", {"request_id": request_id,
-                                                    "approved": resolution.get("approved", False)})
+        self._event(
+            state,
+            "validation.resolved",
+            {"request_id": request_id, "approved": resolution.get("approved", False)},
+        )
         return {"validations": state.get("validations", 0) + 1, "validation_response": resolution}
 
     def check_output(self, state: WorkerState) -> dict[str, Any]:
         result = state["result"]
         artifact = self.artifacts.write(state["run_id"], result, producer_task_id=state["task_id"])
-        published = result.get("published", {}).get("artifact_id") if isinstance(result, dict) else None
-        evidence = list(dict.fromkeys([*state.get("input_artifacts", []), *([published] if published else []), artifact.artifact_id]))
-        checks = [{"criterion": criterion, "passed": True} for criterion in state.get("acceptance_criteria", [])]
-        worker_result = WorkerResult(task_id=state["task_id"],
-                                     agent_instance_id=state["agent"]["agent_instance_id"],
-                                     attempt_id=state["attempt_id"], outcome=Outcome.SUCCEEDED,
-                                     output_schema=state["output_schema"], result=result,
-                                     output_artifact=artifact.artifact_id, evidence_artifacts=evidence,
-                                     acceptance_checks=checks,
-                                     completion_summary=f"Produced validated {state['output_schema']} output.")
-        self._event(state, "worker.completed", {"outcome": "succeeded", "output_artifact": artifact.artifact_id,
-                                                 "output_schema": state["output_schema"]})
-        return {"evidence_artifacts": evidence, "worker_result": worker_result.model_dump(mode="json")}
+        published_value = (
+            result.get("published", {}).get("artifact_id") if isinstance(result, dict) else None
+        )
+        published = published_value if isinstance(published_value, str) else None
+        evidence: list[str] = list(dict.fromkeys(state.get("input_artifacts", [])))
+        if published and published not in evidence:
+            evidence.append(published)
+        if artifact.artifact_id not in evidence:
+            evidence.append(artifact.artifact_id)
+        checks = [
+            {"criterion": criterion, "passed": True}
+            for criterion in state.get("acceptance_criteria", [])
+        ]
+        worker_result = WorkerResult(
+            task_id=state["task_id"],
+            agent_instance_id=state["agent"]["agent_instance_id"],
+            attempt_id=state["attempt_id"],
+            outcome=Outcome.SUCCEEDED,
+            output_schema=state["output_schema"],
+            result=result,
+            output_artifact=artifact.artifact_id,
+            evidence_artifacts=evidence,
+            acceptance_checks=checks,
+            completion_summary=f"Produced validated {state['output_schema']} output.",
+        )
+        self._event(
+            state,
+            "worker.completed",
+            {
+                "outcome": "succeeded",
+                "output_artifact": artifact.artifact_id,
+                "output_schema": state["output_schema"],
+            },
+        )
+        return {
+            "evidence_artifacts": evidence,
+            "worker_result": worker_result.model_dump(mode="json"),
+        }
 
     def failed_result(self, state: WorkerState) -> dict[str, Any]:
         reason = state["decision"]["justification"]
-        worker_result = WorkerResult(task_id=state["task_id"],
-                                     agent_instance_id=state["agent"]["agent_instance_id"],
-                                     attempt_id=state["attempt_id"], outcome=Outcome.FAILED,
-                                     output_schema=state["output_schema"], completion_summary=reason,
-                                     evidence_artifacts=state.get("input_artifacts", []))
+        worker_result = WorkerResult(
+            task_id=state["task_id"],
+            agent_instance_id=state["agent"]["agent_instance_id"],
+            attempt_id=state["attempt_id"],
+            outcome=Outcome.FAILED,
+            output_schema=state["output_schema"],
+            completion_summary=reason,
+            evidence_artifacts=state.get("input_artifacts", []),
+        )
         self._event(state, "worker.completed", {"outcome": "failed", "reason": reason})
         return {"error": reason, "worker_result": worker_result.model_dump(mode="json")}
 
@@ -198,23 +308,42 @@ class OODAHarness:
         inputs, working = state.get("inputs", {}), state.get("working", {})
         validation = state.get("validation_response", {})
         if role == "window_selector":
-            return "read_metric_slice", {"start": "2026-04-17T12:00:00Z", "end": "2026-04-17T13:09:00Z"}
+            return "read_metric_slice", {
+                "start": "2026-04-17T12:00:00Z",
+                "end": "2026-04-17T13:09:00Z",
+            }
         if role == "percentile_calculator":
             if "read_metric_slice" not in working:
                 window = inputs["window"]
-                return "read_metric_slice", {**window, "assume_timezone": "UTC" if validation.get("approved") else None}
-            return "calculate_percentile", {"values": [r["latency_ms"] for r in working["read_metric_slice"]["rows"]],
-                                             "percentile": 95, "units": "ms"}
+                return "read_metric_slice", {
+                    **window,
+                    "assume_timezone": "UTC" if validation.get("approved") else None,
+                }
+            return "calculate_percentile", {
+                "values": [r["latency_ms"] for r in working["read_metric_slice"]["rows"]],
+                "percentile": 95,
+                "units": "ms",
+            }
         if role == "manifest_reader":
             return "read_manifest", {}
         if role == "log_slice_selector":
-            return "read_log_slice", {"start": "2026-04-17T12:00:00Z", "end": "2026-04-17T13:10:00Z"}
+            return "read_log_slice", {
+                "start": "2026-04-17T12:00:00Z",
+                "end": "2026-04-17T13:10:00Z",
+            }
         if role == "log_pattern_counter":
             return "count_log_pattern", {"rows": inputs["log_slice"]["rows"]}
         if role == "deployment_matcher":
-            return "read_deployment_record", {"incident_start": "2026-04-17T13:00:00Z", "lookback_minutes": 30}
+            return "read_deployment_record", {
+                "incident_start": "2026-04-17T13:00:00Z",
+                "lookback_minutes": 30,
+            }
         content = self._synthesis_content(role, inputs)
-        media_type = "text/markdown" if role in {"section_renderer", "report_assembler"} else "application/json"
+        media_type = (
+            "text/markdown"
+            if role in {"section_renderer", "report_assembler"}
+            else "application/json"
+        )
         return "write_artifact", {"content": content, "media_type": media_type}
 
     def _derive_result(self, state: WorkerState, working: dict[str, Any]) -> dict[str, Any] | None:
@@ -222,9 +351,18 @@ class OODAHarness:
         latest = working["latest_tool_result"]
         if role == "window_selector":
             return {
-                "baseline": {"start": "2026-04-17T12:00:00Z", "end": "2026-04-17T12:09:00Z", "service": "checkout"},
-                "incident": {"start": "2026-04-17T13:00:00", "end": "2026-04-17T13:09:00", "service": "checkout"},
-                "sample_count": latest["count"], "timezone_note": "incident window source omitted timezone",
+                "baseline": {
+                    "start": "2026-04-17T12:00:00Z",
+                    "end": "2026-04-17T12:09:00Z",
+                    "service": "checkout",
+                },
+                "incident": {
+                    "start": "2026-04-17T13:00:00",
+                    "end": "2026-04-17T13:09:00",
+                    "service": "checkout",
+                },
+                "sample_count": latest["count"],
+                "timezone_note": "incident window source omitted timezone",
             }
         if role == "percentile_calculator":
             if "calculate_percentile" in working:
@@ -237,9 +375,17 @@ class OODAHarness:
         if role == "log_pattern_counter":
             return {"pattern_counts": latest}
         if role == "deployment_matcher":
-            return {"deployment_match": latest,
-                    "pattern_counts": state.get("inputs", {}).get("pattern_counts", {})}
-        if role in {"metric_comparator", "claim_drafter", "claim_checker", "section_renderer", "report_assembler"}:
+            return {
+                "deployment_match": latest,
+                "pattern_counts": state.get("inputs", {}).get("pattern_counts", {}),
+            }
+        if role in {
+            "metric_comparator",
+            "claim_drafter",
+            "claim_checker",
+            "section_renderer",
+            "report_assembler",
+        }:
             return {"content": self._synthesis_content(role, state["inputs"]), "published": latest}
         return latest
 
@@ -247,24 +393,38 @@ class OODAHarness:
         if role == "metric_comparator":
             baseline = inputs["baseline"]["value"]
             incident = inputs["incident"]["value"]
-            return {"baseline_p95_ms": baseline, "incident_p95_ms": incident,
-                    "absolute_increase_ms": round(incident - baseline, 2),
-                    "ratio": round(incident / baseline, 2),
-                    "claim": f"Checkout p95 rose from {baseline:.2f} ms to {incident:.2f} ms ({incident / baseline:.2f}x)."}
+            return {
+                "baseline_p95_ms": baseline,
+                "incident_p95_ms": incident,
+                "absolute_increase_ms": round(incident - baseline, 2),
+                "ratio": round(incident / baseline, 2),
+                "claim": f"Checkout p95 rose from {baseline:.2f} ms to {incident:.2f} ms ({incident / baseline:.2f}x).",
+            }
         if role == "claim_drafter":
             metric = inputs["metrics"]
             evidence = inputs["evidence"]
             deployment = evidence["deployment_match"]["matches"][0]
-            return {"claim": (
-                f"The regression is likely related to {deployment['version']}, deployed "
-                f"{deployment['minutes_before_incident']} minutes before the incident, because latency rose "
-                f"{metric['ratio']}x while cache_miss became the dominant incident log pattern."
-            ), "confidence": "medium", "alternatives": ["upstream payment latency"]}
+            return {
+                "claim": (
+                    f"The regression is likely related to {deployment['version']}, deployed "
+                    f"{deployment['minutes_before_incident']} minutes before the incident, because latency rose "
+                    f"{metric['ratio']}x while cache_miss became the dominant incident log pattern."
+                ),
+                "confidence": "medium",
+                "alternatives": ["upstream payment latency"],
+            }
         if role == "claim_checker":
             draft = inputs["draft"]
-            return {"claim": draft["claim"], "supported": True,
-                    "checks": ["metric units present", "deployment proximity present", "misleading payment_timeout qualified"],
-                    "caveat": "Temporal association is not proof of causation."}
+            return {
+                "claim": draft["claim"],
+                "supported": True,
+                "checks": [
+                    "metric units present",
+                    "deployment proximity present",
+                    "misleading payment_timeout qualified",
+                ],
+                "caveat": "Temporal association is not proof of causation.",
+            }
         if role == "section_renderer":
             checked = inputs["checked"]
             return (

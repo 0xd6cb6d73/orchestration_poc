@@ -3,4 +3,3 @@
 from poc.models import InputBinding, TaskSpec, WorkflowSpec
 
 __all__ = ["InputBinding", "TaskSpec", "WorkflowSpec"]
-

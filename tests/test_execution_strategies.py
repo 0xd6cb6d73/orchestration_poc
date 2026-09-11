@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -39,13 +39,11 @@ async def _authorized_team(runtime, supervisor_role: str, worker_roles: list[str
 
 @pytest.mark.asyncio
 async def test_board_claim_is_atomic_and_fenced_at_tool_gateway(runtime):
-    run, supervisor, workers = await _authorized_team(
-        runtime, "metrics_supervisor", []
-    )
+    run, supervisor, workers = await _authorized_team(runtime, "metrics_supervisor", [])
     policy = ExecutionPolicy(
         mode=ExecutionMode.BOARD_CLAIM,
         max_workers=2,
-        allowed_roles={"manifest_reader"},
+        allowed_roles=frozenset({"manifest_reader"}),
         lease_seconds=30,
     )
     handle = await runtime.submit_execution(
@@ -66,9 +64,14 @@ async def test_board_claim_is_atomic_and_fenced_at_tool_gateway(runtime):
         required_role="manifest_reader",
         task_spec_ref="fixture:manifest-timezone",
     )
-    claim = board.claim_next(execution_id=handle.execution_id, worker_id=workers[0].agent_instance_id)
+    claim = board.claim_next(
+        execution_id=handle.execution_id, worker_id=workers[0].agent_instance_id
+    )
     assert claim is not None
-    assert board.claim_next(execution_id=handle.execution_id, worker_id=workers[1].agent_instance_id) is None
+    assert (
+        board.claim_next(execution_id=handle.execution_id, worker_id=workers[1].agent_instance_id)
+        is None
+    )
     assert "token" not in repr(claim)
     with pytest.raises(ToolDenied, match="ownership grant"):
         runtime.tools.execute(
@@ -105,14 +108,19 @@ async def test_board_claim_is_atomic_and_fenced_at_tool_gateway(runtime):
         required_role="manifest_reader",
         task_spec_ref="fixture:retry",
     )
-    expired_claim = board.claim_next(execution_id=handle.execution_id, worker_id=workers[0].agent_instance_id)
+    expired_claim = board.claim_next(
+        execution_id=handle.execution_id, worker_id=workers[0].agent_instance_id
+    )
     runtime.db.conn.execute(
         "UPDATE swarm_tasks SET lease_expires_at=? WHERE execution_id=? AND task_id=?",
         ("2000-01-01T00:00:00+00:00", handle.execution_id, "retry-timezone"),
     )
     runtime.db.conn.commit()
     assert board.reap_expired(handle.execution_id) == ["retry-timezone"]
-    replacement = board.claim_next(execution_id=handle.execution_id, worker_id=workers[1].agent_instance_id)
+    replacement = board.claim_next(
+        execution_id=handle.execution_id, worker_id=workers[1].agent_instance_id
+    )
+    assert expired_claim is not None
     assert replacement is not None
     assert replacement.generation == expired_claim.generation + 1
 
@@ -125,7 +133,7 @@ async def test_managed_pool_uses_deterministic_tie_break(runtime):
     policy = ExecutionPolicy(
         mode=ExecutionMode.MANAGED_POOL,
         max_workers=2,
-        allowed_roles={"manifest_reader"},
+        allowed_roles=frozenset({"manifest_reader"}),
         options={"role_quotas": {"manifest_reader": 2}},
     )
     handle = await runtime.submit_execution(
@@ -136,15 +144,23 @@ async def test_managed_pool_uses_deterministic_tie_break(runtime):
     )
     pool = runtime.strategies.get(ExecutionMode.MANAGED_POOL)
     assert isinstance(pool, ManagedPoolStrategy)
-    slots = [pool.start_slot(execution_id=handle.execution_id, worker_id=worker.agent_instance_id) for worker in workers]
+    slots = [
+        pool.start_slot(execution_id=handle.execution_id, worker_id=worker.agent_instance_id)
+        for worker in workers
+    ]
     offer = pool.publish_offer(
         execution_id=handle.execution_id,
         task_id="pool-task",
         eligible_roles=["manifest_reader"],
-        bid_deadline=datetime.now(timezone.utc) + timedelta(minutes=1),
+        bid_deadline=datetime.now(UTC) + timedelta(minutes=1),
     )
     for slot in slots:
-        pool.submit_bid(execution_id=handle.execution_id, offer_id=offer, slot_id=slot, fit_features={"score": 1})
+        pool.submit_bid(
+            execution_id=handle.execution_id,
+            offer_id=offer,
+            slot_id=slot,
+            fit_features={"score": 1},
+        )
     assignment = pool.arbitrate(execution_id=handle.execution_id, offer_id=offer)
     assert assignment.slot_id == min(slots)
     assert pool.validate_assignment(assignment, task_id="pool-task", worker_id=assignment.worker_id)
@@ -154,7 +170,9 @@ async def test_managed_pool_uses_deterministic_tie_break(runtime):
     )
     runtime.db.conn.commit()
     assert pool.reap_expired(handle.execution_id) == [assignment.assignment_id]
-    assert not pool.validate_assignment(assignment, task_id="pool-task", worker_id=assignment.worker_id)
+    assert not pool.validate_assignment(
+        assignment, task_id="pool-task", worker_id=assignment.worker_id
+    )
     replacement = pool.arbitrate(execution_id=handle.execution_id, offer_id=offer)
     assert replacement.generation == assignment.generation + 1
     pool.complete(replacement, result_ref="inline:UTC")
@@ -169,7 +187,7 @@ async def test_speculative_candidates_are_read_only_and_reconciled_explicitly(ru
         mode=ExecutionMode.SPECULATIVE,
         max_workers=2,
         speculative_fanout=2,
-        allowed_roles={"claim_drafter"},
+        allowed_roles=frozenset({"claim_drafter"}),
         effect_policy=EffectPolicy.READ_ONLY,
     )
     handle = await runtime.submit_execution(
@@ -180,7 +198,9 @@ async def test_speculative_candidates_are_read_only_and_reconciled_explicitly(ru
     )
     speculative = runtime.strategies.get(ExecutionMode.SPECULATIVE)
     assert isinstance(speculative, SpeculativeStrategy)
-    group = speculative.start_group(execution_id=handle.execution_id, logical_task_id="candidate-cause")
+    group = speculative.start_group(
+        execution_id=handle.execution_id, logical_task_id="candidate-cause"
+    )
     grants = [
         speculative.authorize_candidate(
             execution_id=handle.execution_id, group_id=group, worker_id=worker.agent_instance_id

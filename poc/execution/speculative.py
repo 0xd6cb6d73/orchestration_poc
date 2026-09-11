@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from poc.execution.strategy import PersistentExecutionStrategy, StrategyError
 from poc.models import EffectPolicy, EventRecord, ExecutionMode, new_id, utc_now
@@ -101,7 +102,9 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
             )
         return group_id
 
-    def authorize_candidate(self, *, execution_id: str, group_id: str, worker_id: str) -> CandidateGrant:
+    def authorize_candidate(
+        self, *, execution_id: str, group_id: str, worker_id: str
+    ) -> CandidateGrant:
         execution, policy = self._active_execution(execution_id)
         worker = self.db.get_agent(worker_id)
         if (
@@ -225,10 +228,16 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
                 "SELECT * FROM swarm_candidates WHERE group_id=? AND state='completed' ORDER BY candidate_id",
                 (group_id,),
             ).fetchall()
-            required = group["fanout_k"] if group["stop_policy"] == "require_all" else (group["fanout_k"] // 2 + 1)
+            required = (
+                group["fanout_k"]
+                if group["stop_policy"] == "require_all"
+                else (group["fanout_k"] // 2 + 1)
+            )
             if len(candidates) < required:
                 raise StrategyError(f"reconciliation requires {required} completed candidates")
-            valid_ids = [row["candidate_id"] for row in candidates if row["validation_status"] == "valid"]
+            valid_ids = [
+                row["candidate_id"] for row in candidates if row["validation_status"] == "valid"
+            ]
             if not valid_ids:
                 raise StrategyError("no candidate passed deterministic validation")
             accepted = list(dict.fromkeys(accepted_candidate_ids or [valid_ids[0]]))
@@ -314,7 +323,8 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
         groups = [
             dict(row)
             for row in self.db.conn.execute(
-                "SELECT * FROM swarm_speculation_groups WHERE execution_id=? ORDER BY created_at", (execution_id,)
+                "SELECT * FROM swarm_speculation_groups WHERE execution_id=? ORDER BY created_at",
+                (execution_id,),
             )
         ]
         group_ids = [row["group_id"] for row in groups]

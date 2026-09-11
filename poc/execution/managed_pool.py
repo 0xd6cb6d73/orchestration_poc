@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from poc.execution.strategy import PersistentExecutionStrategy, StrategyError
 from poc.models import EventRecord, ExecutionHandle, ExecutionMode, ExecutionPolicy, new_id, utc_now
@@ -43,8 +44,10 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
         if not role_quotas:
             return
         unknown = set(role_quotas) - policy.allowed_roles
-        if unknown or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
-                          for value in role_quotas.values()):
+        if unknown or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in role_quotas.values()
+        ):
             raise StrategyError("role quotas must be non-negative integers within allowed_roles")
         if sum(role_quotas.values()) < policy.max_workers:
             raise StrategyError("role quotas cannot be smaller than max_workers in aggregate")
@@ -78,7 +81,9 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                         "pool_id": pool_id,
                         "role_quotas": role_quotas,
                         "max_slots": policy.max_workers,
-                        "arbitration_policy": policy.options.get("arbitration_policy", "deterministic-v1"),
+                        "arbitration_policy": policy.options.get(
+                            "arbitration_policy", "deterministic-v1"
+                        ),
                     },
                 ),
             )
@@ -104,9 +109,12 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
         ):
             raise StrategyError("worker identity is not authorized for this pool")
         with self.db.transaction() as tx:
-            pool = tx.execute("SELECT * FROM swarm_pools WHERE pool_id=? AND state='active'", (pool_id,)).fetchone()
+            pool = tx.execute(
+                "SELECT * FROM swarm_pools WHERE pool_id=? AND state='active'", (pool_id,)
+            ).fetchone()
             count = tx.execute(
-                "SELECT count(*) FROM swarm_pool_slots WHERE pool_id=? AND status!='dead'", (pool_id,)
+                "SELECT count(*) FROM swarm_pool_slots WHERE pool_id=? AND status!='dead'",
+                (pool_id,),
             ).fetchone()[0]
             role_count = tx.execute(
                 "SELECT count(*) FROM swarm_pool_slots WHERE pool_id=? AND role_id=? AND status!='dead'",
@@ -225,7 +233,15 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
             try:
                 tx.execute(
                     "INSERT INTO swarm_bids VALUES (?,?,?,?,?,?,?)",
-                    (bid_id, offer_id, slot_id, 1, 1, json.dumps(fit_features or {}, sort_keys=True), now),
+                    (
+                        bid_id,
+                        offer_id,
+                        slot_id,
+                        1,
+                        1,
+                        json.dumps(fit_features or {}, sort_keys=True),
+                        now,
+                    ),
                 )
             except Exception as exc:
                 raise StrategyError("the slot already bid on this offer") from exc
@@ -235,7 +251,11 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                     run_id=execution["run_id"],
                     event_type="bid.submitted",
                     actor_id=slot["worker_instance_id"],
-                    data={"offer_id": offer_id, "slot_id": slot_id, "fit_features": fit_features or {}},
+                    data={
+                        "offer_id": offer_id,
+                        "slot_id": slot_id,
+                        "fit_features": fit_features or {},
+                    },
                 ),
             )
         return bid_id
@@ -243,7 +263,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
     def arbitrate(self, *, execution_id: str, offer_id: str) -> Assignment:
         execution, policy = self._active_execution(execution_id)
         pool_id = self.pool_id(execution_id)
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         with self.db.transaction() as tx:
             offer = tx.execute(
@@ -330,7 +350,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
 
     def heartbeat(self, assignment: Assignment) -> str:
         _, policy = self._active_execution(assignment.execution_id)
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(seconds=policy.lease_seconds)).isoformat()
         with self.db.transaction() as tx:
@@ -350,7 +370,8 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
             if changed.rowcount != 1:
                 raise StaleAssignment("assignment no longer owns the task")
             tx.execute(
-                "UPDATE swarm_pool_slots SET last_seen_at=? WHERE slot_id=?", (now, assignment.slot_id)
+                "UPDATE swarm_pool_slots SET last_seen_at=? WHERE slot_id=?",
+                (now, assignment.slot_id),
             )
         return expires_at
 
@@ -371,7 +392,9 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                     "WHERE assignment_id=? AND state='active'",
                     (now, row["assignment_id"]),
                 )
-                tx.execute("UPDATE swarm_offers SET state='open' WHERE offer_id=?", (row["offer_id"],))
+                tx.execute(
+                    "UPDATE swarm_offers SET state='open' WHERE offer_id=?", (row["offer_id"],)
+                )
                 tx.execute(
                     "UPDATE swarm_pool_slots SET status='idle',last_seen_at=? WHERE slot_id=?",
                     (now, row["slot_id"]),
@@ -457,9 +480,21 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
             return {"pool": None, "slots": [], "offers": [], "assignments": []}
         key = pool_id[0]
         return {
-            "pool": dict(self.db.conn.execute("SELECT * FROM swarm_pools WHERE pool_id=?", (key,)).fetchone()),
-            "slots": [dict(row) for row in self.db.conn.execute("SELECT * FROM swarm_pool_slots WHERE pool_id=?", (key,))],
-            "offers": [dict(row) for row in self.db.conn.execute("SELECT * FROM swarm_offers WHERE pool_id=?", (key,))],
+            "pool": dict(
+                self.db.conn.execute("SELECT * FROM swarm_pools WHERE pool_id=?", (key,)).fetchone()
+            ),
+            "slots": [
+                dict(row)
+                for row in self.db.conn.execute(
+                    "SELECT * FROM swarm_pool_slots WHERE pool_id=?", (key,)
+                )
+            ],
+            "offers": [
+                dict(row)
+                for row in self.db.conn.execute(
+                    "SELECT * FROM swarm_offers WHERE pool_id=?", (key,)
+                )
+            ],
             "assignments": [
                 dict(row)
                 for row in self.db.conn.execute(
@@ -473,12 +508,12 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
 def _timestamp(value: datetime | str) -> str:
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat()
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat()
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat()
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
 
 
 def _token_hash(token: str) -> str:

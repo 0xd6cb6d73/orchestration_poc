@@ -58,7 +58,9 @@ class StrategyRegistry:
         self._factories: dict[ExecutionMode, StrategyFactory] = {}
         self._instances: dict[ExecutionMode, ExecutionStrategy] = {}
 
-    def register(self, mode: ExecutionMode | str, factory: StrategyFactory, *, replace: bool = False) -> None:
+    def register(
+        self, mode: ExecutionMode | str, factory: StrategyFactory, *, replace: bool = False
+    ) -> None:
         normalized = ExecutionMode(mode)
         if normalized in self._factories and not replace:
             raise ValueError(f"strategy already registered for {normalized.value!r}")
@@ -68,7 +70,9 @@ class StrategyRegistry:
     def get(self, mode: ExecutionMode | str) -> ExecutionStrategy:
         normalized = ExecutionMode(mode)
         if normalized not in self._factories:
-            raise StrategyNotRegistered(f"no execution strategy registered for {normalized.value!r}")
+            raise StrategyNotRegistered(
+                f"no execution strategy registered for {normalized.value!r}"
+            )
         if normalized not in self._instances:
             strategy = self._factories[normalized](self.db)
             if strategy.mode != normalized:
@@ -152,7 +156,9 @@ class PersistentExecutionStrategy:
         if existing is not None:
             stored_policy = ExecutionPolicy.model_validate_json(existing["policy"])
             if stored_policy != policy:
-                raise StrategyError("goal_ref is already registered with a different execution policy")
+                raise StrategyError(
+                    "goal_ref is already registered with a different execution policy"
+                )
             return ExecutionHandle(
                 execution_id=existing["execution_id"],
                 run_id=run_id,
@@ -267,7 +273,8 @@ class PersistentExecutionStrategy:
         if row is None or row["mode"] != self.mode or row["status"] != "active":
             raise StrategyError("execution is not active for this strategy")
         policy = ExecutionPolicy.model_validate_json(row["policy"])
-        if not self.db.authority_active(row["run_id"], self.db.get_agent(row["owner_suborchestrator_id"]).plan_version):
+        owner = self.db.get_agent(row["owner_suborchestrator_id"])
+        if owner is None or not self.db.authority_active(row["run_id"], owner.plan_version):
             raise StrategyError("plan authority is inactive or superseded")
         return row, policy
 

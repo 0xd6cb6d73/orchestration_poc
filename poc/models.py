@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
@@ -9,7 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def new_id(prefix: str) -> str:
@@ -91,7 +91,7 @@ class ExecutionPolicy(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def validate_mode_limits(self) -> "ExecutionPolicy":
+    def validate_mode_limits(self) -> ExecutionPolicy:
         if not self.allowed_roles:
             raise ValueError("allowed_roles must not be empty")
         if self.speculative_fanout > self.max_workers:
@@ -162,7 +162,7 @@ class PlanArea(BaseModel):
     )
 
     @model_validator(mode="after")
-    def selected_mode_is_authorized(self) -> "PlanArea":
+    def selected_mode_is_authorized(self) -> PlanArea:
         if self.execution_mode not in self.allowed_execution_modes:
             raise ValueError("execution_mode must be included in allowed_execution_modes")
         return self
@@ -178,7 +178,9 @@ class MissionPlan(BaseModel):
     permitted_sources: list[str]
     permitted_tools: list[str]
     areas: list[PlanArea]
-    budgets: dict[str, int] = Field(default_factory=lambda: {"max_workers": 4, "ooda_cycles": 3, "tool_calls": 2})
+    budgets: dict[str, int] = Field(
+        default_factory=lambda: {"max_workers": 4, "ooda_cycles": 3, "tool_calls": 2}
+    )
     completion_criteria: list[str]
     created_at: str = Field(default_factory=utc_now)
 
@@ -281,7 +283,7 @@ class WorkflowSpec(BaseModel):
     tasks: list[TaskSpec]
 
     @model_validator(mode="after")
-    def validate_dag(self) -> "WorkflowSpec":
+    def validate_dag(self) -> WorkflowSpec:
         ids = [task.id for task in self.tasks]
         if len(ids) != len(set(ids)):
             raise ValueError("task ids must be unique")

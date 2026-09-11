@@ -21,8 +21,12 @@ async def test_validation_delegates_lookup_and_resumes_correct_checkpoint(runtim
     assert "workflow.paused" in types
     assert "workflow.resumed" in types
     assert any(agent["role_id"] == "manifest_reader" for agent in status["agents"])
-    requested = next(event for event in status["events"] if event["event_type"] == "validation.requested")
-    resolved = next(event for event in status["events"] if event["event_type"] == "validation.resolved")
+    requested = next(
+        event for event in status["events"] if event["event_type"] == "validation.requested"
+    )
+    resolved = next(
+        event for event in status["events"] if event["event_type"] == "validation.resolved"
+    )
     assert requested["data"]["request_id"] == resolved["data"]["request_id"]
 
 
@@ -32,4 +36,3 @@ async def test_stale_plan_approval_is_rejected(runtime):
     await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     with pytest.raises(ValueError):
         await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
-

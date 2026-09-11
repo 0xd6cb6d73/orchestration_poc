@@ -52,4 +52,3 @@ class SupervisorDecision(BaseModel):
     summary: str
     commands: list[dict[str, Any]] = Field(default_factory=list)
     waiting_for: list[str] = Field(default_factory=list)
-

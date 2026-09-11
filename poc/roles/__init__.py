@@ -1,2 +1,1 @@
 """Versioned agent role registry."""
-

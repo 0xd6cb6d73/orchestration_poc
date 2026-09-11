@@ -45,6 +45,16 @@ uv run pytest
 uv build
 ```
 
+Install and run the repository's formatting, linting, and type-checking hooks with:
+
+```bash
+uv run pre-commit install
+uv run pre-commit run --all-files
+```
+
+The checked-in `.pre-commit-config.yaml` runs Ruff lint fixes, Ruff formatting, and
+Pyright through the versions pinned in `uv.lock`.
+
 `uv.lock` pins the complete resolution. Runtime, developer, and optional telemetry
 dependencies are declared in `pyproject.toml`; install Phoenix instrumentation with
 `uv sync --extra telemetry`.

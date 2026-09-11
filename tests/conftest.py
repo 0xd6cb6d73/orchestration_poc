@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from poc.control.runtime import Runtime
@@ -18,4 +16,3 @@ def runtime(tmp_path):
 async def finish_run(runtime: Runtime, run_id: str) -> dict:
     await runtime.wait(run_id)
     return runtime.status(run_id)
-

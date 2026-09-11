@@ -1,3 +1,6 @@
+# pyright: reportTypedDictNotRequiredAccess=false
+"""LangGraph decision nodes intentionally receive partial state updates."""
+
 from __future__ import annotations
 
 from typing import Any, TypedDict
@@ -20,17 +23,18 @@ def build_decision_graph():
     """One bounded supervisor decision turn; it never waits for child work."""
 
     def interpret(state: DecisionState) -> dict[str, Any]:
-        return {"interpretation": f"Handle {state['event']['type']} and return immediately after dispatch."}
+        return {
+            "interpretation": f"Handle {state['event']['type']} and return immediately after dispatch."
+        }
 
     def validate(state: DecisionState) -> dict[str, Any]:
         tier = state["supervisor"]["tier"]
         accepted, rejected = [], []
         for command in state.get("proposed_commands", []):
             kind = command.get("kind")
-            valid = (
-                tier == Tier.MAIN and kind in {"assign_goal", "deliver_artifact"}
-            ) or (
-                tier == Tier.SUB and kind in {"submit_workflow", "resolve_validation", "deliver_artifact"}
+            valid = (tier == Tier.MAIN and kind in {"assign_goal", "deliver_artifact"}) or (
+                tier == Tier.SUB
+                and kind in {"submit_workflow", "resolve_validation", "deliver_artifact"}
             )
             (accepted if valid else rejected).append(command)
         return {"accepted_commands": accepted, "rejected_commands": rejected}

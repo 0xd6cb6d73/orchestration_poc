@@ -1,7 +1,11 @@
 """Execution runtimes and pluggable scheduling strategies."""
 
 from poc.execution.board_claim import BoardClaimStrategy, Claim, StaleClaim
-from poc.execution.capacity import CapacityScheduler, InProcessWorkerMaterializer, WorkerMaterializer
+from poc.execution.capacity import (
+    CapacityScheduler,
+    InProcessWorkerMaterializer,
+    WorkerMaterializer,
+)
 from poc.execution.hierarchical_strategy import HierarchicalDAGStrategy
 from poc.execution.managed_pool import Assignment, ManagedPoolStrategy, StaleAssignment
 from poc.execution.speculative import CandidateGrant, ReconciliationDecision, SpeculativeStrategy
@@ -17,8 +21,8 @@ from poc.execution.strategy import (
 __all__ = [
     "Assignment",
     "BoardClaimStrategy",
-    "CapacityScheduler",
     "CandidateGrant",
+    "CapacityScheduler",
     "Claim",
     "ExecutionCoordinator",
     "ExecutionStrategy",

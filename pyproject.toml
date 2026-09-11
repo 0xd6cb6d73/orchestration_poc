@@ -29,8 +29,11 @@ telemetry = [
 [dependency-groups]
 dev = [
   "httpx==0.28.1",
+  "pre-commit==4.6.2",
+  "pyright[nodejs]==1.1.414",
   "pytest==8.4.1",
   "pytest-asyncio==1.1.0",
+  "ruff==0.16.7",
 ]
 
 [build-system]
@@ -44,3 +47,18 @@ module-root = ""
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["poc", "tests"]
+exclude = ["dist", "var"]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"

@@ -4,7 +4,14 @@ from typing import Protocol
 
 from poc.control.spawn_policy import SpawnPolicy
 from poc.execution.strategy import StrategyError
-from poc.models import AgentInstance, EventRecord, ExecutionHandle, ExecutionMode, ExecutionPolicy, utc_now
+from poc.models import (
+    AgentInstance,
+    EventRecord,
+    ExecutionHandle,
+    ExecutionMode,
+    ExecutionPolicy,
+    utc_now,
+)
 from poc.persistence.database import Database
 
 
@@ -61,7 +68,10 @@ class CapacityScheduler:
         policy = ExecutionPolicy.model_validate_json(row["policy"])
         if (
             set(desired) - policy.allowed_roles
-            or any(not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in desired.values())
+            or any(
+                not isinstance(count, int) or isinstance(count, bool) or count < 0
+                for count in desired.values()
+            )
             or sum(desired.values()) > policy.max_workers
         ):
             raise StrategyError("desired capacity exceeds the authorized role/population envelope")
@@ -127,7 +137,10 @@ class CapacityScheduler:
                             run_id=handle.run_id,
                             event_type="worker.terminated",
                             actor_id=record["worker_instance_id"],
-                            data={"execution_id": handle.execution_id, "reason": "capacity reconciled"},
+                            data={
+                                "execution_id": handle.execution_id,
+                                "reason": "capacity reconciled",
+                            },
                         ),
                     )
         return active

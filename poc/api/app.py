@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -38,9 +38,12 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     @app.post("/runs", status_code=201)
     async def create_run(request: RunCreate, http_request: Request) -> dict:
         run, plan = http_request.app.state.runtime.create_run(request)
-        return {"run": run, "proposed_plan": plan.model_dump(mode="json"),
-                "approval_url": f"/runs/{run['run_id']}/approval",
-                "status_url": f"/runs/{run['run_id']}"}
+        return {
+            "run": run,
+            "proposed_plan": plan.model_dump(mode="json"),
+            "approval_url": f"/runs/{run['run_id']}/approval",
+            "status_url": f"/runs/{run['run_id']}",
+        }
 
     @app.post("/runs/{run_id}/approval")
     async def approve(run_id: str, request: ApprovalRequest, http_request: Request) -> dict:
@@ -50,7 +53,11 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             raise HTTPException(404, "run not found") from None
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
-        return {"run_id": run_id, "status": "running", "approved_plan": plan.model_dump(mode="json")}
+        return {
+            "run_id": run_id,
+            "status": "running",
+            "approved_plan": plan.model_dump(mode="json"),
+        }
 
     @app.get("/runs/{run_id}")
     async def get_run(run_id: str, http_request: Request) -> dict:
@@ -75,8 +82,11 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             record, content = http_request.app.state.runtime.artifacts.read(artifact_id)
         except KeyError:
             raise HTTPException(404, "artifact not found") from None
-        return Response(content, media_type=record.media_type,
-                        headers={"ETag": f'"{record.sha256}"', "Cache-Control": "public, immutable"})
+        return Response(
+            content,
+            media_type=record.media_type,
+            headers={"ETag": f'"{record.sha256}"', "Cache-Control": "public, immutable"},
+        )
 
     @app.get("/ui/runs/{run_id}", response_class=HTMLResponse)
     async def run_page(run_id: str, request: Request):

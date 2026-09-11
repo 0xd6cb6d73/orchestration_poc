@@ -35,19 +35,26 @@ class WorkflowRunner:
         self.db.put_workflow(spec, thread_id)
         graph = self.compiler.compile(spec, self.checkpointer)
         self._graphs[(spec.workflow_id, spec.revision)] = graph
-        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100,
-                  "max_concurrency": spec.max_workers}
+        config: Any = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 100,
+            "max_concurrency": spec.max_workers,
+        }
         if existing and existing["status"] == "completed" and existing["result"]:
             return {"run_id": spec.run_id, "results": json.loads(existing["result"])}
         if existing:
             snapshot = graph.get_state(config)
             if snapshot.values:
-                interrupts = tuple(interrupt for task in snapshot.tasks for interrupt in task.interrupts)
+                interrupts = tuple(
+                    interrupt for task in snapshot.tasks for interrupt in task.interrupts
+                )
                 if interrupts:
                     return {**snapshot.values, "__interrupt__": interrupts}
                 if not snapshot.next:
                     result = dict(snapshot.values)
-                    self.db.update_workflow(spec.workflow_id, spec.revision, "completed", result.get("results", {}))
+                    self.db.update_workflow(
+                        spec.workflow_id, spec.revision, "completed", result.get("results", {})
+                    )
                     return result
                 invocation: Any = None
             else:
@@ -59,7 +66,9 @@ class WorkflowRunner:
         if result.get("__interrupt__"):
             self.db.update_workflow(spec.workflow_id, spec.revision, "paused")
         else:
-            self.db.update_workflow(spec.workflow_id, spec.revision, "completed", result.get("results", {}))
+            self.db.update_workflow(
+                spec.workflow_id, spec.revision, "completed", result.get("results", {})
+            )
         return result
 
     async def resume(self, spec: WorkflowSpec, resolution: dict[str, Any]) -> dict[str, Any]:
@@ -68,13 +77,18 @@ class WorkflowRunner:
         if graph is None:
             graph = self.compiler.compile(spec, self.checkpointer)
             self._graphs[(spec.workflow_id, spec.revision)] = graph
-        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100,
-                  "max_concurrency": spec.max_workers}
+        config: Any = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": 100,
+            "max_concurrency": spec.max_workers,
+        }
         self.db.update_workflow(spec.workflow_id, spec.revision, "resumed")
         async with self._locks.setdefault(thread_id, asyncio.Lock()):
             result = graph.invoke(Command(resume=resolution), config)
         if result.get("__interrupt__"):
             self.db.update_workflow(spec.workflow_id, spec.revision, "paused")
         else:
-            self.db.update_workflow(spec.workflow_id, spec.revision, "completed", result.get("results", {}))
+            self.db.update_workflow(
+                spec.workflow_id, spec.revision, "completed", result.get("results", {})
+            )
         return result

@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from poc.execution.strategy import PersistentExecutionStrategy, StrategyError
-from poc.models import EventRecord, ExecutionHandle, ExecutionMode, ExecutionPolicy, new_id, utc_now
+from poc.models import EventRecord, ExecutionMode, new_id, utc_now
 
 
 class StaleClaim(StrategyError):
@@ -144,7 +145,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
         if worker.role_id not in roles or not roles <= policy.allowed_roles:
             raise StrategyError("eligible roles cannot enlarge the worker's authority")
 
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(seconds=policy.lease_seconds)).isoformat()
         token = secrets.token_urlsafe(32)
@@ -191,11 +192,13 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                     },
                 ),
             )
-        return Claim(execution_id, row["task_id"], attempt_id, worker_id, generation, expires_at, token)
+        return Claim(
+            execution_id, row["task_id"], attempt_id, worker_id, generation, expires_at, token
+        )
 
     def heartbeat(self, claim: Claim) -> str:
         execution, policy = self._active_execution(claim.execution_id)
-        now_dt = datetime.now(timezone.utc)
+        now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(seconds=policy.lease_seconds)).isoformat()
         with self.db.transaction() as tx:
@@ -236,7 +239,9 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
             )
         return expires_at
 
-    def release(self, claim: Claim, *, retry_at: datetime | str | None = None, reason: str = "released") -> None:
+    def release(
+        self, claim: Claim, *, retry_at: datetime | str | None = None, reason: str = "released"
+    ) -> None:
         execution, _ = self._active_execution(claim.execution_id)
         now = utc_now()
         available_at = _timestamp(retry_at) if retry_at else now
@@ -300,7 +305,9 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                     },
                 ),
             )
-            self._promote_dependents(tx, execution["run_id"], claim.execution_id, claim.task_id, now)
+            self._promote_dependents(
+                tx, execution["run_id"], claim.execution_id, claim.task_id, now
+            )
 
     def reap_expired(self, execution_id: str) -> list[str]:
         execution, _ = self._active_execution(execution_id)
@@ -384,7 +391,9 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
             raise StaleClaim("claim no longer owns the task")
         return row
 
-    def _promote_dependents(self, tx, run_id: str, execution_id: str, completed_task_id: str, now: str) -> None:
+    def _promote_dependents(
+        self, tx, run_id: str, execution_id: str, completed_task_id: str, now: str
+    ) -> None:
         rows = tx.execute(
             "SELECT task_id,dependency_ids FROM swarm_tasks WHERE execution_id=? AND state='blocked'",
             (execution_id,),
@@ -392,7 +401,8 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
         completed = {
             row["task_id"]
             for row in tx.execute(
-                "SELECT task_id FROM swarm_tasks WHERE execution_id=? AND state='completed'", (execution_id,)
+                "SELECT task_id FROM swarm_tasks WHERE execution_id=? AND state='completed'",
+                (execution_id,),
             )
         }
         for row in rows:
@@ -436,8 +446,8 @@ def _timestamp(value: datetime | str) -> str:
     if isinstance(value, str):
         value = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
 
 
 def _token_hash(token: str) -> str:

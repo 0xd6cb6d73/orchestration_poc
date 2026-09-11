@@ -14,7 +14,9 @@ async def test_same_role_workers_are_isolated(runtime):
     assert workers[0]["agent_instance_id"] != workers[1]["agent_instance_id"]
     metrics = next(w for w in status["workflows"] if w["workflow_id"].endswith("-metrics"))
     task_ids = {task["task_id"]: task for task in metrics["tasks"]}
-    assert task_ids["baseline_p95"]["agent_instance_id"] != task_ids["incident_p95"]["agent_instance_id"]
+    assert (
+        task_ids["baseline_p95"]["agent_instance_id"]
+        != task_ids["incident_p95"]["agent_instance_id"]
+    )
     assert "baseline_p95" in task_ids["baseline_p95"]["attempt_id"]
     assert "incident_p95" in task_ids["incident_p95"]["attempt_id"]
-

@@ -49,11 +49,16 @@ class WorkflowCompiler:
             for dep, result in predecessor_results.items():
                 if result["outcome"] != "succeeded":
                     blocked = {
-                        "task_id": task.id, "agent_instance_id": "not-started", "attempt_id": "not-started",
-                        "outcome": "failed", "output_schema": task.output_schema, "result": {},
+                        "task_id": task.id,
+                        "agent_instance_id": "not-started",
+                        "attempt_id": "not-started",
+                        "outcome": "failed",
+                        "output_schema": task.output_schema,
+                        "result": {},
                         "output_artifact": None,
                         "evidence_artifacts": result.get("evidence_artifacts", []),
-                        "acceptance_checks": [], "completion_summary": f"Blocked by failed predecessor {dep}.",
+                        "acceptance_checks": [],
+                        "completion_summary": f"Blocked by failed predecessor {dep}.",
                     }
                     return {"results": {task.id: blocked}}
             inputs = dict(task.static_inputs)
@@ -65,11 +70,16 @@ class WorkflowCompiler:
                 for component in binding.field.split("."):
                     value = value[component]
                 inputs[binding.target] = value
-            output = self.adapter.execute(task=task, workflow_id=spec.workflow_id,
-                                          workflow_revision=spec.revision, run_id=spec.run_id,
-                                          plan_version=spec.approved_plan_version,
-                                          owner=self.role_lookup(spec.owner), inputs=inputs,
-                                          input_artifacts=list(dict.fromkeys(input_artifacts)))
+            output = self.adapter.execute(
+                task=task,
+                workflow_id=spec.workflow_id,
+                workflow_revision=spec.revision,
+                run_id=spec.run_id,
+                plan_version=spec.approved_plan_version,
+                owner=self.role_lookup(spec.owner),
+                inputs=inputs,
+                input_artifacts=list(dict.fromkeys(input_artifacts)),
+            )
             if "worker_result" not in output:
                 # A nested interrupt bubbles through this wrapper to the root graph.
                 return {}

@@ -1,2 +1,1 @@
 """Phoenix/OpenInference telemetry integration."""
-
