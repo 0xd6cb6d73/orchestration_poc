@@ -11,7 +11,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 COPY pyproject.toml uv.lock README.md ./
 COPY poc ./poc
-RUN uv sync --locked --no-dev --extra telemetry
+RUN uv sync --locked --no-dev --extra telemetry --extra llm
 
 EXPOSE 8000
 CMD ["uvicorn", "poc.api.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

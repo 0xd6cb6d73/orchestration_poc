@@ -84,6 +84,22 @@ persistent storage. The application journal is authoritative; telemetry export i
 best-effort. Phoenix's server license is Elastic License 2.0, the licensing exception
 called out by the specification.
 
+The image includes the optional OpenAI and Anthropic clients. To use an external
+worker model from the web control room, export `OPENAI_API_KEY` or
+`ANTHROPIC_API_KEY` before `docker compose up`; Compose passes those variables into
+the application container without storing them in a mission plan. OpenAI-compatible
+endpoints can be selected without exposing their URL through the UI:
+
+```bash
+export OPENAI_API_KEY='sk-or-v1-...'
+export OPENAI_BASE_URL='https://openrouter.ai/api/v1'
+docker compose up --build
+```
+
+When using this compatibility path, select `openai` as the provider in the UI and
+enter the upstream service's model identifier. Compose also forwards an optional
+`ANTHROPIC_BASE_URL`.
+
 After startup, `docker compose ps` should report the app as `healthy`. The API is at
 <http://localhost:8000/docs>, while Phoenix is at <http://localhost:6006>.
 
@@ -234,15 +250,78 @@ Every `AgentInstance` persists the resolved backend, and a stable agent identity
 cannot silently switch implementations during recovery. Additional implementations
 can be registered without changing `WorkerAdapter` or any scheduler.
 
-`pydantic-ai-slim` provides the framework-neutral Pydantic AI core. Configure real
-providers on each role (`provider` and `model`) and install the corresponding
-Pydantic AI provider extra, or inject a `PydanticModelFactory` into `Runtime`. Tests
-inject Pydantic AI's `FunctionModel`, so they remain offline and deterministic.
+`pydantic-ai-slim` provides the framework-neutral Pydantic AI core. The `llm`
+optional dependency installs the OpenAI and Anthropic clients used by the documented
+configuration path:
+
+```bash
+uv sync --extra llm
+export OPENAI_API_KEY='...'
+# Anthropic instead uses ANTHROPIC_API_KEY.
+```
+
+Select the provider and model on a run (`openai:gpt-5-mini`, for example), or inject
+a `PydanticModelFactory` into `Runtime`. Provider SDKs read credentials from their
+standard environment variables; secrets are never written to plans, reports, or the
+event journal. Per-run `agent_runtime.options` are passed to Pydantic AI as model
+settings, so values such as `temperature` are configurable independently of the
+orchestration mode. Tests inject Pydantic AI's `FunctionModel`, so they remain
+offline and deterministic.
 
 ## Agent evaluations
 
-The `poc.evaluation` package uses Pydantic Evals to run repeatable agent experiments
-through the same orchestration boundary as production. An evaluation variant can
+For orchestration comparisons, run the complete incident benchmark. Unlike the two
+focused worker regression cases below, this workload is deliberately not a toy: one
+trial executes parallel metric and evidence branches, manifest-backed timezone
+validation (including pause/resume for the OODA backend), percentile and correlation
+analysis, causal claim review, final report
+synthesis, and exact artifact lineage. The standard workload has at least 12 worker
+tasks across four workflows. `hybrid_v1` additionally runs sealed independent
+proposals, critiques, scoring, and independent verification.
+
+The default command runs all four orchestration modes with the same offline worker
+implementation and prints completion, quality, latency, tool, worker, and token
+metrics:
+
+```bash
+uv run hierarchical-ooda-benchmark \
+  --repeat 3 \
+  --report eval-reports/orchestration-offline.json
+```
+
+Use a real LLM after installing the provider clients and exporting its API key:
+
+```bash
+uv run --extra llm hierarchical-ooda-benchmark \
+  --mode hierarchical_dag \
+  --mode board_claim \
+  --mode managed_pool \
+  --mode speculative \
+  --backend pydantic_ai \
+  --model openai:gpt-5-mini \
+  --model-setting temperature=0 \
+  --repeat 3 \
+  --report eval-reports/orchestration-openai.json
+
+uv run --extra llm hierarchical-ooda-benchmark \
+  --mode board_claim \
+  --strategy hybrid_v1 \
+  --backend pydantic_ai \
+  --model anthropic:claude-sonnet-4-5 \
+  --report eval-reports/hybrid-anthropic.json
+```
+
+Trials run sequentially by default to avoid latency distortion and provider rate
+limits; `--max-concurrency` is available when throughput is the metric of interest.
+The machine-readable report includes every quality check plus per-trial counts and
+token usage. Generated report text is omitted unless `--include-output` is supplied;
+its SHA-256 digest is always retained. A failed quality gate produces a non-zero exit
+status.
+
+For focused prompt and tool-use regression tests, the `poc.evaluation` package uses
+Pydantic Evals to run individual worker experiments through the same worker boundary.
+
+An evaluation variant can
 change the agent backend, provider/model, system prompt, per-role allowed tools, and
 execution limits without changing a golden dataset. The standard evaluators grade:
 
@@ -270,10 +349,9 @@ that consumes those `RoleSpec` fields).
 Evaluate a Pydantic AI prompt/model variant and compare it with a previous report:
 
 ```bash
-uv run hierarchical-ooda-eval \
+uv run --extra llm hierarchical-ooda-eval \
   --backend pydantic_ai \
-  --provider openai \
-  --model your-model-name \
+  --model openai:gpt-5-mini \
   --prompt-file prompts/manifest-worker.txt \
   --tools manifest_reader=read_manifest \
   --name manifest-prompt-v2 \
@@ -281,9 +359,9 @@ uv run hierarchical-ooda-eval \
   --report eval-reports/manifest-prompt-v2.json
 ```
 
-Install the provider extra required by the selected Pydantic AI model. The command
-returns a non-zero exit status if a case, evaluator, or assertion fails, making it
-suitable for CI quality gates. Use `--repeat` to measure nondeterministic variants.
+The command returns a non-zero exit status if a case, evaluator, or assertion fails,
+making it suitable for CI quality gates. Use `--repeat` to measure nondeterministic
+variants.
 New typed datasets and custom evaluators can be supplied programmatically through
 `create_agent_dataset` or registered with `AgentEvaluationDatasetRegistry`.
 

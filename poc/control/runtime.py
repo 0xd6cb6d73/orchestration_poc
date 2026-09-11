@@ -411,6 +411,24 @@ class Runtime:
         result = await self.runner.start(spec)
         interrupts = result.get("__interrupt__", ())
         if not interrupts:
+            # Executors that do not expose LangGraph's interrupt primitive still
+            # receive the same independent manifest check. This keeps the mission
+            # contract backend-neutral instead of silently allowing an LLM worker
+            # to assume a timezone that the deterministic OODA worker must validate.
+            lookup = self._manifest_workflow(spec.run_id, plan, supervisor.agent_instance_id)
+            await self._actor(supervisor).turn(
+                {"type": "validation.required"}, [self._submit_command(lookup)]
+            )
+            lookup_result = await self.runner.start(lookup)
+            self._ensure_success(lookup_result, lookup)
+            self.db.record_event(
+                EventRecord(
+                    run_id=spec.run_id,
+                    event_type="validation.completed",
+                    actor_id=supervisor.agent_instance_id,
+                    data={"workflow_id": lookup.workflow_id, "source": "manifest"},
+                )
+            )
             return result
         interrupt_item = interrupts[0]
         request = interrupt_item.value
@@ -603,6 +621,14 @@ class Runtime:
                         id="select_windows",
                         role="window_selector",
                         goal="Select comparable baseline and incident windows.",
+                        static_inputs={
+                            "analysis_range": {
+                                "start": "2026-04-17T12:00:00Z",
+                                "end": "2026-04-17T13:09:00Z",
+                            },
+                            "suspected_incident_start": "2026-04-17T13:00:00",
+                            "comparison_window_minutes": 10,
+                        },
                         output_schema="WindowSelection",
                         acceptance_criteria=["two non-overlapping windows selected"],
                     ),
@@ -670,6 +696,13 @@ class Runtime:
                         id="select_log_slice",
                         role="log_slice_selector",
                         goal="Select baseline and incident log evidence.",
+                        static_inputs={
+                            "analysis_range": {
+                                "start": "2026-04-17T12:00:00Z",
+                                "end": "2026-04-17T13:10:00Z",
+                            },
+                            "suspected_incident_start": "2026-04-17T13:00:00Z",
+                        },
                         output_schema="LogSlice",
                         acceptance_criteria=["bounded slice returned"],
                     ),
@@ -693,6 +726,10 @@ class Runtime:
                         role="deployment_matcher",
                         goal="Match checkout deployment to incident window.",
                         depends_on=["count_error_pattern"],
+                        static_inputs={
+                            "incident_start": "2026-04-17T13:00:00Z",
+                            "lookback_minutes": 30,
+                        },
                         input_bindings=[
                             InputBinding(
                                 source_task="count_error_pattern",

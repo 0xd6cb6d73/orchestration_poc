@@ -10,13 +10,15 @@ from poc.evaluation import (
     AgentEvaluationInput,
     AgentEvaluationRunner,
     AgentEvaluationVariant,
+    OrchestrationBenchmarkRunner,
+    OrchestrationBenchmarkVariant,
     create_agent_dataset,
     incident_worker_dataset,
     load_report,
     report_passed,
     save_report,
 )
-from poc.models import AgentBackend, RoleSpec
+from poc.models import AgentBackend, ExecutionMode, RoleSpec
 
 
 @pytest.mark.asyncio
@@ -126,3 +128,33 @@ async def test_evaluation_variant_overrides_prompt_model_and_tools(tmp_path: Pat
         == report.experiment_metadata["system_prompt_sha256"]
     )
     assert report.cases[0].output.allowed_tools == ["read_manifest"]
+
+
+@pytest.mark.asyncio
+async def test_orchestration_benchmark_runs_complete_nontrivial_workload(
+    tmp_path: Path,
+) -> None:
+    runner = OrchestrationBenchmarkRunner(work_dir=tmp_path / "benchmark-runs")
+
+    report = await runner.evaluate(
+        [
+            OrchestrationBenchmarkVariant(
+                name="managed-pool-offline",
+                execution_mode=ExecutionMode.MANAGED_POOL,
+            )
+        ]
+    )
+
+    assert len(report.trials) == 1
+    trial = report.trials[0]
+    assert trial.passed
+    assert trial.execution_mode == ExecutionMode.MANAGED_POOL
+    assert trial.workflow_count >= 4
+    assert trial.task_count >= 12
+    assert trial.worker_count >= 12
+    assert trial.tool_call_count >= 14
+    assert trial.final_report is None
+    assert trial.final_report_sha256 is not None
+    assert all(trial.quality_checks.values())
+    assert report.summaries[0].completion_rate == 1
+    assert report.summaries[0].pass_rate == 1

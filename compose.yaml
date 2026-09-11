@@ -7,6 +7,10 @@ services:
       PHOENIX_ENABLED: "1"
       PHOENIX_OTLP_HTTP_ENDPOINT: http://phoenix:6006/v1/traces
       POC_DATA_DIR: /data
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
     ports:
       - "8000:8000"
     volumes:

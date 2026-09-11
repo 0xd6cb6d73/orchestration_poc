@@ -20,8 +20,12 @@ dependencies = [
 [project.scripts]
 hierarchical-ooda-poc = "poc.__main__:main"
 hierarchical-ooda-eval = "poc.evaluation.cli:main"
+hierarchical-ooda-benchmark = "poc.evaluation.benchmark_cli:main"
 
 [project.optional-dependencies]
+llm = [
+  "pydantic-ai-slim[anthropic,openai]==2.36.0",
+]
 telemetry = [
   "arize-phoenix-otel==0.16.1",
   "openinference-instrumentation-anthropic==1.1.2",

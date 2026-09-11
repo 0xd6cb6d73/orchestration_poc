@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import os
+from importlib import import_module
 from importlib.util import find_spec
 from typing import Any
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON
+
+logger = logging.getLogger(__name__)
 
 
 def configure_telemetry() -> Any | None:
@@ -36,15 +40,38 @@ def configure_telemetry() -> Any | None:
     )
     LangChainInstrumentor().instrument(tracer_provider=provider)
     # Provider SDKs are optional. Instrument them only when an adapter actually installs them.
-    if find_spec("openai") is not None:
-        from openinference.instrumentation.openai import OpenAIInstrumentor
-
-        OpenAIInstrumentor().instrument(tracer_provider=provider)
-    if find_spec("anthropic") is not None:
-        from openinference.instrumentation.anthropic import AnthropicInstrumentor
-
-        AnthropicInstrumentor().instrument(tracer_provider=provider)
+    _instrument_optional_provider(
+        package="openai",
+        module="openinference.instrumentation.openai",
+        instrumentor_name="OpenAIInstrumentor",
+        provider=provider,
+    )
+    _instrument_optional_provider(
+        package="anthropic",
+        module="openinference.instrumentation.anthropic",
+        instrumentor_name="AnthropicInstrumentor",
+        provider=provider,
+    )
     return provider
+
+
+def _instrument_optional_provider(
+    *, package: str, module: str, instrumentor_name: str, provider: Any
+) -> bool:
+    """Instrument an optional SDK without making telemetry an availability dependency."""
+    if find_spec(package) is None:
+        return False
+    try:
+        instrumentor = getattr(import_module(module), instrumentor_name)()
+        instrumentor.instrument(tracer_provider=provider)
+    except Exception as exc:
+        logger.warning(
+            "Skipping incompatible %s telemetry instrumentation: %s",
+            package,
+            exc,
+        )
+        return False
+    return True
 
 
 def shutdown_telemetry(provider: Any | None) -> None:

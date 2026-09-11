@@ -5,7 +5,7 @@ import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict
 from pydantic_ai import Agent, RunContext, UsageLimits
@@ -120,9 +120,10 @@ class PydanticAIAgentExecutor:
             {"provider": role.provider, "model": role.model},
         )
         try:
-            output = self._run(role, request, dependencies)
+            output, usage = self._run(role, request, dependencies)
         except Exception as exc:
             return self._failed(request, str(exc))
+        self._record(request, "agent.execution_usage", {"usage": usage})
         artifact = self.artifacts.write(
             request.run_id, output.result, producer_task_id=request.task.id
         )
@@ -172,12 +173,13 @@ class PydanticAIAgentExecutor:
         role: RoleSpec,
         request: AgentExecutionRequest,
         dependencies: PydanticAgentDependencies,
-    ) -> PydanticWorkerOutput:
+    ) -> tuple[PydanticWorkerOutput, dict[str, int]]:
         agent = Agent(
             self.model_factory(role),
             deps_type=PydanticAgentDependencies,
             output_type=PydanticWorkerOutput,
             instructions=_instructions(role, request),
+            model_settings=cast(Any, role.provider_options or None),
             tools=[execute_allowed_tool],
         )
         prompt = json.dumps(
@@ -192,8 +194,8 @@ class PydanticAIAgentExecutor:
             default=str,
         )
 
-        def run() -> PydanticWorkerOutput:
-            return agent.run_sync(
+        def run() -> tuple[PydanticWorkerOutput, dict[str, int]]:
+            result = agent.run_sync(
                 prompt,
                 deps=dependencies,
                 infer_name=False,
@@ -201,7 +203,15 @@ class PydanticAIAgentExecutor:
                     request_limit=role.execution_limits.get("max_ooda_cycles", 3),
                     tool_calls_limit=role.execution_limits.get("max_tool_calls", 2),
                 ),
-            ).output
+            )
+            usage = result.usage
+            return result.output, {
+                "requests": usage.requests,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_read_tokens": usage.cache_read_tokens,
+                "cache_write_tokens": usage.cache_write_tokens,
+            }
 
         try:
             asyncio.get_running_loop()
@@ -264,7 +274,89 @@ def _instructions(role: RoleSpec, request: AgentExecutionRequest) -> str:
         f"{role.system_prompt}\n"
         "You are running under the pydantic_ai backend. Use execute_allowed_tool only when "
         f"evidence is needed. Available tools: {', '.join(role.allowed_tools) or 'none'}. "
-        "Return a result matching the requested domain schema and a concise completion summary. "
+        f"Tool contracts:\n{_tool_contracts(role.allowed_tools)}\n"
+        f"Required result shape for {request.task.output_schema}: "
+        f"{_output_contract(request.task.output_schema)}. "
+        "Return that domain object in the `result` field, plus a concise completion_summary. "
         "Do not invent artifact identifiers or claim tools were run when they were not. "
         f"Task identity: {request.task.id}."
     )
+
+
+_TOOL_CONTRACTS = {
+    "read_metric_slice": (
+        "read_metric_slice({start: ISO timestamp, end: ISO timestamp, service?: string, "
+        "assume_timezone?: 'UTC'}) -> rows with latency_ms, count, and units"
+    ),
+    "calculate_percentile": (
+        "calculate_percentile({values: number[], percentile?: number, units?: string}) -> "
+        "percentile, value, units, sample_count, and method"
+    ),
+    "read_manifest": "read_manifest({}) -> fixture timezone declaration and note",
+    "read_log_slice": (
+        "read_log_slice({start: ISO timestamp, end: ISO timestamp}) -> bounded rows and count"
+    ),
+    "count_log_pattern": (
+        "count_log_pattern({rows: log row[]}) -> counts, total, and correlation interpretation"
+    ),
+    "read_deployment_record": (
+        "read_deployment_record({incident_start: ISO timestamp, lookback_minutes?: integer}) -> "
+        "matching checkout deployments and minute proximity"
+    ),
+    "write_artifact": (
+        "write_artifact({content: JSON value or Markdown string, media_type?: string}) -> "
+        "artifact_id, sha256, and media_type"
+    ),
+}
+
+
+_OUTPUT_CONTRACTS = {
+    "WindowSelection": (
+        "{baseline: {start, end, service}, incident: {start, end, service}, sample_count, "
+        "timezone_note}; derive comparable windows from the supplied scope and tool evidence, "
+        "preserving the initially timezone-less incident boundary for independent validation"
+    ),
+    "PercentileResult": "{result: {percentile, value, units, sample_count, method}, window}",
+    "MetricComparison": (
+        "{content: {baseline_p95_ms, incident_p95_ms, absolute_increase_ms, ratio, claim}, "
+        "published: the exact write_artifact response}"
+    ),
+    "ManifestFact": (
+        "{fact: 'timezone-less fixture timestamps are UTC', manifest: the tool response}"
+    ),
+    "LogSlice": "{log_slice: the exact read_log_slice response}",
+    "PatternCount": "{pattern_counts: the exact count_log_pattern response}",
+    "DeploymentMatch": (
+        "{deployment_match: the exact deployment tool response, pattern_counts: supplied input}"
+    ),
+    "DraftClaim": (
+        "{content: {hypothesis_key, claim, confidence, alternatives}, published: the exact "
+        "write_artifact response}; distinguish temporal evidence from proven causation"
+    ),
+    "CheckedClaim": (
+        "{content: {hypothesis_key, claim, supported, checks, caveat}, published: the exact "
+        "write_artifact response}; explicitly qualify payment_timeout and causal uncertainty"
+    ),
+    "VerificationResult": (
+        "{content: {subject_artifact_id, supported, checks, findings}, published: the exact "
+        "write_artifact response}"
+    ),
+    "ReportSection": (
+        "{content: Markdown findings, caveat, and safe follow-up tests, published: the exact "
+        "write_artifact response}"
+    ),
+    "FinalReport": (
+        "{content: complete Markdown report including all supplied evidence artifact IDs, "
+        "published: the exact write_artifact response}"
+    ),
+}
+
+
+def _tool_contracts(tool_names: list[str]) -> str:
+    if not tool_names:
+        return "- no tools"
+    return "\n".join(f"- {_TOOL_CONTRACTS.get(name, name)}" for name in tool_names)
+
+
+def _output_contract(schema: str) -> str:
+    return _OUTPUT_CONTRACTS.get(schema, "a JSON object satisfying every acceptance criterion")
