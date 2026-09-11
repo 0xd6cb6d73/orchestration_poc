@@ -1,0 +1,17 @@
+[
+  {
+    "deployment_id": "deploy-checkout-20260417-1255",
+    "service": "checkout",
+    "version": "2026.04.17.2",
+    "timestamp": "2026-04-17T12:55:00Z",
+    "change": "Enabled pricing-cache-v2 with a cold local cache"
+  },
+  {
+    "deployment_id": "deploy-search-20260417-1240",
+    "service": "search",
+    "version": "2026.04.17.7",
+    "timestamp": "2026-04-17T12:40:00Z",
+    "change": "Routine index refresh"
+  }
+]
+

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="3">
+  <title>Run {{ run_id }}</title>
+  <style>
+    body { color: #17202a; font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; }
+    .pill { background: #e8eef5; border-radius: 1rem; padding: .25rem .65rem; }
+    table { border-collapse: collapse; width: 100%; } th, td { border-bottom: 1px solid #dfe6ee; padding: .55rem; text-align: left; }
+    code { font-size: .85em; } .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); }
+    article { border: 1px solid #dfe6ee; border-radius: .5rem; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Incident run <code>{{ run_id }}</code></h1>
+  <p><span class="pill">{{ status.run.status }}</span> Plan v{{ status.plan.version }}</p>
+  <h2>Approved plan</h2>
+  <p>{{ status.plan.objective }}</p>
+  <ul>{% for constraint in status.plan.constraints %}<li>{{ constraint }}</li>{% endfor %}</ul>
+  <h2>Workflows</h2>
+  <div class="grid">{% for workflow in status.workflows %}<article>
+    <h3>{{ workflow.workflow_id }} · {{ workflow.status }}</h3>
+    <table><tr><th>Task</th><th>State</th><th>Worker</th></tr>
+    {% for task in workflow.tasks %}<tr><td>{{ task.task_id }}</td><td>{{ task.status }}</td><td><code>{{ task.agent_instance_id or "—" }}</code></td></tr>{% endfor %}
+    </table></article>{% endfor %}</div>
+  <h2>Artifacts</h2>
+  <ul>{% for artifact in status.artifacts %}<li><a href="/artifacts/{{ artifact.artifact_id }}">{{ artifact.artifact_id }}</a> · {{ artifact.media_type }} · task {{ artifact.producer_task_id }}</li>{% endfor %}</ul>
+  <h2>Trajectory</h2>
+  <table><tr><th>#</th><th>Event</th><th>Actor</th></tr>{% for event in status.events %}<tr><td>{{ event.seq }}</td><td>{{ event.event_type }}</td><td><code>{{ event.actor_id or "runtime" }}</code></td></tr>{% endfor %}</table>
+</body>
+</html>
+

@@ -1,0 +1,10 @@
+{"timestamp":"2026-04-17T12:02:00Z","service":"checkout","level":"ERROR","pattern":"payment_timeout","message":"payment provider timeout"}
+{"timestamp":"2026-04-17T12:06:00Z","service":"checkout","level":"INFO","pattern":"cache_hit","message":"pricing cache hit"}
+{"timestamp":"2026-04-17T13:00:20Z","service":"checkout","level":"WARN","pattern":"cache_miss","message":"pricing cache miss"}
+{"timestamp":"2026-04-17T13:01:20Z","service":"checkout","level":"WARN","pattern":"cache_miss","message":"pricing cache miss"}
+{"timestamp":"2026-04-17T13:02:20Z","service":"checkout","level":"ERROR","pattern":"payment_timeout","message":"payment provider timeout"}
+{"timestamp":"2026-04-17T13:03:20Z","service":"checkout","level":"WARN","pattern":"cache_miss","message":"pricing cache miss"}
+{"timestamp":"2026-04-17T13:05:20Z","service":"checkout","level":"WARN","pattern":"cache_miss","message":"pricing cache miss"}
+{"timestamp":"2026-04-17T13:07:20Z","service":"checkout","level":"WARN","pattern":"cache_miss","message":"pricing cache miss"}
+{"timestamp":"2026-04-17T13:09:20Z","service":"checkout","level":"WARN","pattern":"cache_miss","message":"pricing cache miss"}
+

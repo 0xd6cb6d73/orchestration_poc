@@ -1,0 +1,6 @@
+{
+  "fixture": "incident_example",
+  "timestamp_timezone": "UTC",
+  "note": "CSV and JSONL timestamps without an explicit offset are UTC. The proposed incident window intentionally omits its timezone to exercise validation."
+}
+

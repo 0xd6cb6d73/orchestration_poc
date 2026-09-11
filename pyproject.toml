@@ -1,0 +1,46 @@
+[project]
+name = "hierarchical-ooda-poc"
+version = "0.1.0"
+description = "Event-driven three-tier orchestration PoC with LangGraph workers"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.116.1",
+  "jinja2==3.1.6",
+  "langgraph==0.6.7",
+  "langgraph-checkpoint-sqlite==2.0.11",
+  "opentelemetry-api==1.36.0",
+  "opentelemetry-sdk==1.36.0",
+  "pydantic==2.11.7",
+  "python-multipart==0.0.20",
+  "uvicorn==0.35.0",
+]
+
+[project.scripts]
+hierarchical-ooda-poc = "poc.__main__:main"
+
+[project.optional-dependencies]
+telemetry = [
+  "arize-phoenix-otel==0.16.1",
+  "openinference-instrumentation-anthropic==1.1.2",
+  "openinference-instrumentation-langchain==0.1.74",
+  "openinference-instrumentation-openai==0.1.56",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.1",
+  "pytest-asyncio==1.1.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "poc"
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
