@@ -1,4 +1,4 @@
-"""Execution runtimes and pluggable scheduling strategies."""
+"""Stable public import surface for execution-strategy extensions."""
 
 from poc.execution.board_claim import BoardClaimStrategy, Claim, StaleClaim
 from poc.execution.capacity import CapacityScheduler, InProcessWorkerMaterializer, WorkerMaterializer
@@ -14,6 +14,12 @@ from poc.execution.strategy import (
     StrategyRegistry,
 )
 
+# Names that describe each component's responsibility, while preserving the more
+# explicit strategy names used by the registry.
+TaskBoard = BoardClaimStrategy
+PoolCoordinator = ManagedPoolStrategy
+SpeculationCoordinator = SpeculativeStrategy
+
 __all__ = [
     "Assignment",
     "BoardClaimStrategy",
@@ -26,12 +32,15 @@ __all__ = [
     "InProcessWorkerMaterializer",
     "ManagedPoolStrategy",
     "PersistentExecutionStrategy",
+    "PoolCoordinator",
     "ReconciliationDecision",
+    "SpeculationCoordinator",
     "SpeculativeStrategy",
     "StaleAssignment",
     "StaleClaim",
     "StrategyError",
     "StrategyNotRegistered",
     "StrategyRegistry",
+    "TaskBoard",
     "WorkerMaterializer",
 ]

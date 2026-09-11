@@ -47,12 +47,125 @@ class Outcome(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ExecutionMode(StrEnum):
+    """How an authorized sub-orchestrator distributes its work."""
+
+    HIERARCHICAL_DAG = "hierarchical_dag"
+    BOARD_CLAIM = "board_claim"
+    MANAGED_POOL = "managed_pool"
+    SPECULATIVE = "speculative"
+
+
+class OwnershipType(StrEnum):
+    DAG = "dag"
+    CLAIM = "claim"
+    ASSIGNMENT = "assignment"
+    SPECULATION = "speculation"
+
+
+class EffectPolicy(StrEnum):
+    PURE_ONLY = "pure_only"
+    READ_ONLY = "read_only"
+    STAGED_EFFECTS = "staged_effects"
+
+
+class ExecutionPolicy(BaseModel):
+    """Immutable authority envelope supplied to an execution strategy.
+
+    Strategy-specific settings live in ``options`` so adding a scheduler does not
+    require changing this common contract.  Security-relevant common limits remain
+    typed and are validated here.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    max_workers: int = Field(default=4, ge=1)
+    allowed_roles: frozenset[str] = Field(default_factory=frozenset)
+    max_task_attempts: int = Field(default=3, ge=1)
+    tool_policy_id: str = "default"
+    budget_id: str = "default"
+    lease_seconds: int = Field(default=30, ge=1)
+    speculative_fanout: int = Field(default=1, ge=1)
+    effect_policy: EffectPolicy = EffectPolicy.READ_ONLY
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_mode_limits(self) -> "ExecutionPolicy":
+        if not self.allowed_roles:
+            raise ValueError("allowed_roles must not be empty")
+        if self.speculative_fanout > self.max_workers:
+            raise ValueError("speculative_fanout cannot exceed max_workers")
+        if self.mode != ExecutionMode.SPECULATIVE and self.speculative_fanout != 1:
+            raise ValueError("speculative_fanout is only valid in speculative mode")
+        return self
+
+
+class ExecutionHandle(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    execution_id: str
+    run_id: str
+    owner_suborchestrator_id: str
+    mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+
+
+class WorkerGrant(BaseModel):
+    """Non-secret worker authority metadata safe for model context and telemetry."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    grant_id: str = Field(default_factory=lambda: new_id("grant"))
+    run_id: str
+    plan_id: str
+    plan_version: int
+    suborchestrator_id: str
+    execution_id: str
+    execution_mode: ExecutionMode
+    task_id: str
+    task_revision: int = 1
+    attempt_id: str
+    worker_instance_id: str
+    role_id: str
+    role_version: int = 1
+    ownership_type: OwnershipType
+    ownership_generation: int = Field(ge=1)
+    ownership_token_fingerprint: str
+    allowed_tools: frozenset[str] = Field(default_factory=frozenset)
+    tool_policy_id: str
+    artifact_scope: str
+    budget: dict[str, int] = Field(default_factory=dict)
+    expires_at: str | None = None
+
+
+class OwnershipCredential(BaseModel):
+    """Runtime-only fenced credential; never place this object in model state."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    execution_id: str
+    ownership_type: OwnershipType
+    ownership_id: str
+    generation: int = Field(ge=1)
+    token: str = Field(exclude=True, repr=False)
+
+
 class PlanArea(BaseModel):
     id: str
     goal: str
     owner_role: str
     depends_on: list[str] = Field(default_factory=list)
     acceptance_criteria: list[str] = Field(default_factory=list)
+    execution_mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    allowed_execution_modes: frozenset[ExecutionMode] = Field(
+        default_factory=lambda: frozenset({ExecutionMode.HIERARCHICAL_DAG})
+    )
+
+    @model_validator(mode="after")
+    def selected_mode_is_authorized(self) -> "PlanArea":
+        if self.execution_mode not in self.allowed_execution_modes:
+            raise ValueError("execution_mode must be included in allowed_execution_modes")
+        return self
 
 
 class MissionPlan(BaseModel):
@@ -97,9 +210,14 @@ class MessageEnvelope(BaseModel):
     message_type: str
     correlation_id: str | None = None
     causation_id: str | None = None
+    event_seq: int | None = None
     plan_version: int
     workflow_revision: int | None = None
+    task_id: str | None = None
+    attempt_id: str | None = None
+    assignment_id: str | None = None
     payload: dict[str, Any]
+    payload_ref: str | None = None
     trace_context: dict[str, str] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
     delivered_at: str | None = None
@@ -158,6 +276,8 @@ class WorkflowSpec(BaseModel):
     approved_plan_version: int
     authorized_worker_roles: list[str]
     max_workers: int = 4
+    execution_mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    execution_options: dict[str, Any] = Field(default_factory=dict)
     tasks: list[TaskSpec]
 
     @model_validator(mode="after")
@@ -244,4 +364,3 @@ class EventRecord(BaseModel):
     causation_id: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now)
-

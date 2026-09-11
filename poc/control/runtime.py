@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
 from poc.control.spawn_policy import SpawnPolicy
 from poc.control.supervisor_actor import SupervisorActor
+from poc.execution.board_claim import BoardClaimStrategy
+from poc.execution.capacity import CapacityScheduler, InProcessWorkerMaterializer
+from poc.execution.hierarchical_strategy import HierarchicalDAGStrategy
+from poc.execution.managed_pool import ManagedPoolStrategy
 from poc.execution.ooda_graph import OODAHarness
+from poc.execution.speculative import SpeculativeStrategy
+from poc.execution.strategy import ExecutionCoordinator, StrategyRegistry
 from poc.execution.worker_adapter import WorkerAdapter
 from poc.execution.workflow_compiler import WorkflowCompiler
 from poc.execution.workflow_runner import WorkflowRunner
 from poc.models import (
-    AgentInstance, ApprovalRequest, EventRecord, InputBinding, MissionPlan, PlanArea, RunCreate,
-    RunStatus, TaskSpec, Tier, WorkflowSpec, new_id,
+    AgentInstance, ApprovalRequest, EventRecord, ExecutionHandle, ExecutionMode, ExecutionPolicy, InputBinding,
+    MissionPlan, PlanArea, RunCreate, RunStatus, TaskSpec, Tier, WorkflowSpec, new_id,
 )
 from poc.persistence.database import Database
 from poc.roles.registry import RoleRegistry
@@ -30,6 +37,13 @@ class Runtime:
         self.artifacts = ArtifactStore(self.data_dir / "artifacts", self.db)
         self.roles = RoleRegistry()
         self.spawns = SpawnPolicy(self.db, self.roles)
+        self.capacity = CapacityScheduler(self.db, InProcessWorkerMaterializer(self.spawns))
+        self.strategies = StrategyRegistry(self.db)
+        self.strategies.register(HierarchicalDAGStrategy.mode, HierarchicalDAGStrategy)
+        self.strategies.register(BoardClaimStrategy.mode, BoardClaimStrategy)
+        self.strategies.register(ManagedPoolStrategy.mode, ManagedPoolStrategy)
+        self.strategies.register(SpeculativeStrategy.mode, SpeculativeStrategy)
+        self.executions = ExecutionCoordinator(self.strategies)
         self.rbac = RBACAdapter(self.db, self.roles)
         fixture_root = fixture_root or Path(__file__).parents[1] / "fixtures" / "incident_example"
         self.tools = ToolGateway(self.db, self.rbac, self.artifacts, fixture_root)
@@ -85,6 +99,22 @@ class Runtime:
         if task:
             await task
 
+    async def submit_execution(
+        self,
+        *,
+        run_id: str,
+        owner_suborchestrator_id: str,
+        goal_ref: str,
+        policy: ExecutionPolicy,
+    ) -> ExecutionHandle:
+        """Public extension point for an approved sub-orchestrator execution."""
+        return await self.executions.submit(
+            run_id=run_id,
+            owner_suborchestrator_id=owner_suborchestrator_id,
+            goal_ref=goal_ref,
+            policy=policy,
+        )
+
     async def recover(self) -> list[str]:
         """Resume runs left active after a process stop using durable plans/checkpoints."""
         recovered: list[str] = []
@@ -112,6 +142,12 @@ class Runtime:
         plan = self.db.get_plan(run_id)
         return {"run": run, "plan": plan.model_dump(mode="json") if plan else None,
                 "agents": self.db.list_agents(run_id), "workflows": self.db.list_workflows(run_id),
+                "executions": [
+                    {**dict(row), "policy": json.loads(row["policy"])}
+                    for row in self.db.conn.execute(
+                        "SELECT * FROM executions WHERE run_id=? ORDER BY created_at", (run_id,)
+                    )
+                ],
                 "artifacts": [a.model_dump(mode="json") for a in self.db.list_artifacts(run_id)],
                 "events": self.db.events(run_id)}
 
@@ -228,10 +264,13 @@ class Runtime:
                              "read_deployment_record", "read_manifest", "write_artifact"],
             areas=[
                 PlanArea(id="metrics", owner_role="metrics_supervisor", goal="Measure regression with comparable windows",
+                         allowed_execution_modes=frozenset(ExecutionMode),
                          acceptance_criteria=["p95 values have units and evidence", "timestamp ambiguity is resolved"]),
                 PlanArea(id="evidence", owner_role="evidence_supervisor", goal="Correlate logs and deployment changes",
+                         allowed_execution_modes=frozenset(ExecutionMode),
                          acceptance_criteria=["misleading patterns are qualified", "deployment window is explicit"]),
                 PlanArea(id="reporting", owner_role="reporting_supervisor", goal="Produce an evidence-backed report",
+                         allowed_execution_modes=frozenset(ExecutionMode),
                          depends_on=["metrics", "evidence"],
                          acceptance_criteria=["claims cite accepted artifacts", "follow-up tests are non-destructive"]),
             ], completion_criteria=["all domain outputs accepted", "report artifact has exact evidence lineage"],

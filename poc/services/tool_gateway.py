@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from poc.execution.board_claim import BoardClaimStrategy, Claim
+from poc.execution.managed_pool import Assignment, ManagedPoolStrategy
+from poc.execution.speculative import CandidateGrant, SpeculativeStrategy
 from poc.models import AgentInstance, EventRecord
 from poc.persistence.database import Database
 from poc.services.artifact_store import ArtifactStore
@@ -27,10 +30,27 @@ class ToolGateway:
         self.fixture_root = Path(fixture_root)
 
     def execute(self, *, operation_id: str, actor: AgentInstance, task_id: str,
-                tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+                tool_name: str, arguments: dict[str, Any],
+                grant: Claim | Assignment | CandidateGrant | None = None,
+                effect_class: str = "read") -> dict[str, Any]:
         decision = self.rbac.authorize(actor, tool_name)
         event_data = {"operation_id": operation_id, "task_id": task_id, "tool": tool_name,
                       "role_id": actor.role_id, "reason": decision.reason}
+        ownership_error = self._validate_ownership(actor, task_id, grant, effect_class)
+        if grant is not None:
+            event_data.update({
+                "execution_id": grant.execution_id,
+                "ownership_type": (
+                    "claim" if isinstance(grant, Claim)
+                    else "assignment" if isinstance(grant, Assignment)
+                    else "speculation"
+                ),
+                "ownership_generation": grant.generation,
+                "ownership_token_fingerprint": grant.token_fingerprint,
+            })
+        if decision.allowed and ownership_error:
+            decision = type(decision)(False, ownership_error)
+            event_data["reason"] = ownership_error
         self.db.record_event(EventRecord(run_id=actor.run_id,
                                          event_type=f"tool.authorization_{'allowed' if decision.allowed else 'denied'}",
                                          actor_id=actor.agent_instance_id, data=event_data))
@@ -51,6 +71,58 @@ class ToolGateway:
                                          actor_id=actor.agent_instance_id,
                                          data={**event_data, "status": "succeeded"}))
         return result
+
+    def _validate_ownership(
+        self,
+        actor: AgentInstance,
+        task_id: str,
+        grant: Claim | Assignment | CandidateGrant | None,
+        effect_class: str,
+    ) -> str | None:
+        # The legacy DAG strategy has explicit graph-node assignment and therefore
+        # no lease credential. Swarm strategies always supply one of these opaque
+        # runtime-held grants.
+        if grant is None:
+            membership = self.db.conn.execute(
+                "SELECT 1 FROM swarm_execution_workers w JOIN executions e ON e.execution_id=w.execution_id "
+                "WHERE w.worker_instance_id=? AND w.status='active' AND e.status='active' "
+                "AND e.mode!='hierarchical_dag'",
+                (actor.agent_instance_id,),
+            ).fetchone()
+            if membership:
+                return "an active swarm execution requires a current ownership grant"
+            return None
+        if grant.execution_id not in {
+            row[0]
+            for row in self.db.conn.execute(
+                "SELECT execution_id FROM executions WHERE run_id=? AND status='active'", (actor.run_id,)
+            )
+        }:
+            return "execution is inactive or belongs to another run"
+        if isinstance(grant, Claim):
+            if not BoardClaimStrategy(self.db).validate_claim(grant, task_id=task_id, worker_id=actor.agent_instance_id):
+                return "claim is stale, forged, or scoped to another task"
+            return None
+        if isinstance(grant, Assignment):
+            if not ManagedPoolStrategy(self.db).validate_assignment(
+                grant, task_id=task_id, worker_id=actor.agent_instance_id
+            ):
+                return "assignment is stale, forged, or scoped to another task"
+            return None
+        if isinstance(grant, CandidateGrant):
+            allowed_effects = {
+                "pure_only": {"pure"},
+                "read_only": {"pure", "read", "artifact"},
+                "staged_effects": {"pure", "read", "artifact", "stage"},
+            }[grant.effect_policy.value]
+            if effect_class not in allowed_effects:
+                return "speculative candidates cannot perform direct external effects"
+            if not SpeculativeStrategy(self.db).validate_candidate(
+                grant, task_id=task_id, worker_id=actor.agent_instance_id
+            ):
+                return "candidate grant is stale, forged, or scoped to another task"
+            return None
+        return "unrecognized ownership grant"
 
     def _tool_read_metric_slice(self, run_id: str, task_id: str, args: dict[str, Any]) -> dict[str, Any]:
         start = _parse_ts(args["start"], args.get("assume_timezone"))
