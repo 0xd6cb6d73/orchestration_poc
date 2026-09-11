@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from poc.execution.board_claim import Claim
 from poc.execution.ooda_graph import OODAHarness, WorkerState
 from poc.models import AgentBackend, AgentInstance, TaskSpec
 
@@ -15,6 +16,10 @@ class AgentExecutionRequest:
     run_id: str
     agent: AgentInstance
     attempt_id: str
+    authority_task_id: str
+    goal_contract_id: str
+    context_manifest_id: str
+    ownership_grant: Claim | None
     inputs: dict[str, Any]
     input_artifacts: list[str]
 
@@ -24,6 +29,7 @@ class AgentExecutionRequest:
             "workflow_id": self.workflow_id,
             "workflow_revision": self.workflow_revision,
             "task_id": self.task.id,
+            "authority_task_id": self.authority_task_id,
             "goal": self.task.goal,
             "output_schema": self.task.output_schema,
             "acceptance_criteria": self.task.acceptance_criteria,
@@ -31,6 +37,7 @@ class AgentExecutionRequest:
             "input_artifacts": self.input_artifacts,
             "agent": self.agent.model_dump(mode="json"),
             "attempt_id": self.attempt_id,
+            "ownership_grant": self.ownership_grant,
             "cycle": 0,
             "tool_calls": 0,
             "validations": 0,

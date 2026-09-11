@@ -197,6 +197,71 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
             execution_id, row["task_id"], attempt_id, worker_id, generation, expires_at, token
         )
 
+    def claim_task(self, *, execution_id: str, task_id: str, worker_id: str) -> Claim | None:
+        """Atomically claim one routed task rather than the next task for a role."""
+        execution, policy = self._active_execution(execution_id)
+        worker = self.db.get_agent(worker_id)
+        if (
+            worker is None
+            or worker.run_id != execution["run_id"]
+            or worker.parent_agent_id != execution["owner_suborchestrator_id"]
+            or worker.role_id not in policy.allowed_roles
+        ):
+            raise StrategyError("worker identity is not authorized for this execution")
+        membership = self.db.conn.execute(
+            "SELECT 1 FROM swarm_execution_workers WHERE execution_id=? AND worker_instance_id=? "
+            "AND role_id=? AND status='active'",
+            (execution_id, worker_id, worker.role_id),
+        ).fetchone()
+        if membership is None:
+            raise StrategyError("worker is not in the scheduler-authorized active population")
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(seconds=policy.lease_seconds)).isoformat()
+        token = secrets.token_urlsafe(32)
+        token_hash = _token_hash(token)
+        attempt_id = new_id("attempt")
+        with self.db.transaction() as tx:
+            row = tx.execute(
+                "SELECT * FROM swarm_tasks WHERE execution_id=? AND task_id=? AND state='ready' "
+                "AND required_role=? AND available_at<=? AND attempt_count<max_attempts",
+                (execution_id, task_id, worker.role_id, now),
+            ).fetchone()
+            if row is None:
+                return None
+            generation = int(row["claim_generation"]) + 1
+            changed = tx.execute(
+                "UPDATE swarm_tasks SET state='claimed',claimant_id=?,claim_token_hash=?,"
+                "claim_generation=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? "
+                "WHERE execution_id=? AND task_id=? AND state='ready'",
+                (worker_id, token_hash, generation, expires_at, now, execution_id, task_id),
+            )
+            if changed.rowcount != 1:
+                return None
+            tx.execute(
+                "INSERT INTO swarm_task_attempts VALUES (?,?,?,?,?,?,?,NULL,'running',NULL,NULL)",
+                (attempt_id, execution_id, task_id, generation, worker_id, now, now),
+            )
+            self.db.append_event(
+                tx,
+                EventRecord(
+                    run_id=execution["run_id"],
+                    event_type="claim.acquired",
+                    actor_id=worker_id,
+                    data={
+                        "execution_id": execution_id,
+                        "task_id": task_id,
+                        "attempt_id": attempt_id,
+                        "claim_generation": generation,
+                        "token_fingerprint": _fingerprint(token),
+                        "lease_expires_at": expires_at,
+                        "role": worker.role_id,
+                        "routed": True,
+                    },
+                ),
+            )
+        return Claim(execution_id, task_id, attempt_id, worker_id, generation, expires_at, token)
+
     def heartbeat(self, claim: Claim) -> str:
         execution, policy = self._active_execution(claim.execution_id)
         now_dt = datetime.now(UTC)

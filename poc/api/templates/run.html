@@ -34,6 +34,7 @@
         <div class="execution-summary" aria-label="Execution configuration">
           <span class="execution-chip"><small>Agent runtime</small><span id="agent-runtime">{{ status.plan.agent_runtime.backend }}</span></span>
           <span class="execution-chip"><small>Orchestration</small><span id="execution-mode">{{ status.plan.execution_mode | replace('_', ' ') }}</span></span>
+          <span class="execution-chip"><small>Swarm strategy</small><span id="swarm-strategy">{{ status.plan.swarm_strategy | replace('_', ' ') }}</span></span>
           <span class="execution-chip"><small>Model</small><span id="agent-model">{% if status.plan.agent_runtime.model %}{{ status.plan.agent_runtime.provider or '' }}{% if status.plan.agent_runtime.provider and ':' not in status.plan.agent_runtime.model %}:{% endif %}{{ status.plan.agent_runtime.model }}{% else %}built-in deterministic{% endif %}</span></span>
         </div>
       </div>
@@ -86,6 +87,30 @@
       <noscript>
         <ul>{% for agent in status.agents %}<li>{{ agent.role_id }} → {{ agent.parent_agent_id or "root" }}</li>{% endfor %}</ul>
       </noscript>
+    </section>
+
+    <section id="hybrid-panel" class="panel hybrid-panel" aria-labelledby="hybrid-title" hidden>
+      <div class="section-heading compact">
+        <div>
+          <p class="eyebrow">Diverge · test · select</p>
+          <h2 id="hybrid-title">Hybrid evidence archive</h2>
+        </div>
+        <span id="hybrid-phase" class="status-badge">framed</span>
+      </div>
+      <div class="hybrid-grid">
+        <div>
+          <h3>Candidate hypotheses</h3>
+          <div id="candidate-list" class="candidate-list"></div>
+        </div>
+        <div>
+          <h3>Verification and delivery</h3>
+          <div id="assurance-list" class="assurance-list"></div>
+        </div>
+        <div>
+          <h3>Evidence blackboard</h3>
+          <div id="blackboard-list" class="blackboard-list"></div>
+        </div>
+      </div>
     </section>
 
     <div class="content-grid">

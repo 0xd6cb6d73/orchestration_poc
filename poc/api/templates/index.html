@@ -51,6 +51,15 @@
             </select>
             <small>Stored in the plan and propagated to every workflow.</small>
           </div>
+          <div class="form-field">
+            <label for="swarm-strategy">Swarm strategy</label>
+            <select id="swarm-strategy" name="swarm_strategy" required>
+              {% for strategy in swarm_strategies %}
+              <option value="{{ strategy }}"{% if strategy == default_swarm_strategy %} selected{% endif %}>{{ strategy | replace('_', ' ') }}</option>
+              {% endfor %}
+            </select>
+            <small>Hybrid v1 adds sealed proposals, evidence testing, and independent verification inside board claim.</small>
+          </div>
           <div class="form-field model-field" data-model-field>
             <label for="agent-provider">Model provider</label>
             <input id="agent-provider" name="agent_provider" placeholder="openai" autocomplete="off">

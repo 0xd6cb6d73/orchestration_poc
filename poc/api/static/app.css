@@ -149,6 +149,16 @@ textarea:focus, input:focus, select:focus { border-color: var(--green); box-shad
 
 .panel { box-shadow: 0 12px 36px rgba(22, 35, 30, .055); padding: 26px; }
 .hierarchy-panel { margin-bottom: 24px; overflow: hidden; }
+.hybrid-panel { margin-bottom: 24px; }
+.hybrid-grid { display: grid; gap: 22px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.hybrid-grid h3 { font-size: 11px; letter-spacing: .08em; margin-bottom: 10px; text-transform: uppercase; }
+.candidate-list, .assurance-list, .blackboard-list { display: grid; gap: 8px; }
+.candidate-row, .assurance-row, .blackboard-row { background: #fbfaf5; border: 1px solid var(--line); border-radius: 9px; display: grid; gap: 7px; padding: 11px; }
+.candidate-heading, .assurance-row, .blackboard-row { align-items: center; display: flex; gap: 8px; justify-content: space-between; }
+.candidate-heading strong { font-size: 12px; }
+.candidate-detail { color: var(--muted); font-size: 9px; }
+.candidate-artifact { color: var(--blue); font: 9px ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assurance-row span:last-child, .blackboard-row span:last-child { color: var(--muted); font-size: 9px; overflow-wrap: anywhere; }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; }
 .legend span { align-items: center; color: var(--muted); display: flex; font-size: 11px; gap: 5px; }
 .legend-dot { background: var(--orange); border-radius: 50%; display: inline-block; height: 7px; width: 7px; }
@@ -218,7 +228,7 @@ textarea:focus, input:focus, select:focus { border-color: var(--green); box-shad
 
 @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(220, 100, 53, .15); } }
 @media (max-width: 900px) {
-  .hero, .content-grid, .approval-panel { grid-template-columns: 1fr; }
+  .hero, .content-grid, .approval-panel, .hybrid-grid { grid-template-columns: 1fr; }
   .hero { gap: 25px; }
   .dashboard-page { padding-top: 45px; }
   .run-index { margin-top: 70px; }

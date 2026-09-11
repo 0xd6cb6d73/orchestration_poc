@@ -15,6 +15,7 @@ class RoleRegistry:
                     "metrics_supervisor",
                     "evidence_supervisor",
                     "reporting_supervisor",
+                    "assurance_supervisor",
                 ],
             ),
             "metrics_supervisor": RoleSpec(
@@ -48,6 +49,14 @@ class RoleRegistry:
                     "section_renderer",
                     "report_assembler",
                 ],
+            ),
+            "assurance_supervisor": RoleSpec(
+                role_id="assurance_supervisor",
+                tier=Tier.SUB,
+                system_prompt=(
+                    "Delegate independent evidence checks; never verify substantive claims directly."
+                ),
+                allowed_child_roles=["evidence_verifier"],
             ),
             "window_selector": _worker(
                 "window_selector", ["read_metric_slice"], "WindowSelection", worker_limits
@@ -84,6 +93,9 @@ class RoleRegistry:
             ),
             "report_assembler": _worker(
                 "report_assembler", ["write_artifact"], "FinalReport", worker_limits
+            ),
+            "evidence_verifier": _worker(
+                "evidence_verifier", ["write_artifact"], "VerificationResult", worker_limits
             ),
         }
 

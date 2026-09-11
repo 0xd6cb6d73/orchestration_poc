@@ -147,6 +147,55 @@ claim = board.claim_next(execution_id=handle.execution_id, worker_id=worker_id)
 SQLite keeps the PoC self-contained. The transaction-bounded coordination layer can
 be backed by PostgreSQL in a distributed runtime without changing the strategy API.
 
+## Hybrid board swarm
+
+`hybrid_v1` is a versioned policy bundle inside `board_claim`; it is not another
+execution backend. Select both values in the web launch form, or create a run with:
+
+```json
+{
+  "execution_mode": "board_claim",
+  "swarm_strategy": "hybrid_v1",
+  "hybrid": {
+    "proposals_per_round": 3,
+    "max_collaboration_rounds": 2,
+    "max_critics_per_candidate": 2,
+    "initial_candidate_visibility": "sealed_to_round"
+  }
+}
+```
+
+The approved plan pins the resolved allocation, context, communication,
+collaboration, acceptance, and completion policy versions. The same board task,
+claim, lease, and capacity machinery remains authoritative. A capability router
+selects provisionable runtime profiles; a shared context assembler serves both
+agent backends and records exact artifact/message inclusion plus output provenance.
+
+Hybrid investigation uses bounded application-controlled rounds: independent
+proposals are sealed, released together, versioned into candidate clusters,
+challenged against original evidence, scored as a vector, and retained even when
+refuted. A separate assurance worker verifies the selected artifact. Typed artifact
+requirements distinguish a published candidate from verified evidence and an
+accepted deliverable, and the main orchestrator records a deterministic final gate.
+
+State ownership remains deliberately split:
+
+| State | Authoritative owner |
+|---|---|
+| Approved objective, constraints, strategy, policy versions | Immutable mission plan |
+| Task readiness, active owner, lease, fencing generation | Board-claim strategy |
+| Worker graph state and validation continuation | LangGraph checkpoint thread |
+| Artifact bytes and access policy | Content-addressed artifact store and application DB |
+| Claims, contradictions, candidate history, tests | Evidence blackboard and collaboration controller |
+| Verification, acceptance, delivery authority | Verification service and completion gate |
+| Agent population and profile capacity | Capacity scheduler |
+| Observability | Durable event journal; Phoenix is a best-effort projection |
+
+New routers, collaboration policies, verification policies, and completion gates can
+be registered behind these contracts without changing LangGraph worker graphs or
+telemetry bootstrap registration. The compatibility `board` strategy remains the
+default for existing and newly created non-hybrid runs.
+
 ## Interchangeable agent backends
 
 Worker execution is selected above the LangGraph and telemetry layers through

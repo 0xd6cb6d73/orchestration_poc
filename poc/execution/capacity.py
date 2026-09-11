@@ -160,3 +160,76 @@ class CapacityScheduler:
                         ),
                     )
         return active
+
+    def activate_existing(self, handle: ExecutionHandle, worker: AgentInstance) -> None:
+        """Attach a pre-materialized graph worker to a bounded board population."""
+        now = utc_now()
+        with self.db.transaction() as tx:
+            row = tx.execute(
+                "SELECT * FROM executions WHERE execution_id=? AND run_id=?",
+                (handle.execution_id, handle.run_id),
+            ).fetchone()
+            if row is None or row["status"] != "active" or row["mode"] != ExecutionMode.BOARD_CLAIM:
+                raise StrategyError("worker activation requires an active board execution")
+            policy = ExecutionPolicy.model_validate_json(row["policy"])
+            if (
+                worker.run_id != handle.run_id
+                or worker.parent_agent_id != handle.owner_suborchestrator_id
+                or worker.role_id not in policy.allowed_roles
+                or worker.agent_backend != policy.agent_backend
+            ):
+                raise StrategyError("worker is incompatible with the board execution policy")
+            existing = tx.execute(
+                "SELECT status FROM swarm_execution_workers WHERE execution_id=? "
+                "AND worker_instance_id=?",
+                (handle.execution_id, worker.agent_instance_id),
+            ).fetchone()
+            active_count = int(
+                tx.execute(
+                    "SELECT count(*) FROM swarm_execution_workers WHERE execution_id=? "
+                    "AND status='active'",
+                    (handle.execution_id,),
+                ).fetchone()[0]
+            )
+            if (
+                existing is None or existing["status"] != "active"
+            ) and active_count >= policy.max_workers:
+                raise StrategyError("board worker population limit is exhausted")
+            tx.execute(
+                "INSERT INTO swarm_execution_workers VALUES (?,?,?,'active',?,?) "
+                "ON CONFLICT(execution_id,worker_instance_id) DO UPDATE SET "
+                "role_id=excluded.role_id,status='active',updated_at=excluded.updated_at",
+                (handle.execution_id, worker.agent_instance_id, worker.role_id, now, now),
+            )
+            self.db.append_event(
+                tx,
+                EventRecord(
+                    run_id=handle.run_id,
+                    event_type="worker.attached",
+                    actor_id=worker.agent_instance_id,
+                    data={
+                        "execution_id": handle.execution_id,
+                        "role": worker.role_id,
+                        "parent_authority": handle.owner_suborchestrator_id,
+                    },
+                ),
+            )
+
+    def deactivate(self, handle: ExecutionHandle, worker_id: str) -> None:
+        now = utc_now()
+        with self.db.transaction() as tx:
+            changed = tx.execute(
+                "UPDATE swarm_execution_workers SET status='stopped',updated_at=? "
+                "WHERE execution_id=? AND worker_instance_id=? AND status='active'",
+                (now, handle.execution_id, worker_id),
+            )
+            if changed.rowcount:
+                self.db.append_event(
+                    tx,
+                    EventRecord(
+                        run_id=handle.run_id,
+                        event_type="worker.detached",
+                        actor_id=worker_id,
+                        data={"execution_id": handle.execution_id},
+                    ),
+                )

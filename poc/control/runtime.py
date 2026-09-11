@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from poc.blackboard.models import EpistemicStatus, RecordType
+from poc.blackboard.service import BlackboardService
 from poc.control.spawn_policy import SpawnPolicy
 from poc.control.supervisor_actor import SupervisorActor
 from poc.execution.agent_executor import AgentExecutorRegistry, CustomPythonAgentExecutor
@@ -19,9 +21,18 @@ from poc.execution.strategy import ExecutionCoordinator, StrategyRegistry
 from poc.execution.worker_adapter import WorkerAdapter
 from poc.execution.workflow_compiler import WorkflowCompiler
 from poc.execution.workflow_runner import WorkflowRunner
+from poc.hybrid.capability_router import CapabilityRouter
+from poc.hybrid.collaboration_controller import CollaborationController
+from poc.hybrid.communication import CommunicationService
+from poc.hybrid.completion_gate import CompletionGate
+from poc.hybrid.context_assembler import ContextAssembler
+from poc.hybrid.contracts import Candidate, CollaborationPhase, EvaluationVector
+from poc.hybrid.policies import SwarmPolicyResolver
+from poc.hybrid.verification_service import VerificationService
 from poc.models import (
     AgentInstance,
     ApprovalRequest,
+    DependencyRequirement,
     EventRecord,
     ExecutionHandle,
     ExecutionMode,
@@ -31,6 +42,7 @@ from poc.models import (
     PlanArea,
     RunCreate,
     RunStatus,
+    SwarmStrategy,
     TaskSpec,
     Tier,
     WorkflowSpec,
@@ -83,7 +95,27 @@ class Runtime:
                 pydantic_model_factory,
             )
         )
-        self.adapter = WorkerAdapter(self.db, self.spawns, self.agent_executors)
+        self.policy_resolver = SwarmPolicyResolver()
+        self.context = ContextAssembler(self.db, self.artifacts, self.roles)
+        self.blackboard = BlackboardService(self.db)
+        self.communications = CommunicationService(self.db)
+        self.capabilities = CapabilityRouter(self.db)
+        self.collaboration = CollaborationController(
+            self.db, self.artifacts, self.blackboard, self.communications
+        )
+        self.verification = VerificationService(self.db)
+        self.completion_gate = CompletionGate(self.db)
+        board_strategy = self.strategies.get(ExecutionMode.BOARD_CLAIM)
+        if not isinstance(board_strategy, BoardClaimStrategy):
+            raise TypeError("board_claim registry entry must be BoardClaimStrategy")
+        self.adapter = WorkerAdapter(
+            self.db,
+            self.spawns,
+            self.agent_executors,
+            self.context,
+            self.capacity,
+            board_strategy,
+        )
         self.compiler = WorkflowCompiler(self.adapter, self._get_agent)
         self.runner = WorkflowRunner(self.db, self.compiler, self.data_dir / "checkpoints.sqlite")
         self.actors: dict[str, SupervisorActor] = {}
@@ -214,6 +246,7 @@ class Runtime:
             ],
             "artifacts": [a.model_dump(mode="json") for a in self.db.list_artifacts(run_id)],
             "events": self.db.events(run_id),
+            "hybrid": self.db.hybrid_status(run_id),
         }
 
     async def _execute_run(self, run_id: str, plan: MissionPlan) -> None:
@@ -238,6 +271,9 @@ class Runtime:
                     goal_ref=area.id,
                     policy=ExecutionPolicy(
                         mode=area.execution_mode,
+                        swarm_strategy=plan.swarm_strategy,
+                        policy_set=plan.policy_set,
+                        hybrid=plan.hybrid,
                         agent_backend=plan.agent_runtime.backend,
                         agent_provider=plan.agent_runtime.provider,
                         agent_model=plan.agent_runtime.model,
@@ -305,6 +341,22 @@ class Runtime:
             source_artifacts = list(
                 dict.fromkeys(metrics["evidence_artifacts"] + evidence["evidence_artifacts"])
             )
+            selected_claim: dict[str, Any] | None = None
+            selected_candidate_artifact_id: str | None = None
+            required_accepted_artifacts: tuple[str, ...] = ()
+            if plan.swarm_strategy == SwarmStrategy.HYBRID_V1:
+                selected_claim, selected_candidate = await self._run_hybrid_search(
+                    run_id=run_id,
+                    plan=plan,
+                    reporting_supervisor=supervisors["reporting"],
+                    assurance_supervisor=supervisors["assurance"],
+                    metrics=metrics["result"]["content"],
+                    evidence=evidence["result"],
+                    source_artifacts=source_artifacts,
+                )
+                source_artifacts.append(selected_candidate.artifact_id)
+                selected_candidate_artifact_id = selected_candidate.artifact_id
+                required_accepted_artifacts = (selected_candidate.artifact_id,)
             report_spec = self._report_workflow(
                 run_id,
                 plan,
@@ -312,6 +364,8 @@ class Runtime:
                 metrics["result"]["content"],
                 evidence["result"],
                 source_artifacts,
+                selected_claim,
+                selected_candidate_artifact_id,
             )
             await self._actor(supervisors["reporting"]).turn(
                 {"type": "dependencies.accepted"}, [self._submit_command(report_spec)]
@@ -320,6 +374,13 @@ class Runtime:
             self._ensure_success(report_result, report_spec)
             final = report_result["results"]["assemble"]
             report_artifact = final["result"]["published"]["artifact_id"]
+            if plan.swarm_strategy == SwarmStrategy.HYBRID_V1:
+                delivery = self.completion_gate.evaluate(
+                    plan=plan,
+                    deliverable_artifact_id=report_artifact,
+                    required_accepted_artifacts=required_accepted_artifacts,
+                )
+                self.completion_gate.require(delivery)
             commands = [
                 {
                     "command_id": f"deliver:{report_artifact}",
@@ -424,6 +485,9 @@ class Runtime:
             agent_runtime=request.agent_runtime,
             execution_mode=request.execution_mode,
             execution_options=request.execution_options,
+            swarm_strategy=request.swarm_strategy,
+            policy_set=self.policy_resolver.resolve(request.swarm_strategy),
+            hybrid=request.hybrid,
             constraints=[
                 "Offline fixture access only",
                 "Do not modify live systems",
@@ -473,6 +537,24 @@ class Runtime:
                         "claims cite accepted artifacts",
                         "follow-up tests are non-destructive",
                     ],
+                ),
+                *(
+                    [
+                        PlanArea(
+                            id="assurance",
+                            owner_role="assurance_supervisor",
+                            goal="Independently verify candidate evidence before synthesis",
+                            execution_mode=request.execution_mode,
+                            allowed_execution_modes=frozenset(ExecutionMode),
+                            depends_on=["metrics", "evidence"],
+                            acceptance_criteria=[
+                                "producer and verifier identities differ",
+                                "all required evidence checks are explicit",
+                            ],
+                        )
+                    ]
+                    if request.swarm_strategy == SwarmStrategy.HYBRID_V1
+                    else []
                 ),
             ],
             completion_criteria=[
@@ -648,6 +730,292 @@ class Runtime:
             plan,
         )
 
+    async def _run_hybrid_search(
+        self,
+        *,
+        run_id: str,
+        plan: MissionPlan,
+        reporting_supervisor: AgentInstance,
+        assurance_supervisor: AgentInstance,
+        metrics: dict[str, Any],
+        evidence: dict[str, Any],
+        source_artifacts: list[str],
+    ) -> tuple[dict[str, Any], Candidate]:
+        focuses = ["nearby_deployment", "payment_timeout", "cache_queueing"]
+        focuses.extend(
+            f"independent_alternative_{index}"
+            for index in range(max(0, plan.hybrid.proposals_per_round - len(focuses)))
+        )
+        focuses = focuses[: plan.hybrid.proposals_per_round]
+        proposal_workflow_id = f"{run_id}-hybrid-proposals-r1"
+        critique_workflow_id = f"{run_id}-hybrid-critiques-r1"
+        verification_workflow_id = f"{run_id}-hybrid-verification-r1"
+        proposal_agents = [
+            self._pre_spawn_worker(
+                run_id=run_id,
+                plan=plan,
+                parent=reporting_supervisor,
+                role="claim_drafter",
+                workflow_id=proposal_workflow_id,
+                task_id=f"propose_{index}",
+            )
+            for index in range(len(focuses))
+        ]
+        critic_agents = [
+            self._pre_spawn_worker(
+                run_id=run_id,
+                plan=plan,
+                parent=reporting_supervisor,
+                role="claim_checker",
+                workflow_id=critique_workflow_id,
+                task_id=f"critique_{index}",
+            )
+            for index in range(len(focuses))
+        ]
+        verifier = self._pre_spawn_worker(
+            run_id=run_id,
+            plan=plan,
+            parent=assurance_supervisor,
+            role="evidence_verifier",
+            workflow_id=verification_workflow_id,
+            task_id="verify_selected_candidate",
+        )
+        round_ = self.collaboration.frame(
+            run_id=run_id,
+            domain_id="reporting",
+            steward=reporting_supervisor,
+            member_agent_ids=tuple(
+                agent.agent_instance_id for agent in [*proposal_agents, *critic_agents, verifier]
+            ),
+            config=plan.hybrid,
+            team_id=f"team:{run_id}:hybrid:r1",
+            round_id=f"round:{run_id}:hybrid:r1",
+        )
+        proposal_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=proposal_workflow_id,
+                run_id=run_id,
+                owner=reporting_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["claim_drafter"],
+                max_workers=plan.hybrid.proposals_per_round,
+                tasks=[
+                    TaskSpec(
+                        id=f"propose_{index}",
+                        role="claim_drafter",
+                        goal="Produce one independent falsifiable incident hypothesis.",
+                        static_inputs={
+                            "metrics": metrics,
+                            "evidence": evidence,
+                            "hypothesis_focus": focus,
+                        },
+                        static_artifact_refs=source_artifacts,
+                        output_schema="DraftClaim",
+                        acceptance_criteria=[
+                            "one falsifiable hypothesis",
+                            "alternatives remain explicit",
+                        ],
+                        domain_id="reporting",
+                        team_id=round_.team_id,
+                        collaboration_round_id=round_.round_id,
+                        artifact_visibility="sealed_to_round",
+                    )
+                    for index, focus in enumerate(focuses)
+                ],
+            ),
+            plan,
+        )
+        await self._actor(reporting_supervisor).turn(
+            {"type": "collaboration.proposals_requested"},
+            [self._submit_command(proposal_spec)],
+        )
+        proposal_result = await self.runner.start(proposal_spec)
+        self._ensure_success(proposal_result, proposal_spec)
+        candidate_content: dict[str, dict[str, Any]] = {}
+        for index, focus in enumerate(focuses):
+            result = proposal_result["results"][f"propose_{index}"]
+            content = result["result"]["content"]
+            author = self._get_agent(result["agent_instance_id"])
+            candidate = self.collaboration.submit_candidate(
+                round_id=round_.round_id,
+                author=author,
+                hypothesis_key=str(content.get("hypothesis_key", focus)),
+                artifact_id=result["output_artifact"],
+                evidence_refs=tuple(source_artifacts),
+            )
+            candidate_content[candidate.candidate_id] = content
+        released = self.collaboration.release(round_.round_id)
+        self.collaboration.cluster_candidates(round_.round_id)
+
+        critique_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=critique_workflow_id,
+                run_id=run_id,
+                owner=reporting_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["claim_checker"],
+                max_workers=min(len(released), plan.hybrid.max_critics_per_candidate + 1),
+                tasks=[
+                    TaskSpec(
+                        id=f"critique_{index}",
+                        role="claim_checker",
+                        goal="Challenge one candidate assumption against original evidence.",
+                        static_inputs={
+                            "draft": candidate_content[candidate.candidate_id],
+                            "hypothesis_key": candidate.hypothesis_key,
+                        },
+                        static_artifact_refs=[candidate.artifact_id, *source_artifacts],
+                        artifact_requirements={
+                            candidate.artifact_id: DependencyRequirement.CANDIDATE_PUBLISHED
+                        },
+                        output_schema="CheckedClaim",
+                        acceptance_criteria=["assumption and evidence check are explicit"],
+                        domain_id="reporting",
+                        team_id=round_.team_id,
+                        collaboration_round_id=round_.round_id,
+                        artifact_visibility="domain",
+                    )
+                    for index, candidate in enumerate(released)
+                ],
+            ),
+            plan,
+        )
+        await self._actor(reporting_supervisor).turn(
+            {"type": "collaboration.candidates_released"},
+            [self._submit_command(critique_spec)],
+        )
+        critique_result = await self.runner.start(critique_spec)
+        self._ensure_success(critique_result, critique_spec)
+        for index, candidate in enumerate(released):
+            result = critique_result["results"][f"critique_{index}"]
+            content = result["result"]["content"]
+            supported = bool(content["supported"])
+            critic = self._get_agent(result["agent_instance_id"])
+            self.collaboration.record_evaluation(
+                candidate_id=candidate.candidate_id,
+                critic=critic,
+                critique_artifact_id=result["output_artifact"],
+                passed=supported,
+                findings=tuple(str(item) for item in content.get("checks", [])),
+                evidence_refs=tuple(source_artifacts),
+                evaluation=EvaluationVector(
+                    validity=5 if supported else 1,
+                    evidence=5 if supported else 1,
+                    usefulness=5 if supported else 2,
+                    novelty=5 if candidate.hypothesis_key == "cache_queueing" else 2,
+                    constraint_satisfaction=5,
+                ),
+            )
+        self.collaboration.advance(round_.round_id, CollaborationPhase.CRITIQUED)
+        self.collaboration.advance(round_.round_id, CollaborationPhase.TESTED)
+        self.collaboration.advance(round_.round_id, CollaborationPhase.RECOMBINED)
+        selected = self.collaboration.select(round_.round_id)
+        selected_content = candidate_content[selected.candidate_id]
+
+        required_checks = (
+            "claim_matches_original_evidence",
+            "misleading_signals_qualified",
+            "constraints_preserved",
+        )
+        verification_request = self.verification.request(
+            run_id=run_id,
+            subject_artifact_id=selected.artifact_id,
+            producer_agent_id=selected.author_agent_id,
+            schema="DraftClaim",
+            required_checks=required_checks,
+            evidence_refs=tuple(source_artifacts),
+        )
+        verification_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=verification_workflow_id,
+                run_id=run_id,
+                owner=assurance_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["evidence_verifier"],
+                max_workers=1,
+                tasks=[
+                    TaskSpec(
+                        id="verify_selected_candidate",
+                        role="evidence_verifier",
+                        goal="Independently verify the selected claim against original evidence.",
+                        static_inputs={
+                            "candidate": selected_content,
+                            "subject_artifact_id": selected.artifact_id,
+                        },
+                        static_artifact_refs=[selected.artifact_id, *source_artifacts],
+                        artifact_requirements={
+                            selected.artifact_id: DependencyRequirement.CANDIDATE_PUBLISHED
+                        },
+                        output_schema="VerificationResult",
+                        acceptance_criteria=list(required_checks),
+                        domain_id="reporting",
+                        team_id=round_.team_id,
+                        collaboration_round_id=round_.round_id,
+                        artifact_visibility="domain",
+                    )
+                ],
+            ),
+            plan,
+        )
+        await self._actor(assurance_supervisor).turn(
+            {"type": "verification.requested"},
+            [self._submit_command(verification_spec)],
+        )
+        verification_result = await self.runner.start(verification_spec)
+        self._ensure_success(verification_result, verification_spec)
+        verified = verification_result["results"]["verify_selected_candidate"]
+        verification_content = verified["result"]["content"]
+        checks = {str(key): bool(value) for key, value in verification_content["checks"].items()}
+        verdict = self.verification.complete(
+            verification_id=verification_request.verification_id,
+            verifier=self._get_agent(verified["agent_instance_id"]),
+            checks=checks,
+            findings=tuple(str(item) for item in verification_content["findings"]),
+            evidence_refs=tuple(source_artifacts),
+        )
+        acceptance = self.verification.accept(
+            request=verification_request,
+            verdict=verdict,
+            policy_version=plan.policy_set.acceptance_policy,
+            downstream_uses=("report_synthesis", "final_delivery"),
+        )
+        if not acceptance.accepted:
+            raise RuntimeError("selected hybrid candidate did not pass independent verification")
+        verifier_agent = self._get_agent(verified["agent_instance_id"])
+        self.blackboard.publish(
+            actor=verifier_agent,
+            domain_id="reporting",
+            record_type=RecordType.DECISION,
+            statement=f"Candidate {selected.candidate_id} independently verified",
+            supporting_artifacts=(selected.artifact_id, *source_artifacts),
+            status=EpistemicStatus.SUPPORTED,
+            visibility_ref="reporting",
+        )
+        self.collaboration.advance(round_.round_id, CollaborationPhase.VERIFIED_AND_SCORED)
+        self.collaboration.complete(round_.round_id)
+        return selected_content, selected
+
+    def _pre_spawn_worker(
+        self,
+        *,
+        run_id: str,
+        plan: MissionPlan,
+        parent: AgentInstance,
+        role: str,
+        workflow_id: str,
+        task_id: str,
+    ) -> AgentInstance:
+        return self.spawns.spawn(
+            run_id=run_id,
+            parent=parent,
+            child_role=role,
+            plan_version=plan.version,
+            stable_key=f"{workflow_id}-r1-{task_id}",
+            agent_backend=plan.agent_runtime.backend,
+            agent_provider=plan.agent_runtime.provider,
+            agent_model=plan.agent_runtime.model,
+        )
+
     def _report_workflow(
         self,
         run_id: str,
@@ -656,6 +1024,8 @@ class Runtime:
         metrics: dict[str, Any],
         evidence: dict[str, Any],
         evidence_artifacts: list[str],
+        selected_claim: dict[str, Any] | None = None,
+        selected_candidate_artifact_id: str | None = None,
     ) -> WorkflowSpec:
         return self._configured_workflow(
             WorkflowSpec(
@@ -674,7 +1044,25 @@ class Runtime:
                         id="draft_claim",
                         role="claim_drafter",
                         goal="Draft one causal claim with alternatives.",
-                        static_inputs={"metrics": metrics, "evidence": evidence},
+                        static_inputs={
+                            "metrics": metrics,
+                            "evidence": evidence,
+                            **(
+                                {"selected_candidate": selected_claim}
+                                if selected_claim is not None
+                                else {}
+                            ),
+                        },
+                        static_artifact_refs=evidence_artifacts,
+                        artifact_requirements=(
+                            {
+                                selected_candidate_artifact_id: (
+                                    DependencyRequirement.ARTIFACT_VERIFIED
+                                )
+                            }
+                            if selected_candidate_artifact_id is not None
+                            else {}
+                        ),
                         output_schema="DraftClaim",
                         acceptance_criteria=["claim separates evidence from inference"],
                     ),
@@ -721,8 +1109,7 @@ class Runtime:
             plan,
         )
 
-    @staticmethod
-    def _configured_workflow(spec: WorkflowSpec, plan: MissionPlan) -> WorkflowSpec:
+    def _configured_workflow(self, spec: WorkflowSpec, plan: MissionPlan) -> WorkflowSpec:
         runtime = plan.agent_runtime
         tasks = [
             task.model_copy(
@@ -735,10 +1122,29 @@ class Runtime:
             )
             for task in spec.tasks
         ]
-        return spec.model_copy(
+        configured = spec.model_copy(
             update={
                 "execution_mode": plan.execution_mode,
                 "execution_options": plan.execution_options,
                 "tasks": tasks,
             }
         )
+        if plan.swarm_strategy == SwarmStrategy.HYBRID_V1:
+            profiles = [
+                self.capabilities.profile_for_role(
+                    self.roles.get(role_id),
+                    runtime,
+                    task_classes=frozenset(self.roles.get(role_id).output_schemas),
+                )
+                for role_id in configured.authorized_worker_roles
+            ]
+            for task in configured.tasks:
+                role = self.roles.get(task.role)
+                self.capabilities.route(
+                    run_id=configured.run_id,
+                    task_id=f"{configured.workflow_id}:{task.id}",
+                    task_class=task.output_schema,
+                    required_tools=frozenset(role.allowed_tools),
+                    profiles=profiles,
+                )
+        return configured

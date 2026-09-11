@@ -63,6 +63,44 @@ class AgentBackend(StrEnum):
     PYDANTIC_AI = "pydantic_ai"
 
 
+class SwarmStrategy(StrEnum):
+    """Versioned policy bundles used inside the board-claim swarm backend."""
+
+    BOARD = "board"
+    HYBRID_V1 = "hybrid_v1"
+
+
+class DependencyRequirement(StrEnum):
+    """Required authority state for consuming an artifact dependency."""
+
+    CANDIDATE_PUBLISHED = "candidate_published"
+    ARTIFACT_VERIFIED = "artifact_verified"
+    DELIVERABLE_ACCEPTED = "deliverable_accepted"
+
+
+class HybridConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    proposals_per_round: int = Field(default=3, ge=2, le=12)
+    max_collaboration_rounds: int = Field(default=2, ge=1, le=8)
+    max_critics_per_candidate: int = Field(default=2, ge=1, le=8)
+    initial_candidate_visibility: Literal["sealed_to_round"] = "sealed_to_round"
+
+
+class SwarmPolicySet(BaseModel):
+    """Resolved, immutable policy versions for one approved run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    strategy: SwarmStrategy = SwarmStrategy.BOARD
+    allocation_policy: str = "compatibility_fifo_v1"
+    context_policy: str = "compatibility_context_v1"
+    communication_policy: str = "supervisor_only_v1"
+    collaboration_policy: str = "none_v1"
+    acceptance_policy: str = "worker_result_v1"
+    completion_policy: str = "workflow_complete_v1"
+
+
 class AgentRuntimeConfig(BaseModel):
     """Per-run worker implementation and model selection.
 
@@ -115,6 +153,9 @@ class ExecutionPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    swarm_strategy: SwarmStrategy = SwarmStrategy.BOARD
+    policy_set: SwarmPolicySet = Field(default_factory=SwarmPolicySet)
+    hybrid: HybridConfig = Field(default_factory=HybridConfig)
     agent_backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
     agent_provider: str | None = Field(default=None, min_length=1)
     agent_model: str | None = Field(default=None, min_length=1)
@@ -137,6 +178,13 @@ class ExecutionPolicy(BaseModel):
             raise ValueError("speculative_fanout cannot exceed max_workers")
         if self.mode != ExecutionMode.SPECULATIVE and self.speculative_fanout != 1:
             raise ValueError("speculative_fanout is only valid in speculative mode")
+        if (
+            self.swarm_strategy == SwarmStrategy.HYBRID_V1
+            and self.mode != ExecutionMode.BOARD_CLAIM
+        ):
+            raise ValueError("hybrid_v1 is a strategy inside board_claim mode")
+        if self.policy_set.strategy != self.swarm_strategy:
+            raise ValueError("policy_set strategy must match swarm_strategy")
         return self
 
 
@@ -216,6 +264,9 @@ class MissionPlan(BaseModel):
     agent_runtime: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
     execution_mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
     execution_options: dict[str, Any] = Field(default_factory=dict)
+    swarm_strategy: SwarmStrategy = SwarmStrategy.BOARD
+    policy_set: SwarmPolicySet = Field(default_factory=SwarmPolicySet)
+    hybrid: HybridConfig = Field(default_factory=HybridConfig)
     constraints: list[str]
     permitted_sources: list[str]
     permitted_tools: list[str]
@@ -247,6 +298,16 @@ class RunCreate(BaseModel):
     agent_runtime: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
     execution_mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
     execution_options: dict[str, Any] = Field(default_factory=dict)
+    swarm_strategy: SwarmStrategy = SwarmStrategy.BOARD
+    hybrid: HybridConfig = Field(default_factory=HybridConfig)
+
+    @model_validator(mode="after")
+    def validate_swarm_strategy(self) -> RunCreate:
+        if self.swarm_strategy == SwarmStrategy.HYBRID_V1 and (
+            self.execution_mode != ExecutionMode.BOARD_CLAIM
+        ):
+            raise ValueError("hybrid_v1 requires board_claim execution mode")
+        return self
 
 
 class MessageEnvelope(BaseModel):
@@ -321,6 +382,22 @@ class TaskSpec(BaseModel):
     output_schema: str
     acceptance_criteria: list[str] = Field(default_factory=list)
     static_inputs: dict[str, Any] = Field(default_factory=dict)
+    static_artifact_refs: list[str] = Field(default_factory=list)
+    artifact_requirements: dict[str, DependencyRequirement] = Field(default_factory=dict)
+    domain_id: str | None = None
+    team_id: str | None = None
+    collaboration_round_id: str | None = None
+    candidate_id: str | None = None
+    artifact_visibility: str = "run_wide"
+
+    @model_validator(mode="after")
+    def validate_artifact_requirements(self) -> TaskSpec:
+        unknown = set(self.artifact_requirements) - set(self.static_artifact_refs)
+        if unknown:
+            raise ValueError(
+                f"artifact requirements reference non-input artifacts: {sorted(unknown)}"
+            )
+        return self
 
 
 class WorkflowSpec(BaseModel):
@@ -405,6 +482,10 @@ class ArtifactRecord(BaseModel):
     sha256: str
     path: str
     producer_task_id: str | None = None
+    producer_attempt_id: str | None = None
+    visibility: str = "run_wide"
+    visibility_ref: str | None = None
+    access_labels: frozenset[str] = Field(default_factory=frozenset)
     created_at: str = Field(default_factory=utc_now)
 
 

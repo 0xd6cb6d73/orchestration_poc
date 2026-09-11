@@ -8,6 +8,24 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from poc.blackboard.models import BlackboardRecord
+from poc.hybrid.contracts import (
+    AcceptanceDecision,
+    Candidate,
+    CandidateCluster,
+    CapabilityProfile,
+    Challenge,
+    CollaborationRound,
+    ContextManifest,
+    DeliveryDecision,
+    GoalContract,
+    ProvenanceRecord,
+    RouteDecision,
+    TeamSpec,
+    TestResult,
+    VerificationRequest,
+    VerificationVerdict,
+)
 from poc.models import (
     AgentInstance,
     ArtifactRecord,
@@ -301,6 +319,120 @@ CREATE TABLE IF NOT EXISTS swarm_reconciliations (
     policy_version TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(group_id, group_revision)
+);
+CREATE TABLE IF NOT EXISTS goal_contracts (
+    goal_contract_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(goal_contract_id, version)
+);
+CREATE TABLE IF NOT EXISTS context_manifests (
+    context_manifest_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(context_manifest_id, version)
+);
+CREATE TABLE IF NOT EXISTS provenance_records (
+    provenance_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    UNIQUE(run_id, artifact_id)
+);
+CREATE TABLE IF NOT EXISTS blackboard_records (
+    record_id TEXT NOT NULL,
+    record_version INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    domain_id TEXT NOT NULL,
+    epistemic_status TEXT NOT NULL,
+    visibility_policy TEXT NOT NULL,
+    visibility_ref TEXT,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(record_id, record_version)
+);
+CREATE TABLE IF NOT EXISTS team_specs (
+    team_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(team_id, version)
+);
+CREATE TABLE IF NOT EXISTS capability_profiles (
+    profile_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(profile_id, version)
+);
+CREATE TABLE IF NOT EXISTS route_decisions (
+    route_decision_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    offer_generation INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collaboration_rounds (
+    round_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    domain_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hybrid_candidates (
+    candidate_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    round_id TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    state TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(candidate_id, version)
+);
+CREATE TABLE IF NOT EXISTS hybrid_candidate_clusters (
+    cluster_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    round_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY(cluster_id, version)
+);
+CREATE TABLE IF NOT EXISTS hybrid_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hybrid_test_results (
+    test_result_id TEXT PRIMARY KEY,
+    round_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS verification_requests (
+    verification_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    subject_artifact_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS verification_verdicts (
+    verdict_id TEXT PRIMARY KEY,
+    verification_id TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS acceptance_decisions (
+    acceptance_decision_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    subject_artifact_id TEXT NOT NULL,
+    accepted INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS delivery_decisions (
+    delivery_decision_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    permitted INTEGER NOT NULL,
+    payload TEXT NOT NULL
 );
 """
 
@@ -773,6 +905,581 @@ class Database:
                 "SELECT payload FROM artifacts WHERE run_id=? ORDER BY rowid", (run_id,)
             )
         ]
+
+    def update_artifact_access(
+        self,
+        artifact_id: str,
+        *,
+        visibility: str,
+        visibility_ref: str | None,
+        access_labels: frozenset[str] = frozenset(),
+    ) -> ArtifactRecord:
+        current = self.get_artifact(artifact_id)
+        if current is None:
+            raise KeyError(artifact_id)
+        updated = current.model_copy(
+            update={
+                "visibility": visibility,
+                "visibility_ref": visibility_ref,
+                "access_labels": access_labels,
+            }
+        )
+        with self.transaction() as tx:
+            tx.execute(
+                "UPDATE artifacts SET payload=? WHERE artifact_id=?",
+                (updated.model_dump_json(), artifact_id),
+            )
+            self._append_event(
+                tx,
+                EventRecord(
+                    run_id=updated.run_id,
+                    event_type="artifact.visibility_changed",
+                    data={
+                        "artifact_id": artifact_id,
+                        "visibility": visibility,
+                        "visibility_ref": visibility_ref,
+                    },
+                ),
+            )
+        return updated
+
+    def put_goal_contract(self, contract: GoalContract) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO goal_contracts VALUES (?,?,?,?)",
+                (
+                    contract.goal_contract_id,
+                    contract.version,
+                    contract.run_id,
+                    contract.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=contract.run_id,
+                        event_type="goal_contract.created",
+                        data={
+                            "goal_contract_id": contract.goal_contract_id,
+                            "goal_contract_version": contract.version,
+                            "plan_version": contract.plan_version,
+                        },
+                    ),
+                )
+
+    def put_context_manifest(self, manifest: ContextManifest) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO context_manifests VALUES (?,?,?,?,?,?)",
+                (
+                    manifest.context_manifest_id,
+                    manifest.version,
+                    manifest.run_id,
+                    manifest.agent_instance_id,
+                    manifest.task_id,
+                    manifest.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=manifest.run_id,
+                        event_type="context.assembled",
+                        actor_id=manifest.agent_instance_id,
+                        data={
+                            "context_manifest_id": manifest.context_manifest_id,
+                            "goal_contract_id": manifest.goal_contract_id,
+                            "task_id": manifest.task_id,
+                            "attempt_id": manifest.attempt_id,
+                            "available_artifacts": len(manifest.available_artifact_refs),
+                            "retrieved_artifacts": len(manifest.retrieved_artifact_refs),
+                            "included_artifacts": len(manifest.included_artifact_refs),
+                            "context_policy_version": manifest.context_policy_version,
+                        },
+                    ),
+                )
+
+    def put_provenance(self, record: ProvenanceRecord) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO provenance_records VALUES (?,?,?,?)",
+                (
+                    record.provenance_id,
+                    record.run_id,
+                    record.artifact_id,
+                    record.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=record.run_id,
+                        event_type="provenance.recorded",
+                        actor_id=record.producer_agent_id,
+                        data={
+                            "provenance_id": record.provenance_id,
+                            "artifact_id": record.artifact_id,
+                            "context_manifest_id": record.context_manifest_id,
+                            "task_id": record.task_id,
+                            "attempt_id": record.attempt_id,
+                        },
+                    ),
+                )
+
+    def get_provenance(self, artifact_id: str) -> ProvenanceRecord | None:
+        row = self.conn.execute(
+            "SELECT payload FROM provenance_records WHERE artifact_id=?", (artifact_id,)
+        ).fetchone()
+        return ProvenanceRecord.model_validate_json(row[0]) if row else None
+
+    def put_blackboard_record(self, record: BlackboardRecord, *, event_type: str) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO blackboard_records VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    record.record_id,
+                    record.record_version,
+                    record.run_id,
+                    record.domain_id,
+                    record.epistemic_status,
+                    record.visibility_policy,
+                    record.visibility_ref,
+                    record.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=record.run_id,
+                        event_type=event_type,
+                        actor_id=record.author_agent_id,
+                        data={
+                            "blackboard_record_id": record.record_id,
+                            "record_version": record.record_version,
+                            "domain_id": record.domain_id,
+                            "epistemic_status": record.epistemic_status,
+                            "visibility": record.visibility_policy,
+                        },
+                    ),
+                )
+
+    def latest_blackboard_record(self, record_id: str) -> BlackboardRecord | None:
+        row = self.conn.execute(
+            "SELECT payload FROM blackboard_records WHERE record_id=? "
+            "ORDER BY record_version DESC LIMIT 1",
+            (record_id,),
+        ).fetchone()
+        return BlackboardRecord.model_validate_json(row[0]) if row else None
+
+    def list_blackboard_records(self, run_id: str) -> list[BlackboardRecord]:
+        rows = self.conn.execute(
+            "SELECT b.payload FROM blackboard_records b "
+            "WHERE b.run_id=? AND b.record_version=(SELECT max(b2.record_version) "
+            "FROM blackboard_records b2 WHERE b2.record_id=b.record_id) ORDER BY b.rowid",
+            (run_id,),
+        ).fetchall()
+        return [BlackboardRecord.model_validate_json(row[0]) for row in rows]
+
+    def put_team(self, team: TeamSpec) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO team_specs VALUES (?,?,?,?)",
+                (team.team_id, team.version, team.run_id, team.model_dump_json()),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=team.run_id,
+                        event_type="team.registered",
+                        actor_id=team.steward_agent_id,
+                        data={
+                            "team_id": team.team_id,
+                            "domain_id": team.domain_id,
+                            "member_count": len(team.member_agent_ids),
+                            "message_budget": team.message_budget,
+                            "communication_policy_version": (team.communication_policy_version),
+                        },
+                    ),
+                )
+
+    def get_team(self, team_id: str) -> TeamSpec | None:
+        row = self.conn.execute(
+            "SELECT payload FROM team_specs WHERE team_id=? ORDER BY version DESC LIMIT 1",
+            (team_id,),
+        ).fetchone()
+        return TeamSpec.model_validate_json(row[0]) if row else None
+
+    def put_capability_profile(self, profile: CapabilityProfile) -> None:
+        with self.transaction() as tx:
+            tx.execute(
+                "INSERT OR REPLACE INTO capability_profiles VALUES (?,?,?)",
+                (profile.profile_id, profile.version, profile.model_dump_json()),
+            )
+
+    def list_capability_profiles(self) -> list[CapabilityProfile]:
+        return [
+            CapabilityProfile.model_validate_json(row[0])
+            for row in self.conn.execute("SELECT payload FROM capability_profiles ORDER BY rowid")
+        ]
+
+    def put_route_decision(self, decision: RouteDecision) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO route_decisions VALUES (?,?,?,?,?)",
+                (
+                    decision.route_decision_id,
+                    decision.run_id,
+                    decision.task_id,
+                    decision.offer_generation,
+                    decision.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=decision.run_id,
+                        event_type="allocation.decided",
+                        data={
+                            "route_decision_id": decision.route_decision_id,
+                            "task_id": decision.task_id,
+                            "selected_profile_id": decision.selected_profile_id,
+                            "offer_generation": decision.offer_generation,
+                            "policy_version": decision.policy_version,
+                            "reasons": list(decision.reasons),
+                        },
+                    ),
+                )
+
+    def put_collaboration_round(self, round_: CollaborationRound) -> None:
+        with self.transaction() as tx:
+            previous = tx.execute(
+                "SELECT phase FROM collaboration_rounds WHERE round_id=?", (round_.round_id,)
+            ).fetchone()
+            tx.execute(
+                "INSERT INTO collaboration_rounds VALUES (?,?,?,?,?) "
+                "ON CONFLICT(round_id) DO UPDATE SET phase=excluded.phase,payload=excluded.payload",
+                (
+                    round_.round_id,
+                    round_.run_id,
+                    round_.domain_id,
+                    round_.phase,
+                    round_.model_dump_json(),
+                ),
+            )
+            if previous is None or previous[0] != round_.phase:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=round_.run_id,
+                        event_type="collaboration.transitioned",
+                        actor_id=round_.steward_agent_id,
+                        data={
+                            "round_id": round_.round_id,
+                            "team_id": round_.team_id,
+                            "from_phase": previous[0] if previous else None,
+                            "phase": round_.phase,
+                            "policy_version": round_.policy_version,
+                        },
+                    ),
+                )
+
+    def get_collaboration_round(self, round_id: str) -> CollaborationRound | None:
+        row = self.conn.execute(
+            "SELECT payload FROM collaboration_rounds WHERE round_id=?", (round_id,)
+        ).fetchone()
+        return CollaborationRound.model_validate_json(row[0]) if row else None
+
+    def list_collaboration_rounds(self, run_id: str) -> list[CollaborationRound]:
+        return [
+            CollaborationRound.model_validate_json(row[0])
+            for row in self.conn.execute(
+                "SELECT payload FROM collaboration_rounds WHERE run_id=? ORDER BY rowid", (run_id,)
+            )
+        ]
+
+    def put_candidate(self, candidate: Candidate, *, event_type: str) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO hybrid_candidates VALUES (?,?,?,?,?,?)",
+                (
+                    candidate.candidate_id,
+                    candidate.version,
+                    candidate.round_id,
+                    candidate.visibility,
+                    candidate.state,
+                    candidate.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                round_row = tx.execute(
+                    "SELECT run_id FROM collaboration_rounds WHERE round_id=?",
+                    (candidate.round_id,),
+                ).fetchone()
+                if round_row:
+                    self._append_event(
+                        tx,
+                        EventRecord(
+                            run_id=round_row[0],
+                            event_type=event_type,
+                            actor_id=candidate.author_agent_id,
+                            data={
+                                "round_id": candidate.round_id,
+                                "candidate_id": candidate.candidate_id,
+                                "candidate_version": candidate.version,
+                                "artifact_id": candidate.artifact_id,
+                                "visibility": candidate.visibility,
+                                "state": candidate.state,
+                                "hypothesis_key": candidate.hypothesis_key,
+                            },
+                        ),
+                    )
+
+    def latest_candidate(self, candidate_id: str) -> Candidate | None:
+        row = self.conn.execute(
+            "SELECT payload FROM hybrid_candidates WHERE candidate_id=? "
+            "ORDER BY version DESC LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        return Candidate.model_validate_json(row[0]) if row else None
+
+    def put_candidate_cluster(self, cluster: CandidateCluster) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO hybrid_candidate_clusters VALUES (?,?,?,?)",
+                (
+                    cluster.cluster_id,
+                    cluster.version,
+                    cluster.round_id,
+                    cluster.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                round_row = tx.execute(
+                    "SELECT run_id FROM collaboration_rounds WHERE round_id=?",
+                    (cluster.round_id,),
+                ).fetchone()
+                if round_row:
+                    self._append_event(
+                        tx,
+                        EventRecord(
+                            run_id=round_row[0],
+                            event_type="candidate.clustered",
+                            data={
+                                "round_id": cluster.round_id,
+                                "cluster_id": cluster.cluster_id,
+                                "cluster_version": cluster.version,
+                                "candidate_ids": list(cluster.candidate_ids),
+                                "policy_version": cluster.assignment_policy_version,
+                                "rationale": cluster.rationale,
+                            },
+                        ),
+                    )
+
+    def list_candidate_clusters(self, run_id: str) -> list[CandidateCluster]:
+        rows = self.conn.execute(
+            "SELECT c.payload FROM hybrid_candidate_clusters c JOIN collaboration_rounds r "
+            "ON r.round_id=c.round_id WHERE r.run_id=? AND c.version=(SELECT max(c2.version) "
+            "FROM hybrid_candidate_clusters c2 WHERE c2.cluster_id=c.cluster_id) ORDER BY c.rowid",
+            (run_id,),
+        ).fetchall()
+        return [CandidateCluster.model_validate_json(row[0]) for row in rows]
+
+    def list_candidates(self, run_id: str) -> list[Candidate]:
+        rows = self.conn.execute(
+            "SELECT c.payload FROM hybrid_candidates c JOIN collaboration_rounds r "
+            "ON r.round_id=c.round_id WHERE r.run_id=? AND c.version=(SELECT max(c2.version) "
+            "FROM hybrid_candidates c2 WHERE c2.candidate_id=c.candidate_id) ORDER BY c.rowid",
+            (run_id,),
+        ).fetchall()
+        return [Candidate.model_validate_json(row[0]) for row in rows]
+
+    def put_challenge(self, challenge: Challenge) -> None:
+        with self.transaction() as tx:
+            tx.execute(
+                "INSERT OR IGNORE INTO hybrid_challenges VALUES (?,?,?,?)",
+                (
+                    challenge.challenge_id,
+                    challenge.round_id,
+                    challenge.candidate_id,
+                    challenge.model_dump_json(),
+                ),
+            )
+
+    def put_test_result(self, result: TestResult) -> None:
+        with self.transaction() as tx:
+            tx.execute(
+                "INSERT OR IGNORE INTO hybrid_test_results VALUES (?,?,?,?)",
+                (
+                    result.test_result_id,
+                    result.round_id,
+                    result.candidate_id,
+                    result.model_dump_json(),
+                ),
+            )
+
+    def put_verification_request(self, request: VerificationRequest) -> None:
+        with self.transaction() as tx:
+            tx.execute(
+                "INSERT OR IGNORE INTO verification_requests VALUES (?,?,?,?)",
+                (
+                    request.verification_id,
+                    request.run_id,
+                    request.subject_artifact_id,
+                    request.model_dump_json(),
+                ),
+            )
+
+    def get_verification_request(self, verification_id: str) -> VerificationRequest | None:
+        row = self.conn.execute(
+            "SELECT payload FROM verification_requests WHERE verification_id=?",
+            (verification_id,),
+        ).fetchone()
+        return VerificationRequest.model_validate_json(row[0]) if row else None
+
+    def put_verification_verdict(self, run_id: str, verdict: VerificationVerdict) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO verification_verdicts VALUES (?,?,?)",
+                (verdict.verdict_id, verdict.verification_id, verdict.model_dump_json()),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=run_id,
+                        event_type="verification.completed",
+                        actor_id=verdict.verifier_agent_id,
+                        data={
+                            "verification_id": verdict.verification_id,
+                            "verdict_id": verdict.verdict_id,
+                            "verdict": verdict.verdict,
+                            "checks_performed": list(verdict.checks_performed),
+                        },
+                    ),
+                )
+
+    def get_verification_verdict(self, verdict_id: str) -> VerificationVerdict | None:
+        row = self.conn.execute(
+            "SELECT payload FROM verification_verdicts WHERE verdict_id=?", (verdict_id,)
+        ).fetchone()
+        return VerificationVerdict.model_validate_json(row[0]) if row else None
+
+    def put_acceptance_decision(self, decision: AcceptanceDecision) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO acceptance_decisions VALUES (?,?,?,?,?)",
+                (
+                    decision.acceptance_decision_id,
+                    decision.run_id,
+                    decision.subject_artifact_id,
+                    decision.accepted,
+                    decision.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=decision.run_id,
+                        event_type="acceptance.decided",
+                        data={
+                            "acceptance_decision_id": decision.acceptance_decision_id,
+                            "artifact_id": decision.subject_artifact_id,
+                            "accepted": decision.accepted,
+                            "verdict_refs": list(decision.verdict_refs),
+                            "acceptance_policy_version": decision.acceptance_policy_version,
+                        },
+                    ),
+                )
+
+    def accepted_artifact(self, run_id: str, artifact_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM acceptance_decisions WHERE run_id=? AND subject_artifact_id=? "
+            "AND accepted=1 LIMIT 1",
+            (run_id, artifact_id),
+        ).fetchone()
+        return row is not None
+
+    def get_acceptance_decision(self, decision_id: str) -> AcceptanceDecision | None:
+        row = self.conn.execute(
+            "SELECT payload FROM acceptance_decisions WHERE acceptance_decision_id=?",
+            (decision_id,),
+        ).fetchone()
+        return AcceptanceDecision.model_validate_json(row[0]) if row else None
+
+    def delivery_permitted(self, run_id: str, artifact_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM delivery_decisions WHERE run_id=? AND artifact_id=? "
+            "AND permitted=1 LIMIT 1",
+            (run_id, artifact_id),
+        ).fetchone()
+        return row is not None
+
+    def put_delivery_decision(self, decision: DeliveryDecision) -> None:
+        with self.transaction() as tx:
+            inserted = tx.execute(
+                "INSERT OR IGNORE INTO delivery_decisions VALUES (?,?,?,?,?)",
+                (
+                    decision.delivery_decision_id,
+                    decision.run_id,
+                    decision.artifact_id,
+                    decision.permitted,
+                    decision.model_dump_json(),
+                ),
+            )
+            if inserted.rowcount:
+                self._append_event(
+                    tx,
+                    EventRecord(
+                        run_id=decision.run_id,
+                        event_type="delivery.gated",
+                        data={
+                            "delivery_decision_id": decision.delivery_decision_id,
+                            "artifact_id": decision.artifact_id,
+                            "plan_version": decision.plan_version,
+                            "permitted": decision.permitted,
+                            "checks": decision.checks,
+                            "reasons": list(decision.reasons),
+                        },
+                    ),
+                )
+
+    def hybrid_status(self, run_id: str) -> dict[str, Any]:
+        def payloads(query: str, parameters: tuple[str, ...]) -> list[dict[str, Any]]:
+            return [json.loads(row[0]) for row in self.conn.execute(query, parameters)]
+
+        return {
+            "blackboard": [
+                item.model_dump(mode="json") for item in self.list_blackboard_records(run_id)
+            ],
+            "collaboration_rounds": [
+                item.model_dump(mode="json") for item in self.list_collaboration_rounds(run_id)
+            ],
+            "candidates": [item.model_dump(mode="json") for item in self.list_candidates(run_id)],
+            "candidate_clusters": [
+                item.model_dump(mode="json") for item in self.list_candidate_clusters(run_id)
+            ],
+            "route_decisions": payloads(
+                "SELECT payload FROM route_decisions WHERE run_id=? ORDER BY rowid", (run_id,)
+            ),
+            "verifications": payloads(
+                "SELECT v.payload FROM verification_verdicts v JOIN verification_requests r "
+                "ON r.verification_id=v.verification_id WHERE r.run_id=? ORDER BY v.rowid",
+                (run_id,),
+            ),
+            "acceptance_decisions": payloads(
+                "SELECT payload FROM acceptance_decisions WHERE run_id=? ORDER BY rowid", (run_id,)
+            ),
+            "delivery_decisions": payloads(
+                "SELECT payload FROM delivery_decisions WHERE run_id=? ORDER BY rowid", (run_id,)
+            ),
+        }
 
     def begin_operation(
         self, operation_id: str, run_id: str, task_id: str, kind: str, request: Any

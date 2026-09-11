@@ -20,6 +20,7 @@ from poc.models import (
     ExecutionMode,
     PlanEdit,
     RunCreate,
+    SwarmStrategy,
 )
 from poc.telemetry.bootstrap import configure_telemetry, shutdown_telemetry
 
@@ -81,6 +82,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
                 "execution_modes": sorted(mode.value for mode in runtime.strategies.modes),
                 "default_backend": AgentBackend.CUSTOM_PYTHON,
                 "default_execution_mode": ExecutionMode.HIERARCHICAL_DAG,
+                "swarm_strategies": [strategy.value for strategy in SwarmStrategy],
+                "default_swarm_strategy": SwarmStrategy.BOARD,
             },
         )
 
@@ -90,6 +93,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         objective: Annotated[str, Form(min_length=1)],
         agent_backend: Annotated[str, Form(min_length=1)],
         execution_mode: Annotated[ExecutionMode, Form()],
+        swarm_strategy: Annotated[SwarmStrategy, Form()] = SwarmStrategy.BOARD,
         agent_provider: Annotated[str | None, Form()] = None,
         agent_model: Annotated[str | None, Form()] = None,
     ) -> RedirectResponse:
@@ -111,13 +115,16 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
             runtime.agent_executors.get(agent_runtime.backend)
         except AgentExecutorNotRegistered as exc:
             raise HTTPException(422, str(exc)) from exc
-        run, _ = runtime.create_run(
-            RunCreate(
+        try:
+            run_request = RunCreate(
                 objective=normalized_objective,
                 agent_runtime=agent_runtime,
                 execution_mode=execution_mode,
+                swarm_strategy=swarm_strategy,
             )
-        )
+        except ValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        run, _ = runtime.create_run(run_request)
         return RedirectResponse(f"/ui/runs/{run['run_id']}", status_code=303)
 
     @app.post("/ui/runs/{run_id}/approval", include_in_schema=False)
@@ -211,9 +218,11 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     async def artifact(artifact_id: str, http_request: Request) -> Response:
         try:
             runtime = cast(Runtime, http_request.app.state.runtime)
-            record, content = runtime.artifacts.read(artifact_id)
+            record, content = runtime.artifacts.read_public(artifact_id)
         except KeyError:
             raise HTTPException(404, "artifact not found") from None
+        except PermissionError:
+            raise HTTPException(403, "artifact is not available in this view") from None
         return Response(
             content,
             media_type=record.media_type,

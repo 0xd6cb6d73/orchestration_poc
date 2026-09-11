@@ -54,9 +54,10 @@ class PydanticAgentDependencies:
         result = self.tools.execute(
             operation_id=(f"{self.request.attempt_id}:pydantic-ai:{call_index}:{tool_name}"),
             actor=self.actor,
-            task_id=self.request.task.id,
+            task_id=self.request.authority_task_id,
             tool_name=tool_name,
             arguments=arguments,
+            grant=self.request.ownership_grant,
         )
         self.tool_results.append({"tool_name": tool_name, "result": result})
         artifact_id = result.get("artifact_id")

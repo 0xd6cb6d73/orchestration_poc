@@ -8,6 +8,7 @@ from typing import Any, Protocol, TypedDict, cast
 from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import interrupt
 
+from poc.execution.board_claim import Claim
 from poc.models import AgentInstance, EventRecord, Outcome, ValidationRequest, WorkerResult
 from poc.persistence.database import Database
 from poc.roles.registry import RoleRegistry
@@ -21,6 +22,7 @@ class WorkerState(TypedDict, total=False):
     workflow_id: str
     workflow_revision: int
     task_id: str
+    authority_task_id: str
     goal: str
     output_schema: str
     acceptance_criteria: list[str]
@@ -28,6 +30,7 @@ class WorkerState(TypedDict, total=False):
     input_artifacts: list[str]
     agent: dict[str, Any]
     attempt_id: str
+    ownership_grant: Claim | None
     cycle: int
     tool_calls: int
     validations: int
@@ -211,9 +214,10 @@ class OODAHarness:
         result = self.tools.execute(
             operation_id=operation_id,
             actor=actor,
-            task_id=state["task_id"],
+            task_id=state.get("authority_task_id", state["task_id"]),
             tool_name=decision["tool_name"],
             arguments=decision["arguments"],
+            grant=state.get("ownership_grant"),
         )
         working = dict(state.get("working", {}))
         working[decision["tool_name"]] = result
@@ -392,6 +396,7 @@ class OODAHarness:
             "metric_comparator",
             "claim_drafter",
             "claim_checker",
+            "evidence_verifier",
             "section_renderer",
             "report_assembler",
         }:
@@ -410,10 +415,32 @@ class OODAHarness:
                 "claim": f"Checkout p95 rose from {baseline:.2f} ms to {incident:.2f} ms ({incident / baseline:.2f}x).",
             }
         if role == "claim_drafter":
+            selected = inputs.get("selected_candidate")
+            if isinstance(selected, dict):
+                return cast(dict[str, Any], selected)
             metric = inputs["metrics"]
             evidence = inputs["evidence"]
             deployment = evidence["deployment_match"]["matches"][0]
+            focus = inputs.get("hypothesis_focus")
+            if focus == "payment_timeout":
+                return {
+                    "hypothesis_key": focus,
+                    "claim": "Upstream payment timeouts caused the checkout latency regression.",
+                    "confidence": "low",
+                    "alternatives": ["cache queueing", "nearby deployment"],
+                }
+            if focus == "cache_queueing":
+                return {
+                    "hypothesis_key": focus,
+                    "claim": (
+                        "A cache configuration or queueing regression is the leading explanation: "
+                        f"latency rose {metric['ratio']}x while cache_miss became incident-specific."
+                    ),
+                    "confidence": "medium",
+                    "alternatives": ["nearby deployment", "upstream payment latency"],
+                }
             return {
+                "hypothesis_key": focus or "nearby_deployment",
                 "claim": (
                     f"The regression is likely related to {deployment['version']}, deployed "
                     f"{deployment['minutes_before_incident']} minutes before the incident, because latency rose "
@@ -424,7 +451,25 @@ class OODAHarness:
             }
         if role == "claim_checker":
             draft = inputs["draft"]
+            hypothesis_key = inputs.get("hypothesis_key")
+            if hypothesis_key == "payment_timeout":
+                return {
+                    "hypothesis_key": hypothesis_key,
+                    "claim": draft["claim"],
+                    "supported": False,
+                    "checks": ["payment_timeout also occurs in the baseline window"],
+                    "caveat": "The pattern is not uniquely correlated with the incident.",
+                }
+            if hypothesis_key == "nearby_deployment":
+                return {
+                    "hypothesis_key": hypothesis_key,
+                    "claim": draft["claim"],
+                    "supported": False,
+                    "checks": ["deployment proximity is temporal evidence only"],
+                    "caveat": "No direct deployment mechanism has been established.",
+                }
             return {
+                "hypothesis_key": hypothesis_key or "cache_queueing",
                 "claim": draft["claim"],
                 "supported": True,
                 "checks": [
@@ -433,6 +478,23 @@ class OODAHarness:
                     "misleading payment_timeout qualified",
                 ],
                 "caveat": "Temporal association is not proof of causation.",
+            }
+        if role == "evidence_verifier":
+            candidate = inputs["candidate"]
+            supported = candidate.get("hypothesis_key") == "cache_queueing"
+            return {
+                "subject_artifact_id": inputs["subject_artifact_id"],
+                "supported": supported,
+                "checks": {
+                    "claim_matches_original_evidence": supported,
+                    "misleading_signals_qualified": supported,
+                    "constraints_preserved": True,
+                },
+                "findings": [
+                    "Cache-miss evidence is incident-specific and the payment signal is not."
+                    if supported
+                    else "The candidate does not survive the original evidence check."
+                ],
             }
         if role == "section_renderer":
             checked = inputs["checked"]

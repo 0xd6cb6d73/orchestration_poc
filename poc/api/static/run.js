@@ -42,6 +42,9 @@
     document.getElementById("execution-mode").textContent = String(
       status.plan?.execution_mode || "hierarchical_dag",
     ).replaceAll("_", " ");
+    document.getElementById("swarm-strategy").textContent = String(
+      status.plan?.swarm_strategy || "board",
+    ).replaceAll("_", " ");
     document.getElementById("agent-model").textContent = modelLabel(runtime);
     document.getElementById("agent-count").textContent = status.agents.length;
     document.getElementById("workflow-count").textContent = status.workflows.length;
@@ -52,6 +55,7 @@
     if (cancelForm) cancelForm.hidden = run.status !== "running";
 
     renderAgents(status.agents);
+    renderHybrid(status.hybrid || {}, status.plan);
     renderWorkflows(status.workflows);
     renderPlan(status.plan);
     renderArtifacts(status.artifacts);
@@ -62,6 +66,71 @@
       timer = null;
       connection.innerHTML = "<span class=\"live-dot\"></span> settled";
     }
+  };
+
+  const renderHybrid = (hybrid, plan) => {
+    const panel = document.getElementById("hybrid-panel");
+    const enabled = plan?.swarm_strategy === "hybrid_v1";
+    panel.hidden = !enabled;
+    if (!enabled) return;
+
+    const rounds = hybrid.collaboration_rounds || [];
+    const phase = rounds.length ? rounds[rounds.length - 1].phase : "framed";
+    const phaseNode = document.getElementById("hybrid-phase");
+    phaseNode.textContent = phase.replaceAll("_", " ");
+    phaseNode.dataset.status = phase === "complete" ? "completed" : "running";
+
+    const candidates = document.getElementById("candidate-list");
+    candidates.replaceChildren();
+    (hybrid.candidates || []).forEach((candidate) => {
+      const row = element("article", "candidate-row");
+      const heading = element("div", "candidate-heading");
+      heading.append(element("strong", "", candidate.hypothesis_key.replaceAll("_", " ")));
+      heading.append(badge(candidate.state));
+      row.append(heading);
+      const evaluation = candidate.evaluation;
+      row.append(
+        element(
+          "span",
+          "candidate-detail",
+          evaluation
+            ? `validity ${evaluation.validity}/5 · evidence ${evaluation.evidence}/5 · novelty ${evaluation.novelty}/5`
+            : candidate.visibility.replaceAll("_", " "),
+        ),
+      );
+      const link = element("a", "candidate-artifact", candidate.artifact_id);
+      link.href = `/artifacts/${encodeURIComponent(candidate.artifact_id)}`;
+      row.append(link);
+      candidates.append(row);
+    });
+    if (!candidates.children.length) candidates.append(empty("Waiting for sealed proposals."));
+
+    const assurance = document.getElementById("assurance-list");
+    assurance.replaceChildren();
+    [...(hybrid.verifications || []), ...(hybrid.delivery_decisions || [])].forEach((item) => {
+      const row = element("article", "assurance-row");
+      const state = item.verdict || (item.permitted ? "permitted" : "blocked");
+      row.append(badge(state));
+      row.append(
+        element(
+          "span",
+          "",
+          item.verification_id || item.delivery_decision_id || "acceptance decision",
+        ),
+      );
+      assurance.append(row);
+    });
+    if (!assurance.children.length) assurance.append(empty("Independent checks are pending."));
+
+    const blackboard = document.getElementById("blackboard-list");
+    blackboard.replaceChildren();
+    (hybrid.blackboard || []).slice().reverse().forEach((record) => {
+      const row = element("article", "blackboard-row");
+      row.append(badge(record.epistemic_status));
+      row.append(element("span", "", record.concise_statement));
+      blackboard.append(row);
+    });
+    if (!blackboard.children.length) blackboard.append(empty("No evidence claims published."));
   };
 
   const renderAgents = (agents) => {
@@ -178,6 +247,7 @@
       planList("Execution", [
         `runtime: ${runtime.backend || "custom_python"}`,
         `orchestration: ${String(plan.execution_mode || "hierarchical_dag").replaceAll("_", " ")}`,
+        `swarm strategy: ${String(plan.swarm_strategy || "board").replaceAll("_", " ")}`,
         `model: ${modelLabel(runtime)}`,
       ]),
     );
