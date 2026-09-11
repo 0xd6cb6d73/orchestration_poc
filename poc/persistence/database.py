@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -324,7 +324,7 @@ class Database:
         self.conn.close()
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self) -> Generator[sqlite3.Connection, None, None]:
         with self._lock:
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
@@ -583,7 +583,7 @@ class Database:
             )
 
     def list_workflows(self, run_id: str) -> list[dict[str, Any]]:
-        workflows = []
+        workflows: list[dict[str, Any]] = []
         for row in self.conn.execute(
             "SELECT * FROM workflows WHERE run_id=? ORDER BY rowid", (run_id,)
         ):
@@ -697,6 +697,10 @@ class Database:
     def record_event(self, event: EventRecord) -> None:
         with self.transaction() as tx:
             self._append_event(tx, event)
+
+    def append_event(self, tx: sqlite3.Connection, event: EventRecord) -> None:
+        """Append an event inside a caller-owned transaction."""
+        self._append_event(tx, event)
 
     def _append_event(self, tx: sqlite3.Connection, event: EventRecord) -> None:
         inserted = tx.execute(

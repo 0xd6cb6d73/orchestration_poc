@@ -61,4 +61,4 @@ exclude = ["dist", "var"]
 pythonVersion = "3.11"
 venvPath = "."
 venv = ".venv"
-typeCheckingMode = "basic"
+typeCheckingMode = "strict"

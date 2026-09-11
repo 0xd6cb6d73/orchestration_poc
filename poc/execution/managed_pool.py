@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -70,7 +71,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                     now,
                 ),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=handle.run_id,
@@ -135,7 +136,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                 (slot_id, pool_id, worker_id, worker.role_id, generation, now),
             )
             self._register_worker(execution_id, worker_id, worker.role_id)
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -184,7 +185,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                     now,
                 ),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -245,7 +246,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                 )
             except Exception as exc:
                 raise StrategyError("the slot already bid on this offer") from exc
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -281,7 +282,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
             if not rows:
                 raise StrategyError("offer has no eligible available bids")
 
-            def rank(row) -> tuple[float, str, str]:
+            def rank(row: sqlite3.Row) -> tuple[float, str, str]:
                 features = json.loads(row["fit_features"])
                 score = float(features.get("score", 0))
                 return (-score, row["last_assigned_at"] or "", row["slot_id"])
@@ -315,7 +316,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                 "UPDATE swarm_pool_slots SET status='assigned',last_assigned_at=?,last_seen_at=? WHERE slot_id=?",
                 (now, now, winner["slot_id"]),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -399,7 +400,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                     "UPDATE swarm_pool_slots SET status='idle',last_seen_at=? WHERE slot_id=?",
                     (now, row["slot_id"]),
                 )
-                self.db._append_event(
+                self.db.append_event(
                     tx,
                     EventRecord(
                         run_id=execution["run_id"],
@@ -441,7 +442,7 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
                 "UPDATE swarm_pool_slots SET status='idle',last_seen_at=? WHERE slot_id=?",
                 (now, assignment.slot_id),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],

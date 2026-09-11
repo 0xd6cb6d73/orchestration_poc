@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Protocol, TypedDict, cast
 
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 
 from poc.models import Tier
 
@@ -19,7 +19,17 @@ class DecisionState(TypedDict, total=False):
     rejected_commands: list[dict[str, Any]]
 
 
-def build_decision_graph():
+class DecisionGraph(Protocol):
+    def invoke(self, input: DecisionState) -> DecisionResult: ...
+
+
+class DecisionResult(TypedDict):
+    interpretation: str
+    accepted_commands: list[dict[str, Any]]
+    rejected_commands: list[dict[str, Any]]
+
+
+def build_decision_graph() -> DecisionGraph:
     """One bounded supervisor decision turn; it never waits for child work."""
 
     def interpret(state: DecisionState) -> dict[str, Any]:
@@ -29,7 +39,8 @@ def build_decision_graph():
 
     def validate(state: DecisionState) -> dict[str, Any]:
         tier = state["supervisor"]["tier"]
-        accepted, rejected = [], []
+        accepted: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
         for command in state.get("proposed_commands", []):
             kind = command.get("kind")
             valid = (tier == Tier.MAIN and kind in {"assign_goal", "deliver_artifact"}) or (
@@ -39,10 +50,11 @@ def build_decision_graph():
             (accepted if valid else rejected).append(command)
         return {"accepted_commands": accepted, "rejected_commands": rejected}
 
-    graph = StateGraph(DecisionState)
+    # LangGraph exposes partially unknown internal generic parameters to Pyright.
+    graph = cast(Any, StateGraph(DecisionState))
     graph.add_node("interpret_event", interpret)
     graph.add_node("validate_authority", validate)
     graph.add_edge(START, "interpret_event")
     graph.add_edge("interpret_event", "validate_authority")
     graph.add_edge("validate_authority", END)
-    return graph.compile()
+    return cast(DecisionGraph, graph.compile())

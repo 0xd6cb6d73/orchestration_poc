@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Annotated, Any, TypedDict
+from collections.abc import Callable, Sequence
+from typing import Annotated, Any, Protocol, TypedDict, cast
 
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.types import Command
 
 from poc.execution.worker_adapter import WorkerAdapter
 from poc.models import AgentInstance, TaskSpec, WorkflowSpec
@@ -21,13 +22,34 @@ class WorkflowState(TypedDict, total=False):
     results: Annotated[dict[str, Any], merge_task_results]
 
 
+class TaskSnapshot(Protocol):
+    interrupts: Sequence[Any]
+
+
+class WorkflowSnapshot(Protocol):
+    values: dict[str, Any]
+    tasks: Sequence[TaskSnapshot]
+    next: Sequence[str]
+
+
+class WorkflowGraph(Protocol):
+    def invoke(
+        self,
+        input: WorkflowState | Command[Any] | None,
+        config: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def get_state(self, config: dict[str, Any]) -> WorkflowSnapshot: ...
+
+
 class WorkflowCompiler:
     def __init__(self, adapter: WorkerAdapter, role_lookup: Callable[[str], AgentInstance]):
         self.adapter = adapter
         self.role_lookup = role_lookup
 
-    def compile(self, spec: WorkflowSpec, checkpointer: Any):
-        graph = StateGraph(WorkflowState)
+    def compile(self, spec: WorkflowSpec, checkpointer: Any) -> WorkflowGraph:
+        # LangGraph exposes partially unknown internal generic parameters to Pyright.
+        graph = cast(Any, StateGraph(WorkflowState))
         task_ids = {task.id for task in spec.tasks}
         depended_on = {dependency for task in spec.tasks for dependency in task.depends_on}
         for task in spec.tasks:
@@ -40,15 +62,17 @@ class WorkflowCompiler:
                 graph.add_edge(task.depends_on, task.id)
         for leaf in task_ids - depended_on:
             graph.add_edge(leaf, END)
-        return graph.compile(checkpointer=checkpointer)
+        return cast(WorkflowGraph, graph.compile(checkpointer=checkpointer))
 
-    def _node(self, spec: WorkflowSpec, task: TaskSpec):
+    def _node(
+        self, spec: WorkflowSpec, task: TaskSpec
+    ) -> Callable[[WorkflowState], dict[str, Any]]:
         def run_task(state: WorkflowState) -> dict[str, Any]:
             results = state.get("results", {})
             predecessor_results = {dep: results[dep] for dep in task.depends_on}
             for dep, result in predecessor_results.items():
                 if result["outcome"] != "succeeded":
-                    blocked = {
+                    blocked: dict[str, Any] = {
                         "task_id": task.id,
                         "agent_instance_id": "not-started",
                         "attempt_id": "not-started",

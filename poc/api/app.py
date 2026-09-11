@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
@@ -19,7 +20,7 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     telemetry_provider = None
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         nonlocal telemetry_provider
         telemetry_provider = configure_telemetry()
         app.state.runtime = Runtime(data_path)
@@ -36,8 +37,9 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/runs", status_code=201)
-    async def create_run(request: RunCreate, http_request: Request) -> dict:
-        run, plan = http_request.app.state.runtime.create_run(request)
+    async def create_run(request: RunCreate, http_request: Request) -> dict[str, Any]:
+        runtime = cast(Runtime, http_request.app.state.runtime)
+        run, plan = runtime.create_run(request)
         return {
             "run": run,
             "proposed_plan": plan.model_dump(mode="json"),
@@ -46,9 +48,12 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         }
 
     @app.post("/runs/{run_id}/approval")
-    async def approve(run_id: str, request: ApprovalRequest, http_request: Request) -> dict:
+    async def approve(
+        run_id: str, request: ApprovalRequest, http_request: Request
+    ) -> dict[str, Any]:
+        runtime = cast(Runtime, http_request.app.state.runtime)
         try:
-            plan = await http_request.app.state.runtime.approve(run_id, request)
+            plan = await runtime.approve(run_id, request)
         except KeyError:
             raise HTTPException(404, "run not found") from None
         except ValueError as exc:
@@ -60,15 +65,16 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         }
 
     @app.get("/runs/{run_id}")
-    async def get_run(run_id: str, http_request: Request) -> dict:
+    async def get_run(run_id: str, http_request: Request) -> dict[str, Any]:
+        runtime = cast(Runtime, http_request.app.state.runtime)
         try:
-            return http_request.app.state.runtime.status(run_id)
+            return runtime.status(run_id)
         except KeyError:
             raise HTTPException(404, "run not found") from None
 
     @app.delete("/runs/{run_id}", status_code=202)
-    async def cancel(run_id: str, http_request: Request) -> dict:
-        runtime: Runtime = http_request.app.state.runtime
+    async def cancel(run_id: str, http_request: Request) -> dict[str, Any]:
+        runtime = cast(Runtime, http_request.app.state.runtime)
         if not runtime.db.request_cancellation(run_id):
             raise HTTPException(404, "run not found")
         task = runtime.run_tasks.get(run_id)
@@ -79,7 +85,8 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
     @app.get("/artifacts/{artifact_id}")
     async def artifact(artifact_id: str, http_request: Request) -> Response:
         try:
-            record, content = http_request.app.state.runtime.artifacts.read(artifact_id)
+            runtime = cast(Runtime, http_request.app.state.runtime)
+            record, content = runtime.artifacts.read(artifact_id)
         except KeyError:
             raise HTTPException(404, "artifact not found") from None
         return Response(
@@ -89,9 +96,10 @@ def create_app(data_dir: str | Path | None = None) -> FastAPI:
         )
 
     @app.get("/ui/runs/{run_id}", response_class=HTMLResponse)
-    async def run_page(run_id: str, request: Request):
+    async def run_page(run_id: str, request: Request) -> Response:
+        runtime = cast(Runtime, request.app.state.runtime)
         try:
-            status = request.app.state.runtime.status(run_id)
+            status = runtime.status(run_id)
         except KeyError:
             raise HTTPException(404, "run not found") from None
         return templates.TemplateResponse(request, "run.html", {"status": status, "run_id": run_id})

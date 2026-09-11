@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Protocol, TypedDict, cast
 
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.types import interrupt
 
 from poc.models import AgentInstance, EventRecord, Outcome, ValidationRequest, WorkerResult
@@ -42,6 +42,10 @@ class WorkerState(TypedDict, total=False):
     error: str
 
 
+class WorkerGraph(Protocol):
+    def invoke(self, input: WorkerState) -> dict[str, Any]: ...
+
+
 class OODAHarness:
     def __init__(
         self,
@@ -58,8 +62,15 @@ class OODAHarness:
         self.artifacts = artifacts
         self.graph = self._build()
 
-    def _build(self):
-        graph = StateGraph(WorkerState)
+    def _build(self) -> WorkerGraph:
+        def route_decision(state: WorkerState) -> str:
+            return str(state["decision"]["kind"])
+
+        def route_action(state: WorkerState) -> str:
+            return "done" if state.get("result") else "continue"
+
+        # LangGraph exposes partially unknown internal generic parameters to Pyright.
+        graph = cast(Any, StateGraph(WorkerState))
         graph.add_node("observe", self.observe)
         graph.add_node("orient", self.orient)
         graph.add_node("decide", self.decide)
@@ -72,7 +83,7 @@ class OODAHarness:
         graph.add_edge("orient", "decide")
         graph.add_conditional_edges(
             "decide",
-            lambda state: state["decision"]["kind"],
+            route_decision,
             {
                 "act": "authorize_act",
                 "request_validation": "request_validation",
@@ -82,7 +93,7 @@ class OODAHarness:
         )
         graph.add_conditional_edges(
             "authorize_act",
-            lambda state: "done" if state.get("result") else "continue",
+            route_action,
             {
                 "done": "check_output",
                 "continue": "observe",
@@ -91,7 +102,7 @@ class OODAHarness:
         graph.add_edge("request_validation", "observe")
         graph.add_edge("check_output", END)
         graph.add_edge("failed_result", END)
-        return graph.compile()
+        return cast(WorkerGraph, graph.compile())
 
     def _event(self, state: WorkerState, event_type: str, data: dict[str, Any]) -> None:
         self.db.record_event(
@@ -247,9 +258,7 @@ class OODAHarness:
     def check_output(self, state: WorkerState) -> dict[str, Any]:
         result = state["result"]
         artifact = self.artifacts.write(state["run_id"], result, producer_task_id=state["task_id"])
-        published_value = (
-            result.get("published", {}).get("artifact_id") if isinstance(result, dict) else None
-        )
+        published_value = result.get("published", {}).get("artifact_id")
         published = published_value if isinstance(published_value, str) else None
         evidence: list[str] = list(dict.fromkeys(state.get("input_artifacts", [])))
         if published and published not in evidence:

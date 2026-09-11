@@ -187,7 +187,7 @@ class PersistentExecutionStrategy:
                     now,
                 ),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=run_id,
@@ -232,7 +232,7 @@ class PersistentExecutionStrategy:
                 (utc_now(), handle.execution_id),
             )
             if changed.rowcount:
-                self.db._append_event(
+                self.db.append_event(
                     tx,
                     EventRecord(
                         run_id=handle.run_id,

@@ -140,27 +140,25 @@ class ToolGateway:
             ):
                 return "assignment is stale, forged, or scoped to another task"
             return None
-        if isinstance(grant, CandidateGrant):
-            allowed_effects = {
-                "pure_only": {"pure"},
-                "read_only": {"pure", "read", "artifact"},
-                "staged_effects": {"pure", "read", "artifact", "stage"},
-            }[grant.effect_policy.value]
-            if effect_class not in allowed_effects:
-                return "speculative candidates cannot perform direct external effects"
-            if not SpeculativeStrategy(self.db).validate_candidate(
-                grant, task_id=task_id, worker_id=actor.agent_instance_id
-            ):
-                return "candidate grant is stale, forged, or scoped to another task"
-            return None
-        return "unrecognized ownership grant"
+        allowed_effects = {
+            "pure_only": {"pure"},
+            "read_only": {"pure", "read", "artifact"},
+            "staged_effects": {"pure", "read", "artifact", "stage"},
+        }[grant.effect_policy.value]
+        if effect_class not in allowed_effects:
+            return "speculative candidates cannot perform direct external effects"
+        if not SpeculativeStrategy(self.db).validate_candidate(
+            grant, task_id=task_id, worker_id=actor.agent_instance_id
+        ):
+            return "candidate grant is stale, forged, or scoped to another task"
+        return None
 
     def _tool_read_metric_slice(
         self, run_id: str, task_id: str, args: dict[str, Any]
     ) -> dict[str, Any]:
         start = _parse_ts(args["start"], args.get("assume_timezone"))
         end = _parse_ts(args["end"], args.get("assume_timezone"))
-        rows = []
+        rows: list[dict[str, Any]] = []
         with (self.fixture_root / "metrics.csv").open(newline="") as handle:
             for row in csv.DictReader(handle):
                 at = _parse_ts(row["timestamp"], None)
@@ -205,7 +203,7 @@ class ToolGateway:
         self, run_id: str, task_id: str, args: dict[str, Any]
     ) -> dict[str, Any]:
         start, end = _parse_ts(args["start"], "UTC"), _parse_ts(args["end"], "UTC")
-        rows = []
+        rows: list[dict[str, Any]] = []
         for line in (self.fixture_root / "logs.jsonl").read_text().splitlines():
             if not line.strip():
                 continue
@@ -232,7 +230,7 @@ class ToolGateway:
     ) -> dict[str, Any]:
         deployments = json.loads((self.fixture_root / "deployments.json").read_text())
         incident_start = _parse_ts(args["incident_start"], "UTC")
-        matched = []
+        matched: list[dict[str, Any]] = []
         for deployment in deployments:
             delta = (incident_start - _parse_ts(deployment["timestamp"], None)).total_seconds() / 60
             if deployment["service"] == "checkout" and 0 <= delta <= args.get(

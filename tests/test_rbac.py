@@ -1,14 +1,16 @@
 import pytest
 
+from poc.control.runtime import Runtime
 from poc.models import ApprovalRequest, RunCreate
 from poc.services.tool_gateway import ToolDenied
 
 
 @pytest.mark.asyncio
-async def test_supervisor_cannot_invoke_domain_tool(runtime):
+async def test_supervisor_cannot_invoke_domain_tool(runtime: Runtime) -> None:
     run, _ = runtime.create_run(RunCreate())
     plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     main = runtime.db.get_agent(run["main_agent_id"])
+    assert main is not None
     sub = runtime.spawns.spawn(
         run_id=run["run_id"],
         parent=main,
@@ -27,10 +29,11 @@ async def test_supervisor_cannot_invoke_domain_tool(runtime):
 
 
 @pytest.mark.asyncio
-async def test_cancel_revokes_worker_authority(runtime):
+async def test_cancel_revokes_worker_authority(runtime: Runtime) -> None:
     run, _ = runtime.create_run(RunCreate())
     plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     main = runtime.db.get_agent(run["main_agent_id"])
+    assert main is not None
     sub = runtime.spawns.spawn(
         run_id=run["run_id"],
         parent=main,

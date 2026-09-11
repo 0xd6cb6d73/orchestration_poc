@@ -50,5 +50,5 @@ class CancelWorkflow(BaseModel):
 
 class SupervisorDecision(BaseModel):
     summary: str
-    commands: list[dict[str, Any]] = Field(default_factory=list)
+    commands: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     waiting_for: list[str] = Field(default_factory=list)

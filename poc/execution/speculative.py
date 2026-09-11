@@ -82,7 +82,7 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
                     now,
                 ),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -134,7 +134,7 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
                 (candidate_id, group_id, worker_id, worker.role_id, _token_hash(token), now),
             )
             self._register_worker(execution_id, worker_id, worker.role_id)
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -191,7 +191,7 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
             )
             if changed.rowcount != 1:
                 raise StrategyError("candidate grant is stale or already completed")
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -274,7 +274,7 @@ class SpeculativeStrategy(PersistentExecutionStrategy):
                     now,
                 ),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],

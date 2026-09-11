@@ -1,10 +1,11 @@
 import pytest
 
+from poc.control.runtime import Runtime
 from poc.models import ApprovalRequest, PlanEdit, RunCreate
 
 
 @pytest.mark.asyncio
-async def test_validation_delegates_lookup_and_resumes_correct_checkpoint(runtime):
+async def test_validation_delegates_lookup_and_resumes_correct_checkpoint(runtime: Runtime) -> None:
     run, proposed = runtime.create_run(RunCreate())
     constraints = [*proposed.constraints, "Never emit customer identifiers"]
     approved = await runtime.approve(
@@ -31,7 +32,7 @@ async def test_validation_delegates_lookup_and_resumes_correct_checkpoint(runtim
 
 
 @pytest.mark.asyncio
-async def test_stale_plan_approval_is_rejected(runtime):
+async def test_stale_plan_approval_is_rejected(runtime: Runtime) -> None:
     run, _ = runtime.create_run(RunCreate())
     await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     with pytest.raises(ValueError):

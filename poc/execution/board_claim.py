@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -101,7 +102,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                 )
             except Exception as exc:
                 raise StrategyError(f"task {task_id!r} already exists") from exc
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -175,7 +176,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                 "INSERT INTO swarm_task_attempts VALUES (?,?,?,?,?,?,?,NULL,'running',NULL,NULL)",
                 (attempt_id, execution_id, row["task_id"], generation, worker_id, now, now),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -223,7 +224,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                 "UPDATE swarm_task_attempts SET last_heartbeat_at=? WHERE attempt_id=? AND status='running'",
                 (now, claim.attempt_id),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -258,7 +259,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                 "WHERE attempt_id=? AND status='running'",
                 (reason, now, claim.attempt_id),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -290,7 +291,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                 "WHERE attempt_id=? AND status='running'",
                 (result_ref, now, claim.attempt_id),
             )
-            self.db._append_event(
+            self.db.append_event(
                 tx,
                 EventRecord(
                     run_id=execution["run_id"],
@@ -336,7 +337,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                         "WHERE attempt_id=?",
                         (now, attempt["attempt_id"]),
                     )
-                self.db._append_event(
+                self.db.append_event(
                     tx,
                     EventRecord(
                         run_id=execution["run_id"],
@@ -371,7 +372,9 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
         ).fetchone()
         return row is not None
 
-    def _owned_row(self, tx, claim: Claim, *, require_unexpired: bool):
+    def _owned_row(
+        self, tx: sqlite3.Connection, claim: Claim, *, require_unexpired: bool
+    ) -> sqlite3.Row:
         suffix = " AND lease_expires_at>?" if require_unexpired else ""
         params: tuple[Any, ...] = (
             claim.execution_id,
@@ -392,7 +395,12 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
         return row
 
     def _promote_dependents(
-        self, tx, run_id: str, execution_id: str, completed_task_id: str, now: str
+        self,
+        tx: sqlite3.Connection,
+        run_id: str,
+        execution_id: str,
+        completed_task_id: str,
+        now: str,
     ) -> None:
         rows = tx.execute(
             "SELECT task_id,dependency_ids FROM swarm_tasks WHERE execution_id=? AND state='blocked'",
@@ -411,7 +419,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                     "UPDATE swarm_tasks SET state='ready',updated_at=? WHERE execution_id=? AND task_id=?",
                     (now, execution_id, row["task_id"]),
                 )
-                self.db._append_event(
+                self.db.append_event(
                     tx,
                     EventRecord(
                         run_id=run_id,

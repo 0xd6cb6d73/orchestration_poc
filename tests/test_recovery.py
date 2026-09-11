@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from poc.control.runtime import Runtime
@@ -5,10 +7,11 @@ from poc.models import ApprovalRequest, RunCreate
 
 
 @pytest.mark.asyncio
-async def test_tool_and_artifact_publication_are_idempotent(runtime):
+async def test_tool_and_artifact_publication_are_idempotent(runtime: Runtime) -> None:
     run, _ = runtime.create_run(RunCreate())
     plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     main = runtime.db.get_agent(run["main_agent_id"])
+    assert main is not None
     sub = runtime.spawns.spawn(
         run_id=run["run_id"],
         parent=main,
@@ -56,7 +59,7 @@ async def test_tool_and_artifact_publication_are_idempotent(runtime):
 
 
 @pytest.mark.asyncio
-async def test_restart_reuses_completed_workflows_without_republication(tmp_path):
+async def test_restart_reuses_completed_workflows_without_republication(tmp_path: Path) -> None:
     data = tmp_path / "restart-data"
     first = Runtime(data)
     run, _ = first.create_run(RunCreate())

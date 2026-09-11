@@ -29,6 +29,10 @@ class WorkerMaterializer(Protocol):
     ) -> AgentInstance: ...
 
 
+def _invalid_capacity_count(count: object) -> bool:
+    return not isinstance(count, int) or isinstance(count, bool) or count < 0
+
+
 class InProcessWorkerMaterializer:
     def __init__(self, spawns: SpawnPolicy):
         self.spawns = spawns
@@ -68,10 +72,7 @@ class CapacityScheduler:
         policy = ExecutionPolicy.model_validate_json(row["policy"])
         if (
             set(desired) - policy.allowed_roles
-            or any(
-                not isinstance(count, int) or isinstance(count, bool) or count < 0
-                for count in desired.values()
-            )
+            or any(_invalid_capacity_count(count) for count in desired.values())
             or sum(desired.values()) > policy.max_workers
         ):
             raise StrategyError("desired capacity exceeds the authorized role/population envelope")
@@ -109,7 +110,7 @@ class CapacityScheduler:
                             "INSERT INTO swarm_execution_workers VALUES (?,?,?,'active',?,?)",
                             (handle.execution_id, worker.agent_instance_id, role_id, now, now),
                         )
-                        self.db._append_event(
+                        self.db.append_event(
                             tx,
                             EventRecord(
                                 run_id=handle.run_id,
@@ -131,7 +132,7 @@ class CapacityScheduler:
                         "WHERE execution_id=? AND worker_instance_id=?",
                         (now, handle.execution_id, record["worker_instance_id"]),
                     )
-                    self.db._append_event(
+                    self.db.append_event(
                         tx,
                         EventRecord(
                             run_id=handle.run_id,

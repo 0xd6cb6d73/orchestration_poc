@@ -9,7 +9,7 @@ from typing import Any
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
-from poc.execution.workflow_compiler import WorkflowCompiler
+from poc.execution.workflow_compiler import WorkflowCompiler, WorkflowGraph
 from poc.models import WorkflowSpec
 from poc.persistence.database import Database
 
@@ -24,7 +24,7 @@ class WorkflowRunner:
         self.checkpointer = SqliteSaver(self.checkpoint_connection)
         self.checkpointer.setup()
         self._locks: dict[str, asyncio.Lock] = {}
-        self._graphs: dict[tuple[str, int], Any] = {}
+        self._graphs: dict[tuple[str, int], WorkflowGraph] = {}
 
     def close(self) -> None:
         self.checkpoint_connection.close()
@@ -35,7 +35,7 @@ class WorkflowRunner:
         self.db.put_workflow(spec, thread_id)
         graph = self.compiler.compile(spec, self.checkpointer)
         self._graphs[(spec.workflow_id, spec.revision)] = graph
-        config: Any = {
+        config: dict[str, Any] = {
             "configurable": {"thread_id": thread_id},
             "recursion_limit": 100,
             "max_concurrency": spec.max_workers,
@@ -77,7 +77,7 @@ class WorkflowRunner:
         if graph is None:
             graph = self.compiler.compile(spec, self.checkpointer)
             self._graphs[(spec.workflow_id, spec.revision)] = graph
-        config: Any = {
+        config: dict[str, Any] = {
             "configurable": {"thread_id": thread_id},
             "recursion_limit": 100,
             "max_concurrency": spec.max_workers,

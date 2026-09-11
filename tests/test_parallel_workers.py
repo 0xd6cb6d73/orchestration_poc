@@ -1,10 +1,11 @@
 import pytest
 
+from poc.control.runtime import Runtime
 from poc.models import ApprovalRequest, RunCreate
 
 
 @pytest.mark.asyncio
-async def test_same_role_workers_are_isolated(runtime):
+async def test_same_role_workers_are_isolated(runtime: Runtime) -> None:
     run, _ = runtime.create_run(RunCreate())
     await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1))
     await runtime.wait(run["run_id"])

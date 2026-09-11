@@ -264,7 +264,7 @@ class TaskSpec(BaseModel):
     role: str
     goal: str
     depends_on: list[str] = Field(default_factory=list)
-    input_bindings: list[InputBinding] = Field(default_factory=list)
+    input_bindings: list[InputBinding] = Field(default_factory=list[InputBinding])
     output_schema: str
     acceptance_criteria: list[str] = Field(default_factory=list)
     static_inputs: dict[str, Any] = Field(default_factory=dict)
@@ -341,7 +341,7 @@ class WorkerResult(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
     output_artifact: str | None = None
     evidence_artifacts: list[str] = Field(default_factory=list)
-    acceptance_checks: list[dict[str, Any]] = Field(default_factory=list)
+    acceptance_checks: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     completion_summary: str
 
 

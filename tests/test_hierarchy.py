@@ -1,11 +1,12 @@
 import pytest
 
+from poc.control.runtime import Runtime
 from poc.control.spawn_policy import SpawnDenied
 from poc.models import ApprovalRequest, RunCreate
 
 
 @pytest.mark.asyncio
-async def test_three_tier_spawn_authority(runtime):
+async def test_three_tier_spawn_authority(runtime: Runtime) -> None:
     run, _ = runtime.create_run(RunCreate())
     plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     main = runtime.db.get_agent(run["main_agent_id"])

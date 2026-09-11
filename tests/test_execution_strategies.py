@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
+from poc.control.runtime import Runtime
 from poc.execution import (
     BoardClaimStrategy,
     ManagedPoolStrategy,
@@ -9,14 +11,24 @@ from poc.execution import (
     StaleClaim,
     StrategyError,
 )
-from poc.models import ApprovalRequest, EffectPolicy, ExecutionMode, ExecutionPolicy, RunCreate
+from poc.models import (
+    AgentInstance,
+    ApprovalRequest,
+    EffectPolicy,
+    ExecutionMode,
+    ExecutionPolicy,
+    RunCreate,
+)
 from poc.services.tool_gateway import ToolDenied
 
 
-async def _authorized_team(runtime, supervisor_role: str, worker_roles: list[str]):
+async def _authorized_team(
+    runtime: Runtime, supervisor_role: str, worker_roles: list[str]
+) -> tuple[dict[str, Any], AgentInstance, list[AgentInstance]]:
     run, _ = runtime.create_run(RunCreate())
     plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
     main = runtime.db.get_agent(run["main_agent_id"])
+    assert main is not None
     supervisor = runtime.spawns.spawn(
         run_id=run["run_id"],
         parent=main,
@@ -38,7 +50,7 @@ async def _authorized_team(runtime, supervisor_role: str, worker_roles: list[str
 
 
 @pytest.mark.asyncio
-async def test_board_claim_is_atomic_and_fenced_at_tool_gateway(runtime):
+async def test_board_claim_is_atomic_and_fenced_at_tool_gateway(runtime: Runtime) -> None:
     run, supervisor, workers = await _authorized_team(runtime, "metrics_supervisor", [])
     policy = ExecutionPolicy(
         mode=ExecutionMode.BOARD_CLAIM,
@@ -126,7 +138,7 @@ async def test_board_claim_is_atomic_and_fenced_at_tool_gateway(runtime):
 
 
 @pytest.mark.asyncio
-async def test_managed_pool_uses_deterministic_tie_break(runtime):
+async def test_managed_pool_uses_deterministic_tie_break(runtime: Runtime) -> None:
     run, supervisor, workers = await _authorized_team(
         runtime, "metrics_supervisor", ["manifest_reader", "manifest_reader"]
     )
@@ -179,7 +191,9 @@ async def test_managed_pool_uses_deterministic_tie_break(runtime):
 
 
 @pytest.mark.asyncio
-async def test_speculative_candidates_are_read_only_and_reconciled_explicitly(runtime):
+async def test_speculative_candidates_are_read_only_and_reconciled_explicitly(
+    runtime: Runtime,
+) -> None:
     run, supervisor, workers = await _authorized_team(
         runtime, "reporting_supervisor", ["claim_drafter", "claim_drafter"]
     )

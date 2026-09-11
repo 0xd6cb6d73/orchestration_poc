@@ -197,7 +197,7 @@ class Runtime:
         try:
             main = self._get_agent(self._require_run(run_id)["main_agent_id"])
             main_actor = self._actor(main)
-            assignments = []
+            assignments: list[dict[str, Any]] = []
             supervisors: dict[str, AgentInstance] = {}
             for area in plan.areas:
                 child = self.spawns.spawn(
