@@ -134,6 +134,49 @@ claim = board.claim_next(execution_id=handle.execution_id, worker_id=worker_id)
 SQLite keeps the PoC self-contained. The transaction-bounded coordination layer can
 be backed by PostgreSQL in a distributed runtime without changing the strategy API.
 
+## Interchangeable agent backends
+
+Worker execution is selected above the LangGraph and telemetry layers through
+`AgentExecutorRegistry`. The built-in `custom_python` executor preserves the existing
+LangGraph OODA worker unchanged. The `pydantic_ai` executor builds a Pydantic AI
+`Agent`, exposes the same RBAC-protected tool gateway, and converts its validated
+structured output into the same `WorkerResult` contract.
+
+An orchestrator can select a backend per workflow task, so both implementations can
+run in the same DAG:
+
+```python
+TaskSpec(
+    id="draft",
+    role="claim_drafter",
+    agent_backend=AgentBackend.PYDANTIC_AI,
+    goal="Draft one evidence-backed claim.",
+    output_schema="DraftClaim",
+)
+```
+
+A swarm scheduler selects the backend for the workers it materializes through the
+execution policy:
+
+```python
+ExecutionPolicy(
+    mode=ExecutionMode.BOARD_CLAIM,
+    agent_backend=AgentBackend.PYDANTIC_AI,
+    max_workers=2,
+    allowed_roles={"manifest_reader"},
+)
+```
+
+If a task does not select a backend, the role's `RoleSpec.agent_backend` is used.
+Every `AgentInstance` persists the resolved backend, and a stable agent identity
+cannot silently switch implementations during recovery. Additional implementations
+can be registered without changing `WorkerAdapter` or any scheduler.
+
+`pydantic-ai-slim` provides the framework-neutral Pydantic AI core. Configure real
+providers on each role (`provider` and `model`) and install the corresponding
+Pydantic AI provider extra, or inject a `PydanticModelFactory` into `Runtime`. Tests
+inject Pydantic AI's `FunctionModel`, so they remain offline and deterministic.
+
 The PoC intentionally excludes live infrastructure access, arbitrary code execution,
 distributed queues, and hot graph mutation. Swarm coordination is implemented and
 tested in-process; worker process materialization remains a trusted runtime concern.

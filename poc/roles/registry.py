@@ -96,6 +96,11 @@ class RoleRegistry:
     def all(self) -> list[RoleSpec]:
         return list(self._roles.values())
 
+    def register(self, role: RoleSpec, *, replace: bool = False) -> None:
+        if role.role_id in self._roles and not replace:
+            raise ValueError(f"role already registered: {role.role_id}")
+        self._roles[role.role_id] = role
+
 
 def _worker(role_id: str, tools: list[str], schema: str, limits: dict[str, int]) -> RoleSpec:
     return RoleSpec(

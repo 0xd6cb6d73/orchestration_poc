@@ -56,6 +56,13 @@ class ExecutionMode(StrEnum):
     SPECULATIVE = "speculative"
 
 
+class AgentBackend(StrEnum):
+    """Built-in worker runtime identifiers; registries also accept extension IDs."""
+
+    CUSTOM_PYTHON = "custom_python"
+    PYDANTIC_AI = "pydantic_ai"
+
+
 class OwnershipType(StrEnum):
     DAG = "dag"
     CLAIM = "claim"
@@ -80,6 +87,7 @@ class ExecutionPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    agent_backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
     max_workers: int = Field(default=4, ge=1)
     allowed_roles: frozenset[str] = Field(default_factory=frozenset)
     max_task_attempts: int = Field(default=3, ge=1)
@@ -231,6 +239,7 @@ class RoleSpec(BaseModel):
     version: int = 1
     tier: Tier
     system_prompt: str
+    agent_backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
     provider: str = "deterministic"
     api_type: str = "local"
     model: str = "fixture-reasoner-v1"
@@ -249,6 +258,7 @@ class AgentInstance(BaseModel):
     role_id: str
     role_version: int
     plan_version: int
+    agent_backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
     status: str = "active"
     created_at: str = Field(default_factory=utc_now)
 
@@ -262,6 +272,7 @@ class InputBinding(BaseModel):
 class TaskSpec(BaseModel):
     id: str
     role: str
+    agent_backend: str | None = Field(default=None, min_length=1)
     goal: str
     depends_on: list[str] = Field(default_factory=list)
     input_bindings: list[InputBinding] = Field(default_factory=list[InputBinding])

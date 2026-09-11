@@ -198,6 +198,7 @@ class PersistentExecutionStrategy:
                         "plan_id": plan.plan_id,
                         "plan_version": owner.plan_version,
                         "mode": self.mode,
+                        "agent_backend": policy.agent_backend,
                         "policy_hash": policy_hash,
                         "tool_policy_id": policy.tool_policy_id,
                         "budget_id": policy.budget_id,

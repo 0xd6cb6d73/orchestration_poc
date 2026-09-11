@@ -22,6 +22,7 @@ class SpawnPolicy:
         child_role: str,
         plan_version: int,
         stable_key: str | None = None,
+        agent_backend: str | None = None,
     ) -> AgentInstance:
         parent_spec = self.roles.get(parent.role_id)
         child_spec = self.roles.get(child_role)
@@ -44,22 +45,51 @@ class SpawnPolicy:
             )
         suffix = stable_key or new_id("instance")
         agent_id = f"{child_role}-{suffix}" if stable_key else suffix
-        agent = AgentInstance(
-            agent_instance_id=agent_id,
-            run_id=run_id,
-            parent_agent_id=parent.agent_instance_id,
-            tier=child_spec.tier,
-            role_id=child_role,
-            role_version=child_spec.version,
-            plan_version=plan_version,
-        )
-        self.db.put_agent(agent)
+        selected_backend = agent_backend or child_spec.agent_backend
+        existing = self.db.get_agent(agent_id)
+        if existing is not None:
+            if (
+                existing.run_id != run_id
+                or existing.parent_agent_id != parent.agent_instance_id
+                or existing.role_id != child_role
+                or existing.plan_version != plan_version
+            ):
+                self._deny(
+                    run_id,
+                    parent.agent_instance_id,
+                    child_role,
+                    "a stable agent identity is already bound to different authority",
+                )
+            if existing.agent_backend != selected_backend:
+                self._deny(
+                    run_id,
+                    parent.agent_instance_id,
+                    child_role,
+                    "a stable worker identity cannot change agent backend",
+                )
+            agent = existing
+        else:
+            agent = AgentInstance(
+                agent_instance_id=agent_id,
+                run_id=run_id,
+                parent_agent_id=parent.agent_instance_id,
+                tier=child_spec.tier,
+                role_id=child_role,
+                role_version=child_spec.version,
+                plan_version=plan_version,
+                agent_backend=selected_backend,
+            )
+            self.db.put_agent(agent)
         self.db.record_event(
             EventRecord(
                 run_id=run_id,
                 event_type="agent.spawn_authorized",
                 actor_id=parent.agent_instance_id,
-                data={"agent_instance_id": agent_id, "child_role": child_role},
+                data={
+                    "agent_instance_id": agent_id,
+                    "child_role": child_role,
+                    "agent_backend": selected_backend,
+                },
             )
         )
         return agent

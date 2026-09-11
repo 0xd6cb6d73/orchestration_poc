@@ -7,11 +7,13 @@ from typing import Any
 
 from poc.control.spawn_policy import SpawnPolicy
 from poc.control.supervisor_actor import SupervisorActor
+from poc.execution.agent_executor import AgentExecutorRegistry, CustomPythonAgentExecutor
 from poc.execution.board_claim import BoardClaimStrategy
 from poc.execution.capacity import CapacityScheduler, InProcessWorkerMaterializer
 from poc.execution.hierarchical_strategy import HierarchicalDAGStrategy
 from poc.execution.managed_pool import ManagedPoolStrategy
 from poc.execution.ooda_graph import OODAHarness
+from poc.execution.pydantic_ai_executor import PydanticAIAgentExecutor, PydanticModelFactory
 from poc.execution.speculative import SpeculativeStrategy
 from poc.execution.strategy import ExecutionCoordinator, StrategyRegistry
 from poc.execution.worker_adapter import WorkerAdapter
@@ -43,12 +45,19 @@ from poc.services.tool_gateway import ToolGateway
 
 
 class Runtime:
-    def __init__(self, data_dir: str | Path, fixture_root: str | Path | None = None):
+    def __init__(
+        self,
+        data_dir: str | Path,
+        fixture_root: str | Path | None = None,
+        *,
+        roles: RoleRegistry | None = None,
+        pydantic_model_factory: PydanticModelFactory | None = None,
+    ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.data_dir / "application.sqlite")
         self.artifacts = ArtifactStore(self.data_dir / "artifacts", self.db)
-        self.roles = RoleRegistry()
+        self.roles = roles or RoleRegistry()
         self.spawns = SpawnPolicy(self.db, self.roles)
         self.capacity = CapacityScheduler(self.db, InProcessWorkerMaterializer(self.spawns))
         self.strategies = StrategyRegistry(self.db)
@@ -63,7 +72,18 @@ class Runtime:
         self.ooda = OODAHarness(
             self.db, self.roles, DeterministicModelAdapter(), self.tools, self.artifacts
         )
-        self.adapter = WorkerAdapter(self.db, self.spawns, self.ooda)
+        self.agent_executors = AgentExecutorRegistry()
+        self.agent_executors.register(CustomPythonAgentExecutor(self.ooda))
+        self.agent_executors.register(
+            PydanticAIAgentExecutor(
+                self.db,
+                self.roles,
+                self.tools,
+                self.artifacts,
+                pydantic_model_factory,
+            )
+        )
+        self.adapter = WorkerAdapter(self.db, self.spawns, self.agent_executors)
         self.compiler = WorkflowCompiler(self.adapter, self._get_agent)
         self.runner = WorkflowRunner(self.db, self.compiler, self.data_dir / "checkpoints.sqlite")
         self.actors: dict[str, SupervisorActor] = {}
@@ -139,6 +159,7 @@ class Runtime:
         policy: ExecutionPolicy,
     ) -> ExecutionHandle:
         """Public extension point for an approved sub-orchestrator execution."""
+        self.agent_executors.get(policy.agent_backend)
         return await self.executions.submit(
             run_id=run_id,
             owner_suborchestrator_id=owner_suborchestrator_id,

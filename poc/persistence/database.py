@@ -480,6 +480,7 @@ class Database:
                         data={
                             "tier": agent.tier,
                             "role_id": agent.role_id,
+                            "agent_backend": agent.agent_backend,
                             "parent_agent_id": agent.parent_agent_id,
                         },
                     ),
