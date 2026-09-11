@@ -12,6 +12,7 @@ from poc.models import (
     ApprovalRequest,
     ExecutionMode,
     ExecutionPolicy,
+    RoleSpec,
     RunCreate,
     TaskSpec,
     WorkflowSpec,
@@ -59,7 +60,13 @@ def test_executor_registry_accepts_extension_backend_ids() -> None:
 @pytest.mark.asyncio
 async def test_workflow_can_mix_custom_and_pydantic_ai_agents(tmp_path: Path) -> None:
     test_model = FunctionModel(_pydantic_agent_model)
-    runtime = Runtime(tmp_path / "mixed", pydantic_model_factory=lambda role: test_model)
+    configured_roles: list[RoleSpec] = []
+
+    def model_factory(role: RoleSpec) -> FunctionModel:
+        configured_roles.append(role)
+        return test_model
+
+    runtime = Runtime(tmp_path / "mixed", pydantic_model_factory=model_factory)
     try:
         run, _ = runtime.create_run(RunCreate())
         plan = await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1), start=False)
@@ -90,6 +97,8 @@ async def test_workflow_can_mix_custom_and_pydantic_ai_agents(tmp_path: Path) ->
                     id="pydantic-manifest",
                     role="manifest_reader",
                     agent_backend=AgentBackend.PYDANTIC_AI,
+                    agent_provider="test-provider",
+                    agent_model="test-model",
                     goal="Produce a manifest fact with a Pydantic AI agent.",
                     output_schema="ManifestFact",
                 ),
@@ -103,6 +112,8 @@ async def test_workflow_can_mix_custom_and_pydantic_ai_agents(tmp_path: Path) ->
         assert result["results"]["pydantic-manifest"]["result"] == {
             "fact": "produced by Pydantic AI"
         }
+        assert configured_roles[-1].provider == "test-provider"
+        assert configured_roles[-1].model == "test-model"
         worker_backends = {
             agent["agent_backend"]
             for agent in runtime.db.list_agents(run["run_id"])
@@ -112,6 +123,13 @@ async def test_workflow_can_mix_custom_and_pydantic_ai_agents(tmp_path: Path) ->
             AgentBackend.CUSTOM_PYTHON,
             AgentBackend.PYDANTIC_AI,
         }
+        pydantic_worker = next(
+            agent
+            for agent in runtime.db.list_agents(run["run_id"])
+            if agent["agent_backend"] == AgentBackend.PYDANTIC_AI
+        )
+        assert pydantic_worker["agent_provider"] == "test-provider"
+        assert pydantic_worker["agent_model"] == "test-model"
         pydantic_completion = next(
             event
             for event in runtime.db.events(run["run_id"])

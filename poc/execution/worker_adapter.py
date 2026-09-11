@@ -28,6 +28,9 @@ class WorkerAdapter:
     ) -> dict[str, Any]:
         stable_key = f"{workflow_id}-r{workflow_revision}-{task.id}"
         selected_backend = task.agent_backend or self.spawns.roles.get(task.role).agent_backend
+        role = self.spawns.roles.get(task.role)
+        selected_provider = task.agent_provider or role.provider
+        selected_model = task.agent_model or role.model
         executor = self.executors.get(selected_backend)
         agent = self.spawns.spawn(
             run_id=run_id,
@@ -36,6 +39,8 @@ class WorkerAdapter:
             plan_version=plan_version,
             stable_key=stable_key,
             agent_backend=selected_backend,
+            agent_provider=selected_provider,
+            agent_model=selected_model,
         )
         attempt_id = f"attempt-{workflow_id}-r{workflow_revision}-{task.id}-1"
         self.db.update_task(

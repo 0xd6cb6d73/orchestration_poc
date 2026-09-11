@@ -90,6 +90,8 @@ class Runtime:
         self.run_tasks: dict[str, asyncio.Task[None]] = {}
 
     def create_run(self, request: RunCreate) -> tuple[dict[str, Any], MissionPlan]:
+        self.agent_executors.get(request.agent_runtime.backend)
+        self.strategies.get(request.execution_mode)
         run_id = new_id("run")
         main = AgentInstance(
             agent_instance_id=f"main-{run_id}",
@@ -100,7 +102,7 @@ class Runtime:
             role_version=1,
             plan_version=1,
         )
-        plan = self._mission_plan(run_id, request.objective)
+        plan = self._mission_plan(run_id, request)
         self.db.create_run(run_id, request.objective, main.agent_instance_id, plan)
         self.db.put_agent(main)
         self.actors[main.agent_instance_id] = SupervisorActor(main, self.db)
@@ -230,6 +232,23 @@ class Runtime:
                 )
                 supervisors[area.id] = child
                 self.actors[child.agent_instance_id] = SupervisorActor(child, self.db)
+                await self.submit_execution(
+                    run_id=run_id,
+                    owner_suborchestrator_id=child.agent_instance_id,
+                    goal_ref=area.id,
+                    policy=ExecutionPolicy(
+                        mode=area.execution_mode,
+                        agent_backend=plan.agent_runtime.backend,
+                        agent_provider=plan.agent_runtime.provider,
+                        agent_model=plan.agent_runtime.model,
+                        agent_options=plan.agent_runtime.options,
+                        max_workers=plan.budgets["max_workers"],
+                        allowed_roles=frozenset(
+                            self.roles.get(area.owner_role).allowed_child_roles
+                        ),
+                        options=plan.execution_options,
+                    ),
+                )
                 assignments.append(
                     {
                         "command_id": f"assign:{area.id}:v{plan.version}",
@@ -245,10 +264,10 @@ class Runtime:
             )
 
             metrics_spec = self._metrics_workflow(
-                run_id, plan.version, supervisors["metrics"].agent_instance_id
+                run_id, plan, supervisors["metrics"].agent_instance_id
             )
             evidence_spec = self._evidence_workflow(
-                run_id, plan.version, supervisors["evidence"].agent_instance_id
+                run_id, plan, supervisors["evidence"].agent_instance_id
             )
             metrics_actor = self._actor(supervisors["metrics"])
             evidence_actor = self._actor(supervisors["evidence"])
@@ -259,7 +278,7 @@ class Runtime:
                 ),
             )
             metrics_result, evidence_result = await asyncio.gather(
-                self._run_metrics_with_validation(metrics_spec, supervisors["metrics"]),
+                self._run_metrics_with_validation(metrics_spec, supervisors["metrics"], plan),
                 self.runner.start(evidence_spec),
             )
             self._ensure_success(metrics_result, metrics_spec)
@@ -288,7 +307,7 @@ class Runtime:
             )
             report_spec = self._report_workflow(
                 run_id,
-                plan.version,
+                plan,
                 supervisors["reporting"].agent_instance_id,
                 metrics["result"]["content"],
                 evidence["result"],
@@ -326,7 +345,7 @@ class Runtime:
             self.db.update_run_status(run_id, RunStatus.FAILED, str(exc))
 
     async def _run_metrics_with_validation(
-        self, spec: WorkflowSpec, supervisor: AgentInstance
+        self, spec: WorkflowSpec, supervisor: AgentInstance, plan: MissionPlan
     ) -> dict[str, Any]:
         result = await self.runner.start(spec)
         interrupts = result.get("__interrupt__", ())
@@ -349,9 +368,7 @@ class Runtime:
         # Yield after dispatch: other domain workflows remain runnable while this one is paused.
         await asyncio.sleep(0)
         # The supervisor does not inspect the manifest. It dispatches a supplementary one-task workflow.
-        lookup = self._manifest_workflow(
-            spec.run_id, spec.approved_plan_version, supervisor.agent_instance_id
-        )
+        lookup = self._manifest_workflow(spec.run_id, plan, supervisor.agent_instance_id)
         await self._actor(supervisor).turn(
             {"type": "validation.requested", "request": request}, [self._submit_command(lookup)]
         )
@@ -399,11 +416,14 @@ class Runtime:
             raise KeyError(run_id)
         return run
 
-    def _mission_plan(self, run_id: str, objective: str) -> MissionPlan:
+    def _mission_plan(self, run_id: str, request: RunCreate) -> MissionPlan:
         return MissionPlan(
             plan_id=new_id("plan"),
             run_id=run_id,
-            objective=objective,
+            objective=request.objective,
+            agent_runtime=request.agent_runtime,
+            execution_mode=request.execution_mode,
+            execution_options=request.execution_options,
             constraints=[
                 "Offline fixture access only",
                 "Do not modify live systems",
@@ -424,6 +444,7 @@ class Runtime:
                     id="metrics",
                     owner_role="metrics_supervisor",
                     goal="Measure regression with comparable windows",
+                    execution_mode=request.execution_mode,
                     allowed_execution_modes=frozenset(ExecutionMode),
                     acceptance_criteria=[
                         "p95 values have units and evidence",
@@ -434,6 +455,7 @@ class Runtime:
                     id="evidence",
                     owner_role="evidence_supervisor",
                     goal="Correlate logs and deployment changes",
+                    execution_mode=request.execution_mode,
                     allowed_execution_modes=frozenset(ExecutionMode),
                     acceptance_criteria=[
                         "misleading patterns are qualified",
@@ -444,6 +466,7 @@ class Runtime:
                     id="reporting",
                     owner_role="reporting_supervisor",
                     goal="Produce an evidence-backed report",
+                    execution_mode=request.execution_mode,
                     allowed_execution_modes=frozenset(ExecutionMode),
                     depends_on=["metrics", "evidence"],
                     acceptance_criteria=[
@@ -481,199 +504,241 @@ class Runtime:
         if failed:
             raise RuntimeError(f"workflow {spec.workflow_id} failed tasks: {failed}")
 
-    def _metrics_workflow(self, run_id: str, version: int, owner: str) -> WorkflowSpec:
-        return WorkflowSpec(
-            workflow_id=f"{run_id}-metrics",
-            run_id=run_id,
-            owner=owner,
-            approved_plan_version=version,
-            authorized_worker_roles=[
-                "window_selector",
-                "percentile_calculator",
-                "metric_comparator",
-            ],
-            tasks=[
-                TaskSpec(
-                    id="select_windows",
-                    role="window_selector",
-                    goal="Select comparable baseline and incident windows.",
-                    output_schema="WindowSelection",
-                    acceptance_criteria=["two non-overlapping windows selected"],
-                ),
-                TaskSpec(
-                    id="baseline_p95",
-                    role="percentile_calculator",
-                    goal="Compute baseline checkout p95.",
-                    depends_on=["select_windows"],
-                    input_bindings=[
-                        InputBinding(
-                            source_task="select_windows", field="baseline", target="window"
-                        )
-                    ],
-                    output_schema="PercentileResult",
-                    acceptance_criteria=["p95 has milliseconds and sample count"],
-                ),
-                TaskSpec(
-                    id="incident_p95",
-                    role="percentile_calculator",
-                    goal="Compute incident checkout p95.",
-                    depends_on=["select_windows"],
-                    input_bindings=[
-                        InputBinding(
-                            source_task="select_windows", field="incident", target="window"
-                        )
-                    ],
-                    output_schema="PercentileResult",
-                    acceptance_criteria=["timezone assumption is validated"],
-                ),
-                TaskSpec(
-                    id="compare",
-                    role="metric_comparator",
-                    goal="Compare baseline and incident p95 with units.",
-                    depends_on=["baseline_p95", "incident_p95"],
-                    input_bindings=[
-                        InputBinding(source_task="baseline_p95", field="result", target="baseline"),
-                        InputBinding(source_task="incident_p95", field="result", target="incident"),
-                    ],
-                    output_schema="MetricComparison",
-                    acceptance_criteria=["absolute and relative change present"],
-                ),
-            ],
+    def _metrics_workflow(self, run_id: str, plan: MissionPlan, owner: str) -> WorkflowSpec:
+        return self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=f"{run_id}-metrics",
+                run_id=run_id,
+                owner=owner,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=[
+                    "window_selector",
+                    "percentile_calculator",
+                    "metric_comparator",
+                ],
+                tasks=[
+                    TaskSpec(
+                        id="select_windows",
+                        role="window_selector",
+                        goal="Select comparable baseline and incident windows.",
+                        output_schema="WindowSelection",
+                        acceptance_criteria=["two non-overlapping windows selected"],
+                    ),
+                    TaskSpec(
+                        id="baseline_p95",
+                        role="percentile_calculator",
+                        goal="Compute baseline checkout p95.",
+                        depends_on=["select_windows"],
+                        input_bindings=[
+                            InputBinding(
+                                source_task="select_windows", field="baseline", target="window"
+                            )
+                        ],
+                        output_schema="PercentileResult",
+                        acceptance_criteria=["p95 has milliseconds and sample count"],
+                    ),
+                    TaskSpec(
+                        id="incident_p95",
+                        role="percentile_calculator",
+                        goal="Compute incident checkout p95.",
+                        depends_on=["select_windows"],
+                        input_bindings=[
+                            InputBinding(
+                                source_task="select_windows", field="incident", target="window"
+                            )
+                        ],
+                        output_schema="PercentileResult",
+                        acceptance_criteria=["timezone assumption is validated"],
+                    ),
+                    TaskSpec(
+                        id="compare",
+                        role="metric_comparator",
+                        goal="Compare baseline and incident p95 with units.",
+                        depends_on=["baseline_p95", "incident_p95"],
+                        input_bindings=[
+                            InputBinding(
+                                source_task="baseline_p95", field="result", target="baseline"
+                            ),
+                            InputBinding(
+                                source_task="incident_p95", field="result", target="incident"
+                            ),
+                        ],
+                        output_schema="MetricComparison",
+                        acceptance_criteria=["absolute and relative change present"],
+                    ),
+                ],
+            ),
+            plan,
         )
 
-    def _evidence_workflow(self, run_id: str, version: int, owner: str) -> WorkflowSpec:
-        return WorkflowSpec(
-            workflow_id=f"{run_id}-evidence",
-            run_id=run_id,
-            owner=owner,
-            approved_plan_version=version,
-            authorized_worker_roles=[
-                "log_slice_selector",
-                "log_pattern_counter",
-                "deployment_matcher",
-            ],
-            tasks=[
-                TaskSpec(
-                    id="select_log_slice",
-                    role="log_slice_selector",
-                    goal="Select baseline and incident log evidence.",
-                    output_schema="LogSlice",
-                    acceptance_criteria=["bounded slice returned"],
-                ),
-                TaskSpec(
-                    id="count_error_pattern",
-                    role="log_pattern_counter",
-                    goal="Count patterns and flag misleading correlation.",
-                    depends_on=["select_log_slice"],
-                    input_bindings=[
-                        InputBinding(
-                            source_task="select_log_slice", field="log_slice", target="log_slice"
-                        )
-                    ],
-                    output_schema="PatternCount",
-                    acceptance_criteria=["all patterns counted"],
-                ),
-                TaskSpec(
-                    id="match_deployment",
-                    role="deployment_matcher",
-                    goal="Match checkout deployment to incident window.",
-                    depends_on=["count_error_pattern"],
-                    input_bindings=[
-                        InputBinding(
-                            source_task="count_error_pattern",
-                            field="pattern_counts",
-                            target="pattern_counts",
-                        )
-                    ],
-                    output_schema="DeploymentMatch",
-                    acceptance_criteria=["proximity in minutes present"],
-                ),
-            ],
+    def _evidence_workflow(self, run_id: str, plan: MissionPlan, owner: str) -> WorkflowSpec:
+        return self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=f"{run_id}-evidence",
+                run_id=run_id,
+                owner=owner,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=[
+                    "log_slice_selector",
+                    "log_pattern_counter",
+                    "deployment_matcher",
+                ],
+                tasks=[
+                    TaskSpec(
+                        id="select_log_slice",
+                        role="log_slice_selector",
+                        goal="Select baseline and incident log evidence.",
+                        output_schema="LogSlice",
+                        acceptance_criteria=["bounded slice returned"],
+                    ),
+                    TaskSpec(
+                        id="count_error_pattern",
+                        role="log_pattern_counter",
+                        goal="Count patterns and flag misleading correlation.",
+                        depends_on=["select_log_slice"],
+                        input_bindings=[
+                            InputBinding(
+                                source_task="select_log_slice",
+                                field="log_slice",
+                                target="log_slice",
+                            )
+                        ],
+                        output_schema="PatternCount",
+                        acceptance_criteria=["all patterns counted"],
+                    ),
+                    TaskSpec(
+                        id="match_deployment",
+                        role="deployment_matcher",
+                        goal="Match checkout deployment to incident window.",
+                        depends_on=["count_error_pattern"],
+                        input_bindings=[
+                            InputBinding(
+                                source_task="count_error_pattern",
+                                field="pattern_counts",
+                                target="pattern_counts",
+                            )
+                        ],
+                        output_schema="DeploymentMatch",
+                        acceptance_criteria=["proximity in minutes present"],
+                    ),
+                ],
+            ),
+            plan,
         )
 
-    def _manifest_workflow(self, run_id: str, version: int, owner: str) -> WorkflowSpec:
-        return WorkflowSpec(
-            workflow_id=f"{run_id}-manifest-lookup",
-            run_id=run_id,
-            owner=owner,
-            approved_plan_version=version,
-            authorized_worker_roles=["manifest_reader"],
-            max_workers=1,
-            tasks=[
-                TaskSpec(
-                    id="read_manifest",
-                    role="manifest_reader",
-                    goal="Read only the fixture timezone declaration.",
-                    output_schema="ManifestFact",
-                    acceptance_criteria=["timezone statement is explicit"],
-                ),
-            ],
+    def _manifest_workflow(self, run_id: str, plan: MissionPlan, owner: str) -> WorkflowSpec:
+        return self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=f"{run_id}-manifest-lookup",
+                run_id=run_id,
+                owner=owner,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["manifest_reader"],
+                max_workers=1,
+                tasks=[
+                    TaskSpec(
+                        id="read_manifest",
+                        role="manifest_reader",
+                        goal="Read only the fixture timezone declaration.",
+                        output_schema="ManifestFact",
+                        acceptance_criteria=["timezone statement is explicit"],
+                    ),
+                ],
+            ),
+            plan,
         )
 
     def _report_workflow(
         self,
         run_id: str,
-        version: int,
+        plan: MissionPlan,
         owner: str,
         metrics: dict[str, Any],
         evidence: dict[str, Any],
         evidence_artifacts: list[str],
     ) -> WorkflowSpec:
-        return WorkflowSpec(
-            workflow_id=f"{run_id}-report",
-            run_id=run_id,
-            owner=owner,
-            approved_plan_version=version,
-            authorized_worker_roles=[
-                "claim_drafter",
-                "claim_checker",
-                "section_renderer",
-                "report_assembler",
-            ],
-            tasks=[
-                TaskSpec(
-                    id="draft_claim",
-                    role="claim_drafter",
-                    goal="Draft one causal claim with alternatives.",
-                    static_inputs={"metrics": metrics, "evidence": evidence},
-                    output_schema="DraftClaim",
-                    acceptance_criteria=["claim separates evidence from inference"],
-                ),
-                TaskSpec(
-                    id="check_claim",
-                    role="claim_checker",
-                    goal="Check the claim against exact evidence.",
-                    depends_on=["draft_claim"],
-                    input_bindings=[
-                        InputBinding(source_task="draft_claim", field="content", target="draft")
-                    ],
-                    output_schema="CheckedClaim",
-                    acceptance_criteria=["caveat and misleading signal addressed"],
-                ),
-                TaskSpec(
-                    id="render_section",
-                    role="section_renderer",
-                    goal="Render findings and follow-up tests.",
-                    depends_on=["check_claim"],
-                    input_bindings=[
-                        InputBinding(source_task="check_claim", field="content", target="checked")
-                    ],
-                    output_schema="ReportSection",
-                    acceptance_criteria=["non-destructive tests included"],
-                ),
-                TaskSpec(
-                    id="assemble",
-                    role="report_assembler",
-                    goal="Assemble final report with lineage.",
-                    depends_on=["render_section"],
-                    static_inputs={"evidence_artifacts": evidence_artifacts},
-                    input_bindings=[
-                        InputBinding(
-                            source_task="render_section", field="content", target="section"
-                        )
-                    ],
-                    output_schema="FinalReport",
-                    acceptance_criteria=["evidence artifact ids included"],
-                ),
-            ],
+        return self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=f"{run_id}-report",
+                run_id=run_id,
+                owner=owner,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=[
+                    "claim_drafter",
+                    "claim_checker",
+                    "section_renderer",
+                    "report_assembler",
+                ],
+                tasks=[
+                    TaskSpec(
+                        id="draft_claim",
+                        role="claim_drafter",
+                        goal="Draft one causal claim with alternatives.",
+                        static_inputs={"metrics": metrics, "evidence": evidence},
+                        output_schema="DraftClaim",
+                        acceptance_criteria=["claim separates evidence from inference"],
+                    ),
+                    TaskSpec(
+                        id="check_claim",
+                        role="claim_checker",
+                        goal="Check the claim against exact evidence.",
+                        depends_on=["draft_claim"],
+                        input_bindings=[
+                            InputBinding(source_task="draft_claim", field="content", target="draft")
+                        ],
+                        output_schema="CheckedClaim",
+                        acceptance_criteria=["caveat and misleading signal addressed"],
+                    ),
+                    TaskSpec(
+                        id="render_section",
+                        role="section_renderer",
+                        goal="Render findings and follow-up tests.",
+                        depends_on=["check_claim"],
+                        input_bindings=[
+                            InputBinding(
+                                source_task="check_claim", field="content", target="checked"
+                            )
+                        ],
+                        output_schema="ReportSection",
+                        acceptance_criteria=["non-destructive tests included"],
+                    ),
+                    TaskSpec(
+                        id="assemble",
+                        role="report_assembler",
+                        goal="Assemble final report with lineage.",
+                        depends_on=["render_section"],
+                        static_inputs={"evidence_artifacts": evidence_artifacts},
+                        input_bindings=[
+                            InputBinding(
+                                source_task="render_section", field="content", target="section"
+                            )
+                        ],
+                        output_schema="FinalReport",
+                        acceptance_criteria=["evidence artifact ids included"],
+                    ),
+                ],
+            ),
+            plan,
+        )
+
+    @staticmethod
+    def _configured_workflow(spec: WorkflowSpec, plan: MissionPlan) -> WorkflowSpec:
+        runtime = plan.agent_runtime
+        tasks = [
+            task.model_copy(
+                update={
+                    "agent_backend": runtime.backend,
+                    "agent_provider": runtime.provider,
+                    "agent_model": runtime.model,
+                    "agent_options": runtime.options,
+                }
+            )
+            for task in spec.tasks
+        ]
+        return spec.model_copy(
+            update={
+                "execution_mode": plan.execution_mode,
+                "execution_options": plan.execution_options,
+                "tasks": tasks,
+            }
         )

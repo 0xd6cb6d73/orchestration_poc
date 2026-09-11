@@ -23,6 +23,8 @@ class SpawnPolicy:
         plan_version: int,
         stable_key: str | None = None,
         agent_backend: str | None = None,
+        agent_provider: str | None = None,
+        agent_model: str | None = None,
     ) -> AgentInstance:
         parent_spec = self.roles.get(parent.role_id)
         child_spec = self.roles.get(child_role)
@@ -46,6 +48,8 @@ class SpawnPolicy:
         suffix = stable_key or new_id("instance")
         agent_id = f"{child_role}-{suffix}" if stable_key else suffix
         selected_backend = agent_backend or child_spec.agent_backend
+        selected_provider = agent_provider or child_spec.provider
+        selected_model = agent_model or child_spec.model
         existing = self.db.get_agent(agent_id)
         if existing is not None:
             if (
@@ -67,6 +71,16 @@ class SpawnPolicy:
                     child_role,
                     "a stable worker identity cannot change agent backend",
                 )
+            if (
+                existing.agent_provider != selected_provider
+                or existing.agent_model != selected_model
+            ):
+                self._deny(
+                    run_id,
+                    parent.agent_instance_id,
+                    child_role,
+                    "a stable worker identity cannot change provider or model",
+                )
             agent = existing
         else:
             agent = AgentInstance(
@@ -78,6 +92,8 @@ class SpawnPolicy:
                 role_version=child_spec.version,
                 plan_version=plan_version,
                 agent_backend=selected_backend,
+                agent_provider=selected_provider,
+                agent_model=selected_model,
             )
             self.db.put_agent(agent)
         self.db.record_event(
@@ -89,6 +105,8 @@ class SpawnPolicy:
                     "agent_instance_id": agent_id,
                     "child_role": child_role,
                     "agent_backend": selected_backend,
+                    "agent_provider": selected_provider,
+                    "agent_model": selected_model,
                 },
             )
         )

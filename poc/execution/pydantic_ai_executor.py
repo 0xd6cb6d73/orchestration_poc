@@ -95,7 +95,17 @@ class PydanticAIAgentExecutor:
 
     def execute(self, request: AgentExecutionRequest) -> dict[str, Any]:
         actor = request.agent
-        role = self.roles.get(actor.role_id)
+        registered_role = self.roles.get(actor.role_id)
+        role = registered_role.model_copy(
+            update={
+                "provider": actor.agent_provider or registered_role.provider,
+                "model": actor.agent_model or registered_role.model,
+                "provider_options": {
+                    **registered_role.provider_options,
+                    **request.task.agent_options,
+                },
+            }
+        )
         dependencies = PydanticAgentDependencies(
             request=request,
             actor=actor,
@@ -103,7 +113,11 @@ class PydanticAIAgentExecutor:
             allowed_tools=frozenset(role.allowed_tools),
             max_tool_calls=role.execution_limits.get("max_tool_calls", 2),
         )
-        self._record(request, "agent.execution_started", {"model": role.model})
+        self._record(
+            request,
+            "agent.execution_started",
+            {"provider": role.provider, "model": role.model},
+        )
         try:
             output = self._run(role, request, dependencies)
         except Exception as exc:
@@ -140,6 +154,7 @@ class PydanticAIAgentExecutor:
             "worker.completed",
             {
                 "outcome": Outcome.SUCCEEDED,
+                "provider": role.provider,
                 "model": role.model,
                 "tool_calls": len(dependencies.tool_results),
                 "output_artifact": artifact.artifact_id,

@@ -21,11 +21,24 @@ uv sync
 uv run hierarchical-ooda-poc
 ```
 
-Open <http://localhost:8000/docs>. A basic demonstration is:
+Open <http://localhost:8000/ui> for the web control room. It can propose and approve
+missions, cancel active runs, and displays the live parent/child agent hierarchy,
+workflow progress, artifacts, and durable trajectory. The JSON API remains available
+at <http://localhost:8000/docs>.
+
+The launch form selects the worker runtime and orchestration mode for the run. When
+`pydantic_ai` is selected, it also requires the provider and model identifier. That
+configuration is stored in the immutable mission plan, submitted to each domain's
+execution strategy, propagated to every generated task, and shown on the run page.
+The built-in `custom_python` runtime always uses the offline deterministic fixture
+model, so its provider/model fields are intentionally disabled.
+
+A basic API demonstration is:
 
 ```bash
 curl -sS -X POST http://localhost:8000/runs \
-  -H 'content-type: application/json' -d '{}'
+  -H 'content-type: application/json' \
+  -d '{"agent_runtime":{"backend":"custom_python"},"execution_mode":"managed_pool"}'
 
 # Use the returned run id. Approval may include edits and creates a new immutable version.
 curl -sS -X POST http://localhost:8000/runs/RUN_ID/approval \
@@ -35,8 +48,8 @@ curl -sS -X POST http://localhost:8000/runs/RUN_ID/approval \
 curl -sS http://localhost:8000/runs/RUN_ID
 ```
 
-The read-only page is at `/ui/runs/RUN_ID`; completed Markdown artifacts are served
-at `/artifacts/ARTIFACT_ID` with immutable ETags.
+Completed Markdown artifacts are served at `/artifacts/ARTIFACT_ID` with immutable
+ETags.
 
 ## Test and build
 

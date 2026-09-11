@@ -27,6 +27,8 @@ class WorkerMaterializer(Protocol):
         plan_version: int,
         stable_key: str,
         agent_backend: str,
+        agent_provider: str | None,
+        agent_model: str | None,
     ) -> AgentInstance: ...
 
 
@@ -47,6 +49,8 @@ class InProcessWorkerMaterializer:
         plan_version: int,
         stable_key: str,
         agent_backend: str,
+        agent_provider: str | None,
+        agent_model: str | None,
     ) -> AgentInstance:
         return self.spawns.spawn(
             run_id=run_id,
@@ -55,6 +59,8 @@ class InProcessWorkerMaterializer:
             plan_version=plan_version,
             stable_key=stable_key,
             agent_backend=agent_backend,
+            agent_provider=agent_provider,
+            agent_model=agent_model,
         )
 
 
@@ -108,6 +114,8 @@ class CapacityScheduler:
                         plan_version=owner.plan_version,
                         stable_key=f"{handle.execution_id}-{role_id}-{index}",
                         agent_backend=policy.agent_backend,
+                        agent_provider=policy.agent_provider,
+                        agent_model=policy.agent_model,
                     )
                     with self.db.transaction() as tx:
                         tx.execute(
@@ -124,6 +132,8 @@ class CapacityScheduler:
                                     "execution_id": handle.execution_id,
                                     "role": role_id,
                                     "agent_backend": worker.agent_backend,
+                                    "agent_provider": worker.agent_provider,
+                                    "agent_model": worker.agent_model,
                                     "parent_authority": owner.agent_instance_id,
                                 },
                             ),

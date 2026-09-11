@@ -63,6 +63,34 @@ class AgentBackend(StrEnum):
     PYDANTIC_AI = "pydantic_ai"
 
 
+class AgentRuntimeConfig(BaseModel):
+    """Per-run worker implementation and model selection.
+
+    ``options`` is deliberately framework-owned so additional executors can add
+    configuration without widening the common orchestration contract.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
+    provider: str | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1)
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_pydantic_ai_model(self) -> AgentRuntimeConfig:
+        if self.backend != AgentBackend.PYDANTIC_AI:
+            return self
+        provider_from_model = (
+            self.model.split(":", 1)[0] if self.model and ":" in self.model else None
+        )
+        if self.model is None:
+            raise ValueError("pydantic_ai requires a model")
+        if self.provider is None and provider_from_model is None:
+            raise ValueError("pydantic_ai requires a provider or provider:model identifier")
+        return self
+
+
 class OwnershipType(StrEnum):
     DAG = "dag"
     CLAIM = "claim"
@@ -88,6 +116,9 @@ class ExecutionPolicy(BaseModel):
 
     mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
     agent_backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
+    agent_provider: str | None = Field(default=None, min_length=1)
+    agent_model: str | None = Field(default=None, min_length=1)
+    agent_options: dict[str, Any] = Field(default_factory=dict)
     max_workers: int = Field(default=4, ge=1)
     allowed_roles: frozenset[str] = Field(default_factory=frozenset)
     max_task_attempts: int = Field(default=3, ge=1)
@@ -182,6 +213,9 @@ class MissionPlan(BaseModel):
     version: int = 1
     status: Literal["proposed", "approved", "superseded"] = "proposed"
     objective: str
+    agent_runtime: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
+    execution_mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    execution_options: dict[str, Any] = Field(default_factory=dict)
     constraints: list[str]
     permitted_sources: list[str]
     permitted_tools: list[str]
@@ -210,6 +244,9 @@ class RunCreate(BaseModel):
         "and deployment records. Produce an evidence-backed report identifying likely "
         "causes and useful follow-up tests. Do not modify any live system."
     )
+    agent_runtime: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
+    execution_mode: ExecutionMode = ExecutionMode.HIERARCHICAL_DAG
+    execution_options: dict[str, Any] = Field(default_factory=dict)
 
 
 class MessageEnvelope(BaseModel):
@@ -259,6 +296,8 @@ class AgentInstance(BaseModel):
     role_version: int
     plan_version: int
     agent_backend: str = Field(default=AgentBackend.CUSTOM_PYTHON, min_length=1)
+    agent_provider: str | None = Field(default=None, min_length=1)
+    agent_model: str | None = Field(default=None, min_length=1)
     status: str = "active"
     created_at: str = Field(default_factory=utc_now)
 
@@ -273,6 +312,9 @@ class TaskSpec(BaseModel):
     id: str
     role: str
     agent_backend: str | None = Field(default=None, min_length=1)
+    agent_provider: str | None = Field(default=None, min_length=1)
+    agent_model: str | None = Field(default=None, min_length=1)
+    agent_options: dict[str, Any] = Field(default_factory=dict)
     goal: str
     depends_on: list[str] = Field(default_factory=list)
     input_bindings: list[InputBinding] = Field(default_factory=list[InputBinding])

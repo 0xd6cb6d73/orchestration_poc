@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent Operations</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/ui" aria-label="Agent Operations home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>Agent Operations</span>
+    </a>
+    <span class="environment"><span class="live-dot"></span> local runtime</span>
+  </header>
+
+  <main class="page dashboard-page">
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Orchestration control room</p>
+        <h1>Turn a mission into<br><em>coordinated action.</em></h1>
+        <p class="lede">Create a run, inspect the proposed plan, then watch supervisors and workers assemble around it in real time.</p>
+        <div class="capability-row" aria-label="System capabilities">
+          <span>3-tier hierarchy</span><span>bounded tools</span><span>durable trajectory</span>
+        </div>
+      </div>
+
+      <form class="mission-card" method="post" action="/ui/runs">
+        <div class="card-kicker"><span class="step-number">01</span> New mission</div>
+        <label for="objective">What should the agents investigate?</label>
+        <textarea id="objective" name="objective" rows="8" required>{{ default_objective }}</textarea>
+        <fieldset class="runtime-config">
+          <legend>Execution configuration</legend>
+          <div class="form-field">
+            <label for="agent-backend">Agent runtime</label>
+            <select id="agent-backend" name="agent_backend" required>
+              {% for backend in agent_backends %}
+              <option value="{{ backend }}"{% if backend == default_backend %} selected{% endif %}>{{ backend | replace('_', ' ') }}</option>
+              {% endfor %}
+            </select>
+            <small>Applied to every worker generated for this run.</small>
+          </div>
+          <div class="form-field">
+            <label for="execution-mode">Orchestration mode</label>
+            <select id="execution-mode" name="execution_mode" required>
+              {% for mode in execution_modes %}
+              <option value="{{ mode }}"{% if mode == default_execution_mode %} selected{% endif %}>{{ mode | replace('_', ' ') }}</option>
+              {% endfor %}
+            </select>
+            <small>Stored in the plan and propagated to every workflow.</small>
+          </div>
+          <div class="form-field model-field" data-model-field>
+            <label for="agent-provider">Model provider</label>
+            <input id="agent-provider" name="agent_provider" placeholder="openai" autocomplete="off">
+            <small>Required for Pydantic AI unless the model includes a provider prefix.</small>
+          </div>
+          <div class="form-field model-field" data-model-field>
+            <label for="agent-model">Model</label>
+            <input id="agent-model" name="agent_model" placeholder="openai:gpt-5" autocomplete="off">
+            <small>The exact provider model identifier passed to Pydantic AI.</small>
+          </div>
+        </fieldset>
+        <div class="form-footer">
+          <span>The plan requires approval before agents start.</span>
+          <button class="button button-primary" type="submit">Propose plan <span aria-hidden="true">→</span></button>
+        </div>
+      </form>
+    </section>
+
+    <section class="run-index" aria-labelledby="recent-runs-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Run history</p>
+          <h2 id="recent-runs-title">Recent missions</h2>
+        </div>
+        <span class="count-label">{{ runs | length }} total</span>
+      </div>
+
+      {% if runs %}
+      <div class="run-list">
+        {% for run in runs %}
+        <a class="run-row" href="/ui/runs/{{ run.run_id }}">
+          <span class="run-status status-badge" data-status="{{ run.status }}">{{ run.status | replace('_', ' ') }}</span>
+          <span class="run-objective">{{ run.objective }}</span>
+          <span class="run-meta"><code>{{ run.run_id }}</code><small>{{ run.updated_at }}</small></span>
+          <span class="row-arrow" aria-hidden="true">↗</span>
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="empty-state">
+        <span class="empty-glyph" aria-hidden="true">◎</span>
+        <h3>No missions yet</h3>
+        <p>Your first proposed plan will appear here.</p>
+      </div>
+      {% endif %}
+    </section>
+  </main>
+  <script src="/static/index.js" defer></script>
+</body>
+</html>
