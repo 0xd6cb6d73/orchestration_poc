@@ -64,8 +64,9 @@ accidentally expand a role's tool permissions or access to private task informat
    decision should reference the immutable submitted artifact, avoiding accidental empty
    rewrites. Protocol/schema failures can be handled by execution policy. Any semantic
    checks must be part of the strategy's declared implementation over ordinary inputs,
-   not calls into the benchmark grader. The generic controller added here retains the
-   simpler replace-on-success behavior; it does not claim to solve semantic regression.
+   not calls into the benchmark grader. The optional `decision-v1` protocol now implements accept/revise/decline;
+   the default `replace` protocol remains available for comparisons. An explicit bad
+   revision still replaces the draft, and accept/decline do not certify correctness.
 
 3. **Reviewer failure: retain an execution-owned submission.** Implemented through
    `review_submission`. Recovery must complete inside an internal deadline preceding

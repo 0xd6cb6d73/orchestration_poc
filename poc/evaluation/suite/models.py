@@ -69,11 +69,13 @@ class Matrix(StrictModel):
             )
             if set(options.phase_models) - allowed_phases:
                 raise ValueError("phase_models contains phases unused by this strategy")
-            if options.review_failure_policy != "fail" and strategy not in {
+            if (
+                options.review_failure_policy != "fail" or options.review_protocol != "replace"
+            ) and strategy not in {
                 "review",
                 "review-json",
             }:
-                raise ValueError("review_failure_policy requires review or review-json")
+                raise ValueError("review options require review or review-json")
         return self
 
 

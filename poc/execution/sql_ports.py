@@ -32,6 +32,7 @@ class TrialState(Protocol):
     exhausted_phase: str | None
     recovery: dict[str, Any] | None
     answer_source: str | None
+    review_decision: dict[str, Any] | None
     emit: Callable[[dict[str, Any]], None]
 
     def candidate(self, answer: Answer, source: str) -> dict[str, Any]: ...

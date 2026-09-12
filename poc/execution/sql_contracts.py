@@ -64,6 +64,7 @@ class ArchitectureOptions(StrictModel):
     constraint_feedback: bool = False
     output_retries: int = Field(default=1, ge=0)
     review_failure_policy: Literal["fail", "return_submitted_draft"] = "fail"
+    review_protocol: Literal["replace", "decision-v1"] = "replace"
 
 
 class Answer(StrictModel):

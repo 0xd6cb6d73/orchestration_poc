@@ -389,3 +389,47 @@ provider overrides must not silently relabel an existing cohort.
 
 See [the orchestration investigation](orchestration-model-routing.md) for existing
 per-task model support, strategy-specific gaps, and a fair experimental design.
+
+### Explicit review decisions
+
+Set `architecture_options.review.review_protocol` to `"decision-v1"` (also supported
+by `review-json`) to evaluate the execution-owned accept/revise/decline protocol.
+The default `"replace"` preserves the earlier unconditional replacement strategy for
+controlled comparisons. `configs/evaluation-review-decision.json` selects the same
+seed-0 Qwen 2.5/Qwen 3.8 scheduling/routing pilot, with four concurrent trials.
+
+A reviewer returns `action`, a nonempty `reason`, and an optional `replacement`:
+
+- `accept` returns the exact retained draft; no replacement is allowed.
+- `revise` requires a complete replacement answer. It is returned even if it is
+  empty, incomplete, or worse than the draft; no grader selects between them.
+- `decline` returns the retained draft and records that review was declined. This
+  is not approval, an exception recovery, or evidence that the draft is correct.
+
+For example, `{"action":"accept","reason":"Checked the submission","replacement":null}`
+accepts the artifact without copying its values into a new model output. A revision
+uses `{"action":"revise","reason":"Changed the assignment","replacement":{"values":{...}}}`.
+The reason is reviewer-reported text, not a verified explanation.
+
+Malformed decisions receive at most `output_retries` protocol retries. Existing
+`review_failure_policy` controls recovery after those retries fail or after an
+eligible internal reviewer error. External cancellation and the benchmark's hard
+cutoff still propagate. All requests and tools share the original budgets.
+
+The generic controller is `poc/execution/review.py`; SQL prompt/schema integration
+is `poc/execution/sql_strategy.py`. Neither accesses evaluation diagnostics.
+No evidence-handoff, progress-detection, model-escalation, or coverage-preservation
+policy is bundled into this protocol. An explicit bad revision remains possible.
+
+Trial records include the raw `review_decision`, and review phases include
+`review_action`. `answer_source` distinguishes `draft_accept`, `draft_decline`,
+`review` (revision), and `draft_fallback` (exception recovery). `review_outcome`
+continues to describe phase execution, so a completed decline must not be interpreted
+as reviewer endorsement. Phoenix receives the same fields in the trial output.
+
+The [limited decision-protocol verification](../var/evaluation/review-decision-seed0-analysis.md)
+repeated all12 pilot trials. Qwen2.5 returned six valid `revise` decisions but no
+feasible answer; Qwen3.8 timed out before review in all six trials. The live run did
+not exercise accept, decline, or protocol-error recovery; deterministic tests cover
+those branches. The protocol remains opt-in, with no demonstrated task-success gain
+from this small comparison.

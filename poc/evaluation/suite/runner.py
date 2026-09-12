@@ -198,6 +198,7 @@ async def run_trial(
         "recovery": recovery,
         "answer_source": answer_source,
         "review_outcome": review_outcome,
+        "review_decision": env.state.review_decision,
         "error": error,
         "error_status_code": error_status_code,
         "scores": scores,

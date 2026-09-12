@@ -17,7 +17,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
 
-from poc.execution.review import review_submission
+from poc.execution.review import ReviewDecision, review_decision_submission, review_submission
 from poc.execution.sql_contracts import Answer, Budget, ModelSpec, PhaseName, TaskInput
 from poc.execution.sql_ports import (
     PhaseTimeout,
@@ -86,6 +86,29 @@ def _check_output(env: TaskEnvironment, answer: Answer) -> Answer:
     return answer
 
 
+REVIEW_DECISION_INSTRUCTIONS = """
+Review protocol decision-v1: make an explicit decision about the supplied draft.
+Use SQL as needed. Your final output must be a decision object, not a bare values mapping:
+{"action":"accept","reason":"why you accept","replacement":null} returns the exact draft;
+{"action":"revise","reason":"what you changed and why","replacement":{"values":{...}}}
+submits your complete replacement;
+{"action":"decline","reason":"why you cannot complete review","replacement":null}
+retains the original draft and records that review was declined, without endorsing it.
+Accept and decline must not include a replacement. Revise must include one.
+Do not rewrite or copy the draft when accepting it. No decision guarantees correctness.
+"""
+
+
+def _record_decision(
+    env: TaskEnvironment, decision: ReviewDecision[Answer]
+) -> ReviewDecision[Answer]:
+    env.state.review_decision = decision.model_dump()
+    env.state.emit({"review_decision": env.state.review_decision})
+    if decision.replacement is not None:
+        _check_output(env, decision.replacement)
+    return decision
+
+
 async def _solve_json(
     task: TaskInput,
     env: TaskEnvironment,
@@ -95,7 +118,10 @@ async def _solve_json(
     usage: RunUsage,
     draft: Answer | None = None,
     finalizing: bool = False,
-) -> Answer:
+) -> Answer | ReviewDecision[Answer]:
+    decision_mode = (
+        draft is not None and not finalizing and env.state.options.review_protocol == "decision-v1"
+    )
     # The same text JSON protocol works even when a provider lacks native function calling.
     agent = Agent(
         ObservedModel(model, env.state, budget),
@@ -105,20 +131,31 @@ async def _solve_json(
         instructions=(
             "Solve the task with the read-only SQLite tool. On EACH turn return exactly one "
             'JSON object: {"sql": "SELECT ..."} to execute a query, or '
-            '{"values": {"id": value}} for your COMPLETE final answer. '
-            "No markdown. SQLite joins, windows and recursive CTEs are supported. "
+            + (
+                'a final {"action":"accept|revise|decline","reason":"...","replacement":null} decision. '
+                if decision_mode
+                else '{"values": {"id": value}} for your COMPLETE final answer. '
+            )
+            + "No markdown. SQLite joins, windows and recursive CTEs are supported. "
             "Queries return at most 200 rows / 64KB; use LIMIT/OFFSET pagination. "
             "Inspect and compute over the tables, check edge cases, never invent results."
         ),
     )
     prompt = task.prompt + "\nSQL schema: " + json.dumps(env.schema)
     if draft is not None:
-        prompt += "\nIndependently verify and correct this draft: " + draft.model_dump_json()
+        prompt += (
+            "\nReview this submitted draft: "
+            if decision_mode
+            else "\nIndependently verify and correct this draft: "
+        ) + draft.model_dump_json()
     if env.state.options.candidate_submission:
         prompt += '\nYou may checkpoint an answer with {"candidate": {"id": value}}.'
     if finalizing:
         prompt += "\nFinalization phase: return your final answer now. No tools are available."
+    if decision_mode:
+        prompt += REVIEW_DECISION_INSTRUCTIONS
     history = None
+    invalid_outputs = 0
     while True:
         result = await agent.run(
             prompt,
@@ -148,8 +185,18 @@ async def _solve_json(
             ):
                 prompt = json.dumps(env.submit_candidate(cast(dict[str, Any], action)["candidate"]))
             else:
+                if decision_mode:
+                    return _record_decision(env, ReviewDecision[Answer].model_validate(action))
                 return _check_output(env, Answer.model_validate(action))
         except (ValueError, TypeError):
+            if decision_mode:
+                invalid_outputs += 1
+                if invalid_outputs > env.state.options.output_retries:
+                    raise UnexpectedModelBehavior(
+                        "review decision output retries exhausted"
+                    ) from None
+                prompt = "Invalid review protocol output." + REVIEW_DECISION_INSTRUCTIONS
+                continue
             prompt = 'Invalid action. Return ONLY {"sql":"..."} or {"values":{...}}.'
 
 
@@ -162,7 +209,11 @@ async def _solve_native(
     usage: RunUsage,
     draft: Answer | None = None,
     finalizing: bool = False,
-) -> Answer:
+) -> Answer | ReviewDecision[Answer]:
+    decision_mode = (
+        draft is not None and not finalizing and env.state.options.review_protocol == "decision-v1"
+    )
+
     async def query(sql: str) -> dict[str, Any]:
         """Read-only SQLite query; 200 rows and 64KB maximum. Paginate with LIMIT/OFFSET."""
         return env.query(sql)
@@ -176,7 +227,7 @@ async def _solve_native(
         tool_functions.append(submit_candidate)
     agent = Agent(
         ObservedModel(model, env.state, budget),
-        output_type=Answer,
+        output_type=ReviewDecision[Answer] if decision_mode else Answer,
         tools=tool_functions,
         retries={"output": env.state.options.output_retries},
         model_settings=settings,
@@ -184,17 +235,32 @@ async def _solve_native(
         instructions=(
             "Solve the task using SQL over the provided schema. SQLite joins, "
             "windows and recursive CTEs are supported. Check all constraints "
-            "and return the complete values mapping."
+            + (
+                "and return a review decision."
+                if decision_mode
+                else "and return the complete values mapping."
+            )
         ),
     )
     prompt = task.prompt + "\nSQL schema: " + json.dumps(env.schema)
     if draft is not None:
-        prompt += "\nIndependently verify and correct this draft: " + draft.model_dump_json()
+        prompt += (
+            "\nReview this submitted draft: "
+            if decision_mode
+            else "\nIndependently verify and correct this draft: "
+        ) + draft.model_dump_json()
     if finalizing:
         prompt += "\nFinalization phase: return your final answer now. No tools are available."
 
+    if decision_mode:
+        prompt += REVIEW_DECISION_INSTRUCTIONS
+
     @agent.output_validator
-    async def validate_output(answer: Answer) -> Answer:
+    async def validate_output(
+        answer: Answer | ReviewDecision[Answer],
+    ) -> Answer | ReviewDecision[Answer]:
+        if isinstance(answer, ReviewDecision):
+            return _record_decision(env, answer)
         return _check_output(env, answer)
 
     result = await agent.run(
@@ -235,7 +301,7 @@ async def _orchestrate(
         token_limit: int,
         draft: Answer | None = None,
         finalizing: bool = False,
-    ) -> Answer:
+    ) -> Answer | ReviewDecision[Answer]:
         state.phase = name
         started, tokens = perf_counter(), usage.total_tokens
         input_tokens, output_tokens = usage.input_tokens, usage.output_tokens
@@ -278,6 +344,9 @@ async def _orchestrate(
                         finalizing,
                     )
                 record["status"] = "completed"
+                if isinstance(result, ReviewDecision):
+                    record["review_action"] = result.action
+                    span.set_attribute("orchestration.review.action", result.action)
                 return result
             except RequestTimeout:
                 record["status"] = "request_timeout"
@@ -309,14 +378,22 @@ async def _orchestrate(
     try:
         if review:
             draft_deadline = state.started + (work_deadline - state.started) * budget.draft_fraction
-            draft = await phase(
-                "draft", draft_deadline, max(1, int(work_tokens * budget.draft_fraction))
+            draft = cast(
+                Answer,
+                await phase(
+                    "draft", draft_deadline, max(1, int(work_tokens * budget.draft_fraction))
+                ),
             )
 
-            async def review_output(submission: Answer) -> Answer:
+            async def review_output(submission: Answer) -> Any:
                 return await phase("review", work_deadline, work_tokens, submission)
 
-            outcome = await review_submission(
+            controller = (
+                review_decision_submission
+                if state.options.review_protocol == "decision-v1"
+                else review_submission
+            )
+            outcome = await controller(
                 draft,
                 review_output,
                 return_draft_on_error=state.options.review_failure_policy
@@ -330,12 +407,14 @@ async def _orchestrate(
                     UnexpectedModelBehavior,
                 ),
             )
+            if outcome.source in {"draft_accept", "draft_decline"}:
+                state.candidate(outcome.output, outcome.source)
             state.answer_source = outcome.source
             if outcome.reviewer_error:
                 state.recovery = {"error": outcome.reviewer_error, "phase": "review"}
                 state.emit({"recovery": state.recovery})
             return outcome.output
-        return await phase("solve", work_deadline, work_tokens)
+        return cast(Answer, await phase("solve", work_deadline, work_tokens))
     except (PhaseTimeout, UsageLimitExceeded, ToolBudgetExceeded):
         # A reserve enables another MODEL submission, never automatic promotion of a checkpoint.
         if not state.candidates or not (
@@ -350,12 +429,15 @@ async def _orchestrate(
             or usage.requests >= budget.requests
         ):
             raise
-        return await phase(
-            "finalize",
-            deadline,
-            budget.total_tokens,
-            Answer.model_validate(state.candidates[-1]["answer"]),
-            True,
+        return cast(
+            Answer,
+            await phase(
+                "finalize",
+                deadline,
+                budget.total_tokens,
+                Answer.model_validate(state.candidates[-1]["answer"]),
+                True,
+            ),
         )
 
 

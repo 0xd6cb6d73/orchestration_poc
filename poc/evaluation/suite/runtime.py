@@ -45,6 +45,7 @@ class TrialState:
         self.exhausted_phase: str | None = None
         self.recovery: dict[str, Any] | None = None
         self.answer_source: str | None = None
+        self.review_decision: dict[str, Any] | None = None
 
     def candidate(self, answer: Answer, source: str) -> dict[str, Any]:
         # Copies prevent later reviewer mutation from erasing the checkpoint.

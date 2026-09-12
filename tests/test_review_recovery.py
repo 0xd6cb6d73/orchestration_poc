@@ -94,8 +94,10 @@ async def test_harness_grades_whatever_execution_returns(
     assert result["answer_source"] == "draft_fallback"
 
 
+@pytest.mark.parametrize("protocol", ["replace", "decision-v1"])
 async def test_hard_harness_deadline_never_selects_a_candidate(
     monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
 ) -> None:
     case = generate("scheduling", 0, "dev", "standard")
     calls = 0
@@ -115,7 +117,9 @@ async def test_hard_harness_deadline_never_selects_a_candidate(
         strategies=["review"],
         budget=Budget(seconds=0.3),
         architecture_options={
-            "review": ArchitectureOptions(review_failure_policy="return_submitted_draft")
+            "review": ArchitectureOptions.model_validate(
+                {"review_failure_policy": "return_submitted_draft", "review_protocol": protocol}
+            )
         },
     )
     result = await runner.run_trial(case, cfg.models[0], "review", 1, cfg)
