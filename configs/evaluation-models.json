@@ -1,0 +1,70 @@
+{
+  "models": [
+    {
+      "name": "mistral-nemo",
+      "model_class": "7B",
+      "model": "mistralai/mistral-nemo",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "llama-3.1-8b",
+      "model_class": "7B",
+      "model": "meta-llama/llama-3.1-8b-instruct",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "qwen-2.5-7b",
+      "model_class": "7B",
+      "model": "qwen/qwen-2.5-7b-instruct",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "mistral-small-3.2-24b",
+      "model_class": "27B",
+      "model": "mistralai/mistral-small-3.2-24b-instruct",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "qwen-3.8-27b",
+      "model_class": "27B",
+      "model": "qwen/qwen3.8-27b",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "gemma-3-27b",
+      "model_class": "27B",
+      "model": "google/gemma-3-27b-it",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    }
+  ],
+  "strategies": [
+    "single",
+    "review"
+  ],
+  "families": [
+    "scheduling",
+    "routing"
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "split": "dev",
+  "difficulty": "standard",
+  "repetitions": 2,
+  "budget": {
+    "requests": 40,
+    "tool_calls": 80,
+    "total_tokens": 100000,
+    "seconds": 300
+  }
+}

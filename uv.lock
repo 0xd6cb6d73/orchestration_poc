@@ -58,6 +58,24 @@ wheels = [
 ]
 
 [[package]]
+name = "arize-phoenix-client"
+version = "3.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "openinference-instrumentation" },
+    { name = "openinference-semantic-conventions" },
+    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-sdk" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5f/05/93402e0ac59cdd64e48f7a5cef8dfb60cc90ba01be0aea1d76cfd9141080/arize_phoenix_client-3.4.0.tar.gz", hash = "sha256:212e4ee4f0e93b2183f35b1b37f2966d72c52bb93754fd94d08e4c9d88ebb070", size = 289520, upload-time = "2026-09-04T02:42:19.863Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e3/26/2f64fd3ace199cd04bf269f988ce002e4dfb0345c978d951979a750e6917/arize_phoenix_client-3.4.0-py3-none-any.whl", hash = "sha256:20d3b5ea083f5add97db93b23b24ea26317e5fdb820dfa1c883213a6928623dd", size = 250371, upload-time = "2026-09-04T02:42:18.291Z" },
+]
+
+[[package]]
 name = "arize-phoenix-otel"
 version = "0.16.1"
 source = { registry = "https://pypi.org/simple" }
@@ -417,11 +435,15 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-ai-slim" },
     { name = "pydantic-evals" },
+    { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
+evaluation = [
+    { name = "arize-phoenix-client" },
+]
 llm = [
     { name = "pydantic-ai-slim", extra = ["anthropic", "openai"] },
 ]
@@ -444,6 +466,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "arize-phoenix-client", marker = "extra == 'evaluation'", specifier = "==3.4.0" },
     { name = "arize-phoenix-otel", marker = "extra == 'telemetry'", specifier = "==0.16.1" },
     { name = "fastapi", specifier = "==0.116.1" },
     { name = "jinja2", specifier = "==3.1.6" },
@@ -458,10 +481,11 @@ requires-dist = [
     { name = "pydantic-ai-slim", specifier = "==2.36.0" },
     { name = "pydantic-ai-slim", extras = ["anthropic", "openai"], marker = "extra == 'llm'", specifier = "==2.36.0" },
     { name = "pydantic-evals", specifier = "==2.36.0" },
+    { name = "python-dotenv", specifier = "==1.2.1" },
     { name = "python-multipart", specifier = "==0.0.20" },
     { name = "uvicorn", specifier = "==0.35.0" },
 ]
-provides-extras = ["llm", "telemetry"]
+provides-extras = ["llm", "telemetry", "evaluation"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1586,6 +1610,15 @@ wheels = [
 ]
 
 [[package]]
+name = "python-dotenv"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f0/26/19cadc79a718c5edbec86fd4919a6b6d3f681039a2f6d66d14be94e75fb9/python_dotenv-1.2.1.tar.gz", hash = "sha256:42667e897e16ab0d66954af0e60a9caa94f0fd4ecf3aaf6d2d260eec1aa36ad6", size = 44221, upload-time = "2025-10-26T15:12:10.434Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/1b/a298b06749107c305e1fe0f814c6c74aea7b2f1e10989cb30f544a1b3253/python_dotenv-1.2.1-py3-none-any.whl", hash = "sha256:b81ee9561e9ca4004139c6cbba3a238c32b03e4894671e181b671e8cb8425d61", size = 21230, upload-time = "2025-10-26T15:12:09.109Z" },
+]
+
+[[package]]
 name = "python-multipart"
 version = "0.0.20"
 source = { registry = "https://pypi.org/simple" }
@@ -1936,6 +1969,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/f6/80760e98a08e6649d2d68afb6035af713121dfb615acce8c4f73810ec438/tiktoken-0.14.0-cp315-cp315t-musllinux_1_2_aarch64.whl", hash = "sha256:86f66c85e796f5d05d5c4a60ec1d40cbfebc47a32464053528c797163fa9ab89", size = 1251479, upload-time = "2026-08-17T19:49:36.419Z" },
     { url = "https://files.pythonhosted.org/packages/c5/84/50966fb6918a0fb9b32721277e5342bf729a2d74350074d662fbedf9772e/tiktoken-0.14.0-cp315-cp315t-musllinux_1_2_x86_64.whl", hash = "sha256:149d97453c4c98c04b081d64a85e635921269b532710d6faf81e9e82b790e7d3", size = 1316673, upload-time = "2026-08-17T19:49:37.756Z" },
     { url = "https://files.pythonhosted.org/packages/35/5e/9b01afd037bfa22a0033963fa091e0f75b6fb15cd85bffb42ff86e697323/tiktoken-0.14.0-cp315-cp315t-win_amd64.whl", hash = "sha256:561e7580f84a79859af1ef6f676968e9030fcc3fe195700b15235bca64f009c9", size = 987929, upload-time = "2026-08-17T19:49:38.947Z" },
+]
+
+[[package]]
+name = "tqdm"
+version = "4.70.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0d/ea/b2a5bd54b28a324dae8211928b2d730b6547500342c7e6c6dea08bd0a485/tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4", size = 171846, upload-time = "2026-09-11T07:25:16.601Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/03/921a3d3c75785aca9ebfbfcabfbc3a1be12e2ab5265deb026d55a5a3f83e/tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73", size = 80199, upload-time = "2026-09-11T07:25:14.599Z" },
 ]
 
 [[package]]

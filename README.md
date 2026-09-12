@@ -385,3 +385,11 @@ New typed datasets and custom evaluators can be supplied programmatically throug
 The PoC intentionally excludes live infrastructure access, arbitrary code execution,
 distributed queues, and hot graph mutation. Swarm coordination is implemented and
 tested in-process; worker process materialization remains a trusted runtime concern.
+
+## Task-independent orchestration evaluations
+
+See [the evaluation suite guide](docs/evaluation.md) for seeded reconciliation, dependency,
+access-policy, resource-constrained scheduling and vehicle-routing tasks; six configurable small-model entries;
+single-agent/review comparisons under shared budgets; and Phoenix datasets, experiments and traces.
+Start with `configs/evaluation-smoke.json` for offline validation, then calibrate a small subset
+of `configs/evaluation-models.json` before a full sweep.
