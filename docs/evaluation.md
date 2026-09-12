@@ -99,16 +99,16 @@ that the environment and graders agree, not that any model has solved the benchm
 
 | Cohort | Model |
 | --- | --- |
-| 7B | `mistralai/mistral-nemo` |
 | 7B | `meta-llama/llama-3.1-8b-instruct` |
 | 7B | `qwen/qwen-2.5-7b-instruct` |
 | 27B | `mistralai/mistral-small-3.2-24b-instruct` |
 | 27B | `qwen/qwen3.8-27b` |
-| 27B | `google/gemma-3-27b-it` |
+| 100B | `openai/gpt-oss-120b` |
+| frontier-flash | `deepseek/deepseek-v4-flash-0731` |
 
-Cohorts are comparison labels, not exact parameter counts (Nemo is 12B; the selected
-Llama is 8B and Mistral Small is 24B). Add `100B` or `frontier-flash` entries with exact
-provider model IDs when extending the matrix. No harness rewrite is needed.
+Cohorts are comparison labels, not exact parameter counts (the selected
+Llama is 8B and Mistral Small is 24B). Use exact provider model IDs when extending
+the matrix. No harness rewrite is needed.
 For an OpenAI-compatible local server, change the environment variable referenced by
 `base_url_env` and supply that server's model ID. For Pydantic AI's other providers omit
 `base_url_env` and use `provider:model`. Install its provider extra separately if needed.

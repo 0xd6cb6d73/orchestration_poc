@@ -1,13 +1,6 @@
 {
   "models": [
     {
-      "name": "mistral-nemo",
-      "model_class": "7B",
-      "model": "mistralai/mistral-nemo",
-      "base_url_env": "OPENAI_BASE_URL",
-      "api_key_env": "OPENAI_API_KEY"
-    },
-    {
       "name": "llama-3.1-8b",
       "model_class": "7B",
       "model": "meta-llama/llama-3.1-8b-instruct",
@@ -36,9 +29,16 @@
       "api_key_env": "OPENAI_API_KEY"
     },
     {
-      "name": "gemma-3-27b",
-      "model_class": "27B",
-      "model": "google/gemma-3-27b-it",
+      "name": "gpt-oss-120b",
+      "model_class": "100B",
+      "model": "openai/gpt-oss-120b",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    {
+      "name": "deepseek-v4-flash-0731",
+      "model_class": "frontier-flash",
+      "model": "deepseek/deepseek-v4-flash-0731",
       "base_url_env": "OPENAI_BASE_URL",
       "api_key_env": "OPENAI_API_KEY"
     }
