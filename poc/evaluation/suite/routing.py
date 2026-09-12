@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, cast
+from typing import Any
 
 from poc.evaluation.suite.models import Answer, TaskCase, TaskInput
 
@@ -62,33 +62,6 @@ def routing(rng: random.Random, size: int) -> tuple[TaskInput, dict[str, Any]]:
 
 
 def grade_routing(case: TaskCase, answer: Answer) -> dict[str, float]:
-    stops = {r["id"]: r for r in case.input.tables["stops"]}
-    vehicles = {r["id"]: r for r in case.input.tables["vehicles"]}
-    if set(answer.values) != set(stops):
-        return {"exact": 0.0, "fraction_correct": 0.0}
-    routes: dict[int, list[tuple[int, str]]] = {v: [] for v in vehicles}
-    for name, assignment in answer.values.items():
-        if (
-            not isinstance(assignment, dict)
-            or set(cast(dict[str, Any], assignment)) != {"vehicle", "position"}
-            or type(cast(dict[str, Any], assignment)["vehicle"]) is not int
-            or type(cast(dict[str, Any], assignment)["position"]) is not int
-            or assignment["vehicle"] not in vehicles
-        ):
-            return {"exact": 0.0, "fraction_correct": 0.0}
-        parsed = cast(dict[str, Any], assignment)
-        routes[parsed["vehicle"]].append((parsed["position"], name))
-    checks: list[bool] = []
-    for vehicle, route in routes.items():
-        route.sort()
-        checks.append([pos for pos, _ in route] == list(range(1, len(route) + 1)))
-        checks.append(sum(stops[n]["demand"] for _, n in route) <= vehicles[vehicle]["capacity"])
-        time, x, y = 0, 0, 0
-        for _, name in route:
-            stop = stops[name]
-            time = max(time + abs(x - stop["x"]) + abs(y - stop["y"]), stop["opens"])
-            checks.append(time <= stop["closes"])
-            time += stop["service"]
-            x, y = stop["x"], stop["y"]
-        checks.append(time + abs(x) + abs(y) <= vehicles[vehicle]["return_deadline"])
-    return {"exact": float(all(checks)), "fraction_correct": sum(checks) / len(checks)}
+    from poc.evaluation.suite.diagnostics import diagnose
+
+    return diagnose(case.input, answer)["scores"]

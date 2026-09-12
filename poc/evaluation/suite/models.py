@@ -38,6 +38,31 @@ class Budget(StrictModel):
     tool_calls: int = Field(default=80, ge=1)
     total_tokens: int = Field(default=100000, ge=1)
     seconds: float = Field(default=300, gt=0)
+    request_timeout_seconds: float | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    finalization_seconds: float = Field(default=0, ge=0)
+    finalization_tokens: int = Field(default=0, ge=0)
+    finalization_requests: int = Field(default=0, ge=0)
+    draft_fraction: float = Field(default=1, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def valid_reserves(self) -> Budget:
+        if self.finalization_seconds >= self.seconds:
+            raise ValueError("finalization_seconds must be less than seconds")
+        if self.finalization_tokens >= self.total_tokens:
+            raise ValueError("finalization_tokens must be less than total_tokens")
+        if self.finalization_requests >= self.requests:
+            raise ValueError("finalization_requests must be less than requests")
+        return self
+
+
+class ArchitectureOptions(StrictModel):
+    """Explicit interventions; baseline strategies receive no additional assistance."""
+
+    candidate_submission: bool = False
+    output_validation: bool = False
+    constraint_feedback: bool = False
+    output_retries: int = Field(default=1, ge=0)
 
 
 class ModelSpec(StrictModel):
@@ -62,12 +87,15 @@ class Matrix(StrictModel):
     budget: Budget = Field(default_factory=Budget)
     order_seed: int = 1729
     max_concurrency: int = Field(default=4, ge=1)
+    architecture_options: dict[str, ArchitectureOptions] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def unique_axes(self) -> Matrix:
         for axis in ([m.name for m in self.models], self.strategies, self.families, self.seeds):
             if len(axis) != len(set(axis)):
                 raise ValueError("matrix axes must contain unique values")
+        if set(self.architecture_options) - set(self.strategies):
+            raise ValueError("architecture_options must refer to configured strategies")
         return self
 
 

@@ -12,7 +12,7 @@ from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 logger = logging.getLogger(__name__)
 
 
-def configure_telemetry() -> Any | None:
+def configure_telemetry(*, instrument_providers: bool = True) -> Any | None:
     """Configure Phoenix once when enabled; keep local development fully offline."""
     if os.getenv("PHOENIX_ENABLED", "0").lower() not in {"1", "true", "yes"}:
         return None
@@ -39,6 +39,10 @@ def configure_telemetry() -> Any | None:
         ),
     )
     LangChainInstrumentor().instrument(tracer_provider=provider)
+    if not instrument_providers:
+        # Pydantic AI's Instrumentation capability owns suite model spans.
+        # SDK instrumentors would report the same request and tokens a second time.
+        return provider
     # Provider SDKs are optional. Instrument them only when an adapter actually installs them.
     _instrument_optional_provider(
         package="openai",

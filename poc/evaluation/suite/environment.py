@@ -7,7 +7,8 @@ from typing import Any
 
 from opentelemetry import trace
 
-from poc.evaluation.suite.models import TaskInput
+from poc.evaluation.suite.models import Answer, TaskInput
+from poc.evaluation.suite.runtime import ToolBudgetExceeded, TrialState
 
 
 class TaskEnvironment:
@@ -17,6 +18,8 @@ class TaskEnvironment:
         self.db = sqlite3.connect(":memory:")
         self.calls: list[dict[str, Any]] = []
         self.max_calls = max_calls
+        self.state = TrialState(task)
+        self.validation_calls: list[dict[str, Any]] = []
         self.schema: dict[str, list[str]] = {}
         for table, rows in task.tables.items():
             if not rows:
@@ -56,8 +59,8 @@ class TaskEnvironment:
 
         Joins, aggregates, window functions and recursive CTEs are available.
         """
-        if len(self.calls) >= self.max_calls:
-            raise RuntimeError("shared tool-call budget exhausted")
+        if self.tool_calls >= self.max_calls:
+            raise ToolBudgetExceeded("shared tool-call budget exhausted")
         call: dict[str, Any] = {"sql": sql}
         self.calls.append(call)
         ticks = 0
@@ -70,6 +73,7 @@ class TaskEnvironment:
         self.db.set_progress_handler(progress, 1000)
         with trace.get_tracer(__name__).start_as_current_span("evaluation.query") as span:
             span.set_attribute("openinference.span.kind", "TOOL")
+            span.set_attribute("evaluation.phase", self.state.phase)
             span.set_attribute("input.value", sql)
             try:
                 cursor = self.db.execute(sql)
@@ -90,3 +94,30 @@ class TaskEnvironment:
 
     def close(self) -> None:
         self.db.close()
+
+    @property
+    def tool_calls(self) -> int:
+        return len(self.calls) + len(self.validation_calls)
+
+    def submit_candidate(self, values: dict[str, Any]) -> dict[str, Any]:
+        if self.tool_calls >= self.max_calls:
+            raise ToolBudgetExceeded("shared tool-call budget exhausted")
+        answer = Answer(values=values)
+        self.validation_calls.append({"action": "submit_candidate", "values": answer.model_dump()})
+        self.state.candidate(answer, "submitted")
+        if self.state.options.constraint_feedback:
+            return self.state.feedback(answer, constraints=True)
+        if self.state.options.output_validation:
+            return self.state.feedback(answer, constraints=False)
+        return {"recorded": True}
+
+    def validate_candidate(self, values: dict[str, Any]) -> dict[str, Any]:
+        if self.tool_calls >= self.max_calls:
+            raise ToolBudgetExceeded("shared tool-call budget exhausted")
+        answer = Answer(values=values)
+        result = self.state.feedback(answer, constraints=True)
+        self.validation_calls.append(
+            {"action": "validate_candidate", "values": answer.model_dump(), "result": result}
+        )
+        self.state.candidate(answer, "validated")
+        return result
