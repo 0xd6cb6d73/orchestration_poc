@@ -43,6 +43,24 @@ time spent waiting for a worker does not count toward that timeout. Draft and re
 stages within one trial remain sequential and share that trial's budget. Completed trials
 are flushed immediately in completion order. Cancellation stops active workers and leaves
 completed records readable. The configured concurrency is recorded in the manifest.
+Progress is printed to stderr at startup and whenever a trial starts or stops, as
+`Progress: 3/12 finished, 4 running`. Finished includes terminal failures and results
+already saved when resuming; queued trials are not counted as running.
+
+Select a subset of the config with `--models`, `--strategies`, `--families` and `--seeds`:
+
+```bash
+uv run python -m poc.evaluation.suite run \
+  --config configs/evaluation-smoke.json --output var/evaluation/subset.jsonl \
+  --models sql-oracle --strategies sql-baseline --families ledger access --seeds 0 2
+```
+
+Each flag accepts space-separated values and can be repeated. Models are selected by
+their config `name`, not provider model ID. Omitted flags include the entire configured
+axis; unknown values are rejected before execution. Selections preserve config order and
+ignore duplicate requests. All configured repetitions run for the selected combinations.
+The report records the selected matrix, including only the selected strategies' architecture
+options. To resume it, pass the same subset flags; use a new output for a different subset.
 
 Concurrency overlaps model API waits, not CPU-heavy Python or SQLite computation.
 Choose a limit suitable for the endpoint's capacity and keep it consistent when comparing

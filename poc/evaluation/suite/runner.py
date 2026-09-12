@@ -6,6 +6,7 @@ import inspect
 import os
 import random
 import statistics
+import sys
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -302,6 +303,7 @@ async def _run_matrix(matrix: Matrix, output: Path, *, resume: bool) -> dict[str
         for rep in range(1, matrix.repetitions + 1)
     ]
     random.Random(matrix.order_seed).shuffle(schedule)
+    total = len(schedule)
     schedule = [
         (c, m, s, r)
         for c, m, s, r in schedule
@@ -318,8 +320,20 @@ async def _run_matrix(matrix: Matrix, output: Path, *, resume: bool) -> dict[str
         if not resume:
             append(stream, {"manifest": header})
         pending = iter(schedule)
+        finished = len(completed)
+        running = 0
+
+        def progress() -> None:
+            print(
+                f"Progress: {finished}/{total} finished, {running} running",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        progress()
 
         async def worker() -> None:
+            nonlocal finished, running
             for case, model, strategy, rep in pending:
                 identity = {
                     "case_id": case.id,
@@ -333,9 +347,16 @@ async def _run_matrix(matrix: Matrix, output: Path, *, resume: bool) -> dict[str
                     append(stream, {"event": {**identity, **event}})
 
                 emit({"started": datetime.now(UTC).isoformat()})
-                trial = await run_trial(case, model, strategy, rep, matrix, emit)
-                trials.append(trial)
-                append(stream, {"trial": trial})
+                running += 1
+                progress()
+                try:
+                    trial = await run_trial(case, model, strategy, rep, matrix, emit)
+                    append(stream, {"trial": trial})
+                    trials.append(trial)
+                    finished += 1
+                finally:
+                    running -= 1
+                    progress()
                 print(
                     f"{case.id} {model.name}/{strategy} r{rep}: "
                     f"{trial['status']} exact={trial['scores']['exact']}",

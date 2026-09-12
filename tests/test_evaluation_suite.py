@@ -273,6 +273,7 @@ async def test_matrix_bounds_parallel_trials_and_isolates_budgets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     concurrency: int,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     active = 0
     peak = 0
@@ -325,6 +326,9 @@ async def test_matrix_bounds_parallel_trials_and_isolates_budgets(
         try:
             await full.wait()
             assert active == concurrency
+            progress = capsys.readouterr().err.splitlines()
+            assert progress[0] == "Progress: 0/6 finished, 0 running"
+            assert progress[-1] == f"Progress: 0/6 finished, {concurrency} running"
             release.set()
             report = await task
         finally:
@@ -339,11 +343,13 @@ async def test_matrix_bounds_parallel_trials_and_isolates_budgets(
     assert sum(t["status"] == "error" for t in report["trials"]) == 1
     assert read_report(path)["trials"] == report["trials"]
     assert report["config"]["max_concurrency"] == concurrency
+    assert capsys.readouterr().err.splitlines()[-1] == "Progress: 6/6 finished, 0 running"
 
 
 async def test_parallel_completion_is_flushed_before_slow_trial_and_cancellation_cleans_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     import sqlite3
 
@@ -392,6 +398,7 @@ async def test_parallel_completion_is_flushed_before_slow_trial_and_cancellation
             with pytest.raises(asyncio.CancelledError):
                 await task
     assert cancelled.is_set()
+    assert capsys.readouterr().err.splitlines()[-1] == "Progress: 3/4 finished, 0 running"
     assert len(read_report(path)["trials"]) == 3
     for env in environments:
         with pytest.raises(sqlite3.ProgrammingError, match="closed"):
@@ -449,3 +456,81 @@ def test_cli_concurrency_override_is_validated_and_saved(
         main()
     assert valid.value.code == 0
     assert read_report(output)["config"]["max_concurrency"] == 3
+
+
+@pytest.mark.parametrize("invalid_axis", [None, "models", "strategies", "families", "seeds"])
+def test_cli_selects_config_subset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    invalid_axis: str | None,
+) -> None:
+    import sys
+
+    from poc.evaluation.suite.__main__ import main
+    from poc.evaluation.suite.models import ArchitectureOptions
+
+    matrix = Matrix(
+        models=[
+            ModelSpec(name="offline", model_class="baseline", model="offline"),
+            ModelSpec(name="unused", model_class="7B", model="unused", base_url_env="ABSENT"),
+        ],
+        strategies=["sql-baseline", "review"],
+        families=["ledger", "access", "dependencies"],
+        seeds=[0, 1, 2],
+        repetitions=2,
+        architecture_options={"review": ArchitectureOptions(candidate_submission=True)},
+    )
+    config = tmp_path / "config.json"
+    config.write_text(matrix.model_dump_json())
+    output = tmp_path / "subset.jsonl"
+    argv = [
+        "suite",
+        "--no-env-file",
+        "run",
+        "--config",
+        str(config),
+        "--output",
+        str(output),
+        "--models",
+        "offline",
+        "--strategies",
+        "sql-baseline",
+        "--families",
+        "access",
+        "ledger",
+        "--seeds",
+        "2",
+        "0",
+        "--seeds",
+        "2",
+    ]
+    if invalid_axis:
+        argv.extend([f"--{invalid_axis}", "99" if invalid_axis == "seeds" else "unknown"])
+    monkeypatch.setenv("PHOENIX_ENABLED", "0")
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as result:
+        main()
+    if invalid_axis:
+        assert result.value.code == 2
+        assert "values not in config" in capsys.readouterr().err
+        assert not output.exists()
+        return
+    assert result.value.code == 0
+    report = read_report(output)
+    assert report["coverage"] == {"expected": 8, "recorded": 8, "missing": 0, "complete": True}
+    assert report["config"] == {
+        **matrix.model_dump(),
+        "models": [matrix.models[0].model_dump()],
+        "strategies": ["sql-baseline"],
+        "families": ["ledger", "access"],
+        "seeds": [0, 2],
+        "architecture_options": {},
+    }
+    assert config.read_text() == matrix.model_dump_json()
+    assert "Progress: 8/8 finished, 0 running" in capsys.readouterr().err
+    monkeypatch.setattr(sys, "argv", [*argv, "--resume"])
+    with pytest.raises(SystemExit) as resumed:
+        main()
+    assert resumed.value.code == 0
+    assert len(read_report(output)["trials"]) == 8

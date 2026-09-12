@@ -186,7 +186,7 @@ def test_public_diagnostics_and_shared_validation_budget() -> None:
 
 
 async def test_execution_resume_preserves_failed_trials_and_rejects_drift(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     cfg = matrix().model_copy(
         update={"strategies": ["resume-test"], "repetitions": 4, "max_concurrency": 1}
@@ -210,13 +210,18 @@ async def test_execution_resume_preserves_failed_trials_and_rejects_drift(
     assert len(read_report(path)["trials"]) == 2
     with path.open("ab") as f:
         f.write(b'{"trial":')
+    capsys.readouterr()
     await run_matrix(cfg, path, resume=True)
+    progress = capsys.readouterr().err.splitlines()
+    assert progress[0] == "Progress: 2/4 finished, 0 running"
+    assert progress[-1] == "Progress: 4/4 finished, 0 running"
     assert count == 5
     report = read_report(path)
     assert report["coverage"] == {"expected": 4, "recorded": 4, "missing": 0, "complete": True}
     assert sum(t["status"] == "error" for t in report["trials"]) == 1
     assert path.with_suffix(".jsonl.interrupted").exists()
     await run_matrix(cfg, path, resume=True)
+    assert capsys.readouterr().err.strip() == "Progress: 4/4 finished, 0 running"
     assert count == 5
     with pytest.raises(ValueError, match="config changed"):
         await run_matrix(cfg.model_copy(update={"max_concurrency": 2}), path, resume=True)

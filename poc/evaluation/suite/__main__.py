@@ -40,6 +40,17 @@ def main() -> None:
     run = commands.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
+    for axis in ("models", "strategies", "families", "seeds"):
+        run.add_argument(
+            f"--{axis}",
+            nargs="+",
+            action="extend",
+            type=int if axis == "seeds" else str,
+            help=(
+                f"Select configured {axis} (space-separated; repeatable; default: all)"
+                + (". Use model names, not provider IDs" if axis == "models" else "")
+            ),
+        )
     run.add_argument(
         "--max-concurrency",
         type=int,
@@ -89,10 +100,31 @@ def main() -> None:
         print(json.dumps(receipt, indent=2))
         return
     matrix = Matrix.model_validate_json(args.config.read_bytes())
+    selected = matrix.model_dump()
+    for axis in ("models", "strategies", "families", "seeds"):
+        requested = getattr(args, axis)
+        if requested is None:
+            continue
+        available = [m.name for m in matrix.models] if axis == "models" else selected[axis]
+        unknown = set(requested) - set(available)
+        if unknown:
+            parser.error(
+                f"--{axis}: values not in config: {', '.join(map(str, sorted(unknown)))}; "
+                f"available: {', '.join(map(str, available))}"
+            )
+        selected[axis] = [
+            value
+            for value in selected[axis]
+            if (value["name"] if axis == "models" else value) in requested
+        ]
+    selected["architecture_options"] = {
+        key: value
+        for key, value in selected["architecture_options"].items()
+        if key in selected["strategies"]
+    }
     if args.max_concurrency is not None:
-        matrix = Matrix.model_validate(
-            {**matrix.model_dump(), "max_concurrency": args.max_concurrency}
-        )
+        selected["max_concurrency"] = args.max_concurrency
+    matrix = Matrix.model_validate(selected)
     provider = configure_telemetry(instrument_providers=False)
     try:
         report = asyncio.run(run_matrix(matrix, args.output, resume=args.resume))
