@@ -79,7 +79,9 @@ dependencies are declared in `pyproject.toml`; install Phoenix instrumentation w
 docker compose up --build
 ```
 
-This starts one application process and a pinned Phoenix 14.0.0 container. Application
+This starts one application process and a pinned Phoenix 20 non-root container. A
+short-lived initialization container grants Phoenix's UID access to its named volume
+before the server starts. Application
 state, LangGraph checkpoints, immutable artifacts, and Phoenix data use separate
 persistent storage. The application journal is authoritative; telemetry export is
 best-effort. Phoenix's server license is Elastic License 2.0, the licensing exception

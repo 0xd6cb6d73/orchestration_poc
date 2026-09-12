@@ -24,9 +24,20 @@ services:
       retries: 10
       start_period: 10s
 
+  phoenix-data-init:
+    image: alpine:3.22.1
+    user: "0:0"
+    command: ["chown", "-R", "65532:65532", "/mnt/data"]
+    restart: "no"
+    volumes:
+      - phoenix_data:/mnt/data
+
   phoenix:
-    image: arizephoenix/phoenix:version-14.0.0
+    image: arizephoenix/phoenix:version-20-nonroot
     restart: unless-stopped
+    depends_on:
+      phoenix-data-init:
+        condition: service_completed_successfully
     environment:
       PHOENIX_WORKING_DIR: /mnt/data
       PHOENIX_ALLOW_EXTERNAL_RESOURCES: "false"
