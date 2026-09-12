@@ -4,18 +4,26 @@ import hashlib
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-class TaskInput(StrictModel):
-    """The complete public interface; references never cross the adapter boundary."""
-
-    prompt: str
-    tables: dict[str, list[dict[str, Any]]]
+from poc.execution.sql_contracts import (
+    Answer as Answer,
+)
+from poc.execution.sql_contracts import (
+    ArchitectureOptions as ArchitectureOptions,
+)
+from poc.execution.sql_contracts import (
+    Budget as Budget,
+)
+from poc.execution.sql_contracts import (
+    ModelSpec as ModelSpec,
+)
+from poc.execution.sql_contracts import (
+    StrictModel,
+)
+from poc.execution.sql_contracts import (
+    TaskInput as TaskInput,
+)
 
 
 class TaskCase(StrictModel):
@@ -31,49 +39,6 @@ class TaskCase(StrictModel):
     @property
     def digest(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
-
-
-class Budget(StrictModel):
-    requests: int = Field(default=40, ge=1)
-    tool_calls: int = Field(default=80, ge=1)
-    total_tokens: int = Field(default=100000, ge=1)
-    seconds: float = Field(default=300, gt=0)
-    request_timeout_seconds: float | None = Field(default=None, gt=0)
-    max_output_tokens: int | None = Field(default=None, ge=1)
-    finalization_seconds: float = Field(default=0, ge=0)
-    finalization_tokens: int = Field(default=0, ge=0)
-    finalization_requests: int = Field(default=0, ge=0)
-    draft_fraction: float = Field(default=1, gt=0, le=1)
-
-    @model_validator(mode="after")
-    def valid_reserves(self) -> Budget:
-        if self.finalization_seconds >= self.seconds:
-            raise ValueError("finalization_seconds must be less than seconds")
-        if self.finalization_tokens >= self.total_tokens:
-            raise ValueError("finalization_tokens must be less than total_tokens")
-        if self.finalization_requests >= self.requests:
-            raise ValueError("finalization_requests must be less than requests")
-        return self
-
-
-class ArchitectureOptions(StrictModel):
-    """Explicit interventions; baseline strategies receive no additional assistance."""
-
-    candidate_submission: bool = False
-    output_validation: bool = False
-    constraint_feedback: bool = False
-    output_retries: int = Field(default=1, ge=0)
-
-
-class ModelSpec(StrictModel):
-    name: str
-    model_class: Literal["7B", "27B", "100B", "frontier-flash", "baseline"]
-    model: str
-    base_url_env: str | None = None
-    api_key_env: str = "OPENAI_API_KEY"
-    settings: dict[str, Any] = Field(default_factory=lambda: {"temperature": 0})
-    input_usd_per_million: float | None = Field(default=None, ge=0)
-    output_usd_per_million: float | None = Field(default=None, ge=0)
 
 
 class Matrix(StrictModel):
@@ -96,11 +61,20 @@ class Matrix(StrictModel):
                 raise ValueError("matrix axes must contain unique values")
         if set(self.architecture_options) - set(self.strategies):
             raise ValueError("architecture_options must refer to configured strategies")
+        for strategy, options in self.architecture_options.items():
+            allowed_phases = (
+                {"draft", "review", "finalize"}
+                if strategy in {"review", "review-json"}
+                else {"solve", "finalize"}
+            )
+            if set(options.phase_models) - allowed_phases:
+                raise ValueError("phase_models contains phases unused by this strategy")
+            if options.review_failure_policy != "fail" and strategy not in {
+                "review",
+                "review-json",
+            }:
+                raise ValueError("review_failure_policy requires review or review-json")
         return self
-
-
-class Answer(StrictModel):
-    values: dict[str, Any]
 
 
 def grade(case: TaskCase, answer: Answer) -> dict[str, float]:

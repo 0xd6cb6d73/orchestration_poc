@@ -219,6 +219,9 @@ def _publish(report: dict[str, Any], client: Any, receipt_path: Path | None) -> 
         receipt["runs"][key] = run["id"]
         save()
         scores = dict(trial["scores"])
+        if "recovered" in trial:
+            scores["recovered"] = float(trial["recovered"])
+            scores["review_completed"] = float(trial["review_outcome"] == "completed")
         diag = trial.get("diagnostics", {})
         if diag.get("answer_valid") is not None:
             scores["answer_valid"] = float(diag["answer_valid"])

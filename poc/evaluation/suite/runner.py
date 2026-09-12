@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import os
 import random
 import statistics
@@ -31,7 +32,14 @@ from poc.evaluation.suite.tasks import FACTORIES, GRADERS, generate
 
 def implementation_digest() -> str:
     digest = hashlib.sha256()
-    for path in sorted(Path(__file__).parent.glob("*.py")):
+    paths = [
+        *Path(__file__).parent.glob("*.py"),
+        *[
+            Path(__file__).resolve().parents[2] / "execution" / name
+            for name in ("review.py", "sql_contracts.py", "sql_ports.py", "sql_strategy.py")
+        ],
+    ]
+    for path in sorted(paths):
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
     lockfile = Path(__file__).resolve().parents[3] / "uv.lock"
@@ -74,6 +82,9 @@ async def run_trial(
     usage = RunUsage()
     env = TaskEnvironment(case.input, matrix.budget.tool_calls)
     env.state = TrialState(case.input, matrix.architecture_options.get(strategy), emit)
+    # Both timeout scopes share an absolute deadline, including setup time.
+    env.state.started = started
+    deadline = started + matrix.budget.seconds
     answer = Answer(values={})
     error: str | None = None
     error_status_code: int | None = None
@@ -90,7 +101,7 @@ async def run_trial(
         trace_id = format(context.trace_id, "032x") if context.is_valid else None
         try:
             model = "test" if strategy == "sql-baseline" else resolve_model(spec)
-            async with asyncio.timeout(matrix.budget.seconds):
+            async with asyncio.timeout(max(0, deadline - perf_counter())):
                 answer = await ADAPTERS[strategy](
                     case.input.model_copy(deep=True),
                     env,
@@ -117,6 +128,16 @@ async def run_trial(
             error_status_code = getattr(exc, "status_code", None)
         finally:
             env.close()
+        recovery = env.state.recovery if status == "completed" else None
+        review_phase = next((p for p in env.state.phases if p["name"] == "review"), None)
+        review_outcome = review_phase["status"] if review_phase else "not_started"
+        answer_source = (
+            env.state.answer_source
+            if status == "completed" and env.state.answer_source
+            else env.state.phase
+            if status == "completed"
+            else "none"
+        )
         if status == "completed" and not env.state.candidates:
             env.state.candidate(answer, "adapter_return")
         scores = (
@@ -130,6 +151,11 @@ async def run_trial(
         for name, score in scores.items():
             span.set_attribute(f"evaluation.{name}", score)
         span.set_attribute("evaluation.status", status)
+        span.set_attribute("evaluation.recovered", recovery is not None)
+        span.set_attribute("evaluation.answer_source", answer_source)
+        span.set_attribute("evaluation.review_outcome", review_outcome)
+        if recovery:
+            span.set_attribute("evaluation.recovery", json.dumps(recovery))
         span.set_attribute("evaluation.request_attempts", env.state.request_attempts)
         span.set_attribute("evaluation.request_responses", env.state.request_responses)
         if env.state.request_attempts:
@@ -141,15 +167,28 @@ async def run_trial(
         if error is not None:
             span.set_status(trace.Status(trace.StatusCode.ERROR, error))
     cost = None
-    if (
-        spec.input_usd_per_million is not None
-        and spec.output_usd_per_million is not None
-        and env.state.usage_complete
-    ):
-        cost = (
-            usage.input_tokens * spec.input_usd_per_million
-            + usage.output_tokens * spec.output_usd_per_million
-        ) / 1_000_000
+    if env.state.usage_complete:
+        priced_phases: list[float] = []
+        for phase in env.state.phases:
+            binding = phase.get("model_binding") or spec.model_dump()
+            input_rate, output_rate = (
+                binding.get("input_usd_per_million"),
+                binding.get("output_usd_per_million"),
+            )
+            if input_rate is None or output_rate is None:
+                break
+            priced_phases.append(
+                (phase["input_tokens"] * input_rate + phase["output_tokens"] * output_rate)
+                / 1_000_000
+            )
+        else:
+            if env.state.phases:
+                cost = sum(priced_phases)
+            elif spec.input_usd_per_million is not None and spec.output_usd_per_million is not None:
+                cost = (
+                    usage.input_tokens * spec.input_usd_per_million
+                    + usage.output_tokens * spec.output_usd_per_million
+                ) / 1_000_000
     return {
         "case_id": case.id,
         "case_sha256": case.digest,
@@ -159,6 +198,10 @@ async def run_trial(
         "strategy": strategy,
         "repetition": repetition,
         "status": status,
+        "recovered": recovery is not None,
+        "recovery": recovery,
+        "answer_source": answer_source,
+        "review_outcome": review_outcome,
         "error": error,
         "error_status_code": error_status_code,
         "scores": scores,
@@ -167,7 +210,7 @@ async def run_trial(
         "validation_calls": env.validation_calls,
         "total_tool_calls": env.tool_calls,
         "diagnostics": diagnose(case.input, answer),
-        "candidates": env.state.candidates,
+        "candidates": env.state.diagnostic_candidates,
         "best_candidate": env.state.best_candidate(),
         "phases": env.state.phases,
         "review_started": any(p["name"] == "review" for p in env.state.phases),
@@ -257,6 +300,9 @@ def summarize(trials: list[dict[str, Any]], matrix: Matrix | None = None) -> lis
                     for r in rows
                 ),
                 "review_started": sum(r.get("review_started", False) for r in rows),
+                "review_completed": sum(r.get("review_outcome") == "completed" for r in rows),
+                "recovered": sum(r.get("recovered", False) for r in rows),
+                "recovery_rate": statistics.mean(bool(r.get("recovered")) for r in rows),
                 "usage_complete": all(r.get("usage_complete") is True for r in rows),
             }
         )
@@ -269,6 +315,10 @@ async def run_matrix(matrix: Matrix, output: Path, *, resume: bool = False) -> d
 
 
 async def _run_matrix(matrix: Matrix, output: Path, *, resume: bool) -> dict[str, Any]:
+    if any(
+        o.output_validation or o.constraint_feedback for o in matrix.architecture_options.values()
+    ):
+        raise ValueError("grader feedback is not available to orchestration strategies")
     unknown = set(matrix.strategies) - ADAPTERS.keys()
     if unknown:
         raise ValueError(f"unknown adapters: {sorted(unknown)}")
@@ -311,7 +361,15 @@ async def _run_matrix(matrix: Matrix, output: Path, *, resume: bool) -> dict[str
         not in completed
     ]
     if schedule and set(matrix.strategies) & {"single", "review", "single-json", "review-json"}:
-        for spec in matrix.models:
+        configured_models = [
+            *matrix.models,
+            *[
+                m
+                for options in matrix.architecture_options.values()
+                for m in options.phase_models.values()
+            ],
+        ]
+        for spec in configured_models:
             if spec.base_url_env:
                 for key in (spec.base_url_env, spec.api_key_env):
                     if not os.environ.get(key):

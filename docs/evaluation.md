@@ -132,8 +132,8 @@ For an OpenAI-compatible local server, change the environment variable reference
 `base_url_env` and use `provider:model`. Install its provider extra separately if needed.
 
 `single` runs one tool-using agent. `review` runs a drafter and a fresh reviewing agent
-that receives the draft and can inspect the same database. Both stages use the same
-model, share request/token/tool limits and share one wall-clock timeout. They use native
+that receives the draft and can inspect the same database. Both stages default to the matrix model; explicit execution phase bindings can override it.
+They share request/token/tool limits and share one wall-clock timeout. They use native
 function calling. `single-json` and `review-json` offer an explicit text JSON action
 protocol for endpoints without native tools. Do not pool scores from different protocols.
 `sql-baseline` is an independent deterministic reference implementation for the three
@@ -260,112 +260,97 @@ cache outside the repository. Commit the script and metadata only. Never include
 corpora in a plugin module or in fixtures. Tests can use generated miniature examples.
 
 
-## Reliability, diagnostics, and architecture interventions
+## Benchmark boundary and execution strategies
 
-Task generators, task prompts and official scoring rules are unchanged. A fully feasible
-final answer is still required to pass scheduling/routing. The evaluator does not correct
-answers, infer candidates from arbitrary SQL or reasoning text, promote checkpoints to
-passes, shorten SQL error loops, or add solver hints. All models/cohorts use the same
-rules. Model size is a reporting label, not a control-flow condition.
+The harness provides public task inputs, the same read-only SQL tool, hard trial resource
+limits, observations, and final grading. It never chooses a final answer, rescues a timed-out
+strategy, feeds constraint scores back to a model, or chooses a diagnostic best candidate.
+Task generation, reference answers, difficulty, SQL limits and official grading are unchanged.
 
-Every terminal record contains separate execution `status`, `diagnostics.answer_valid`,
-`diagnostics.feasible`, official `scores`, and per-constraint passed/total counts with
-violation evidence. Invalid shape gates retain the original zero-score semantics.
-Scheduling's `job_window` count combines release, deadline and horizon exactly as before;
-its overlap score still counts adjacent intervals. Routing still checks contiguous
-positions, capacities, service-start windows and return deadlines. Partial fractions are
-not a percentage of independently solved tasks. Diagnostics for private-reference families
-do not disclose correct values. Unregistered public schemas have unknown validity rather
-than an invented validator.
+`poc/execution/sql_strategy.py` implements the reusable single/review strategies;
+`poc/evaluation/suite/adapters.py` only binds them to the benchmark registry. Execution
+contracts and ports have no imports from the evaluation package. The local SQL oracle
+remains a harness self-check, not a competitive model strategy.
 
-The built-in adapters checkpoint structured outputs (including drafts and rejected output
-attempts) for operators. `best_candidate` is a **diagnostic** selection by public feasibility,
-constraint fraction and shape, never the official answer and never a private-reference
-oracle. Candidate and phase events are also written before the terminal trial, so an
-interrupted process does not erase them. A timeout/reviewer error still receives official
-zero scores even if a feasible candidate was saved. To checkpoint an intermediate answer
-before it is returned, an architecture must explicitly enable and use candidate submission.
+The execution layer owns prompts, internal phase allocations, model selection, retries,
+and submission/failure policies. `ArchitectureOptions` and `Budget` are persisted execution
+configuration, re-exported by the suite for compatibility; internal allocations do not
+increase the harness's hard total budget. The current SQL strategies are small reference
+strategies, not adapters for every hierarchical, board, pool or speculative runtime. Results
+from them must not be presented as measurements of those other runtimes.
 
-Model-visible assistance is opt-in per strategy and recorded in both report and Phoenix
-experiment metadata. For example, this matrix fragment defines an assisted review
-architecture; it is not equivalent to the default `review`:
+### Observations are not assistance
+
+Candidate snapshots may carry offline diagnostics for analysis; only a checkpoint
+acknowledgement (`{"recorded": true}`) is returned to an agent. There is no
+`validate_candidate` environment tool and no grader-based output repair. Legacy
+`output_validation` and `constraint_feedback` fields are retained so archived reports can
+be inspected and published, but new runs reject either field set to true.
+
+`best_candidate` remains diagnostic only. Invalid outputs receive the same zero-score
+semantics; a full but infeasible answer is scored normally. A fully feasible answer is
+still required to pass scheduling/routing. Fractional scores count constraint checks, not
+independently solved tasks. No unknown/private-reference correctness is inferred.
+
+### Execution-owned review failure policy
+
+`poc/execution/review.py::review_submission` accepts a typed submitted draft and a reviewer
+callback. It has no task tables, grader, expected answer, or model dependency. Its default
+is to propagate review errors. With `review_failure_policy=return_submitted_draft`, the SQL
+strategy retains its submitted draft after an explicitly recoverable internal review error.
+Retention is based on submission provenance, never on benchmark correctness or coverage.
+An empty or incorrect typed draft can therefore be retained and still score zero. A normal
+review response takes precedence; this controller is not a correctness selector.
+
+The harness's outer timeout and external cancellation always remain failures. Strategies
+must reserve enough time to handle internal deadlines and return before the hard deadline.
+An unfinished draft checkpoint cannot be passed off as a completed draft. Finalization,
+when configured, requires a new model submission using the latest checkpoint, never the
+best-by-score candidate. Per-request, request-count and token limits are cumulative.
+
+A returned fallback is recorded as `answer_source=draft_fallback`, `recovered=true`, with
+its reviewer error class and phase. This is execution telemetry, not a harness decision.
+Summaries and Phoenix expose review completion and recovery separately from answer scores.
+`configs/evaluation-review-recovery.json` is an experimental allocation, not a recommended
+setting: the seed-0 pilot found its 60% draft fraction too short, and a 90% follow-up did
+not produce a draft either. No historical reports are rescored under this revised boundary.
+
+### Heterogeneous phase bindings
+
+By default every phase uses the matrix model and settings. Assign another model explicitly:
 
 ```json
 {
   "architecture_options": {
     "review": {
-      "candidate_submission": true,
-      "output_validation": true,
-      "constraint_feedback": true,
-      "output_retries": 1
+      "review_failure_policy": "return_submitted_draft",
+      "phase_models": {
+        "review": {
+          "name": "independent-reviewer",
+          "model_class": "27B",
+          "model": "qwen/qwen3.8-27b",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {"temperature": 0}
+        }
+      }
     }
   }
 }
 ```
 
-- `candidate_submission` exposes `submit_candidate(values)`. Its default response only
-  acknowledges storage, revealing neither validity nor constraint results.
-- `output_validation` rejects incomplete or malformed final mappings with structural
-  feedback and a bounded number of model repair attempts. It does not reject a properly
-  shaped answer for being infeasible. With candidate submission it also reports shape.
-- `constraint_feedback` exposes a budgeted `validate_candidate(values)` tool using public
-  constraints only. It includes the same feedback in candidate submission and validates
-  the draft before review, charging a tool call. No reference answer or solving algorithm
-  enters the prompt.
-- SQL, candidate submission and validation consume one shared tool-call budget. Repeated
-  queries and repeated SQL errors are still permitted up to the ordinary budget, with no
-  special retry suppression or targeted SQL guidance.
+This illustrates configuration, not a recommendation for that model. Bindings support
+`draft`, `review`, `finalize` for review strategies, and `solve`, `finalize` for single
+strategies. Unspecified phases retain the matrix model. Each binding has its own provider,
+settings and optional prices. Every phase records its binding and token deltas; totals
+share one `RunUsage`. Cost sums each phase using its actual binding's prices and remains
+unknown if any price or usage is missing. SDK-internal retries are not separately counted.
 
-The text-JSON adapters expose the equivalent explicit actions `{"candidate": {...}}`
-and `{"validate": {...}}` only when those options are enabled. Default `single`, `review`,
-`single-json` and `review-json` retain their original tool surfaces and model-visible
-feedback. Do not pool results from different architecture options just because the strategy
-names match. Built-in options affect the reference adapters; custom plugins must explicitly
-implement the same contracts if they want comparable interventions.
+Phase bindings are included in saved configuration and Phoenix metadata. Source digests
+include the execution implementation, and changed assignments/configuration invalidate
+resume. Give each model team a separate report/configuration when comparing teams; the
+matrix model label alone no longer describes all models involved. Role-wide settings or
+provider overrides must not silently relabel an existing cohort.
 
-Optional budget fields apply to built-in adapters:
-
-```json
-{
-  "budget": {
-    "seconds": 300,
-    "requests": 40,
-    "tool_calls": 80,
-    "total_tokens": 100000,
-    "request_timeout_seconds": 90,
-    "max_output_tokens": 8192,
-    "draft_fraction": 0.6,
-    "finalization_seconds": 20,
-    "finalization_tokens": 5000,
-    "finalization_requests": 2
-  }
-}
-```
-
-These values are an example policy, not new recommended model limits. The defaults are no
-request/output cap, `draft_fraction=1`, and zero finalization reserves, retaining the original
-allocation. Set policies before comparing architectures; do not tune them after seeing test
-answers. `draft_fraction` partitions the non-finalization wall time, reported-token ceiling
-and request allowance between draft and review. Limits remain cumulative across phases.
-When a work phase exhausts its allocation and a checkpoint exists, finalization can use the
-reserved budget for a **new model submission** with no tools. It receives the latest
-checkpoint, not the evaluator's best-by-score selection. If that submission fails, the
-checkpoint remains diagnostic only. A draft that exhausts its reserved portion can pass its
-latest checkpoint to review. Without an explicit checkpoint it cannot fabricate a draft.
-
-Reported token ceilings are checked after responses; an unexpectedly large response or
-prompt can overshoot a phase reserve. These are not hard provider-side admission guarantees.
-Output caps bound generation, and every phase remains inside the whole-trial limits.
-Per-request timeouts have a distinct `request_timeout` status. Trials record solve/draft/
-review/finalize phase timing, phase outcome, whether review started, and the exhausted phase.
-
-The suite disables SDK-level instrumentation when configuring telemetry, retaining Pydantic
-AI model spans as the single model-call instrumentation layer. Trial usage remains the
-canonical aggregate. Request attempts/responses and `usage_complete` distinguish missing
-usage after cancellations/provider errors from genuinely zero usage; costs remain null when
-usage is incomplete. Legacy usage completeness is unknown. Provider-internal retries are
-not separately counted as adapter requests.
-
-Reports show expected/recorded coverage, including zero-run cells, and matched case/repetition
-single-versus-review comparisons. Unmatched trials are counted and excluded from deltas.
-No significance claim is generated. Empty or incomplete coverage is not a model ranking.
+See [the orchestration investigation](orchestration-model-routing.md) for existing
+per-task model support, strategy-specific gaps, and a fair experimental design.

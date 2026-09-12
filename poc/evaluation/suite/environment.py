@@ -105,19 +105,4 @@ class TaskEnvironment:
         answer = Answer(values=values)
         self.validation_calls.append({"action": "submit_candidate", "values": answer.model_dump()})
         self.state.candidate(answer, "submitted")
-        if self.state.options.constraint_feedback:
-            return self.state.feedback(answer, constraints=True)
-        if self.state.options.output_validation:
-            return self.state.feedback(answer, constraints=False)
         return {"recorded": True}
-
-    def validate_candidate(self, values: dict[str, Any]) -> dict[str, Any]:
-        if self.tool_calls >= self.max_calls:
-            raise ToolBudgetExceeded("shared tool-call budget exhausted")
-        answer = Answer(values=values)
-        result = self.state.feedback(answer, constraints=True)
-        self.validation_calls.append(
-            {"action": "validate_candidate", "values": answer.model_dump(), "result": result}
-        )
-        self.state.candidate(answer, "validated")
-        return result

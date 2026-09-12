@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from pydantic_ai import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from poc.evaluation.suite import runner
@@ -53,24 +54,13 @@ async def test_baseline_has_no_extra_tools_or_feedback(monkeypatch: pytest.Monke
     assert t["candidates"][0]["answer"]["values"] == {"error": "bad SQL"}
 
 
-async def test_explicit_output_validation_repairs_shape_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    case = generate("scheduling", 0, "dev", "standard")
-    calls = 0
-
-    async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        nonlocal calls
-        calls += 1
-        # A full but infeasible answer must still be scored normally, without repair hints.
-        values = {} if calls == 1 else dict.fromkeys(case.expected, 0)
-        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"values": values})])
-
-    monkeypatch.setattr(runner, "resolve_model", partial(_model_for_spec, FunctionModel(model)))
-    cfg = matrix(architecture_options={"single": ArchitectureOptions(output_validation=True)})
-    t = await run_trial(case, cfg.models[0], "single", 1, cfg)
-    assert calls == 2 and t["status"] == "completed"
-    assert t["diagnostics"]["answer_valid"] is True and t["scores"]["exact"] == 0
+@pytest.mark.parametrize("option", ["output_validation", "constraint_feedback"])
+async def test_grader_assistance_is_rejected(option: str, tmp_path: Path) -> None:
+    cfg = matrix(
+        architecture_options={"single": ArchitectureOptions.model_validate({option: True})}
+    )
+    with pytest.raises(ValueError, match="grader feedback"):
+        await run_matrix(cfg, tmp_path / "rejected.jsonl")
 
 
 async def test_checkpoint_survives_timeout_without_becoming_a_pass(
@@ -178,7 +168,8 @@ def test_public_diagnostics_and_shared_validation_budget() -> None:
     env = TaskEnvironment(case.input, 2)
     try:
         assert env.submit_candidate(case.expected) == {"recorded": True}
-        assert env.validate_candidate(answer)["feasible"] is False
+        assert env.submit_candidate(answer) == {"recorded": True}
+        assert not hasattr(env, "validate_candidate")
         with pytest.raises(RuntimeError, match="budget"):
             env.query("SELECT 1")
     finally:
@@ -349,12 +340,58 @@ async def test_publication_recovers_lost_responses_without_duplicates(
     publish(report, client, receipt_path=receipt_path)
     assert len(client.exps) == 1 and len(client.runs) == 2
     assert receipt["published_runs"] == 2
-    assert len(client.evaluations) == 6
+    assert len(client.evaluations) == 10
     check = reconcile(report, receipt, client)
     assert check["unpublished"] == check["mismatched"] == []
     report["config"]["max_concurrency"] = 99
     with pytest.raises(ValueError, match="different report"):
         publish(report, client, receipt_path=receipt_path)
+
+
+async def test_recovery_report_resume_and_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = generate("scheduling", 0, "dev", "standard")
+    calls = 0
+
+    async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise UnexpectedModelBehavior("empty response")
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"values": case.expected})]
+        )
+
+    monkeypatch.setattr(runner, "resolve_model", partial(_model_for_spec, FunctionModel(model)))
+    cfg = Matrix.model_validate(
+        {
+            **matrix().model_dump(),
+            "strategies": ["review"],
+            "architecture_options": {"review": {"review_failure_policy": "return_submitted_draft"}},
+        }
+    )
+    path = tmp_path / "recovery.jsonl"
+    report = await run_matrix(cfg, path)
+    resumed = await run_matrix(cfg, path, resume=True)
+    assert calls == 2 and resumed["trials"] == report["trials"]
+    assert report["trials"][0]["recovered"]
+    assert any("recovery" in e for e in read_report(path)["events"])
+    client = FakePhoenix("")
+    receipt_path = tmp_path / "receipt.json"
+    receipt = publish(report, client, receipt_path=receipt_path)
+    publish(report, client, receipt_path=receipt_path)
+    assert client.exps[0]["metadata"]["architecture_options"]["review_failure_policy"] == (
+        "return_submitted_draft"
+    )
+    assert client.runs[0]["output"]["task_output"]["recovery"]["error"] == "UnexpectedModelBehavior"
+    assert client.evaluations["run-0", "recovered"]["score"] == 1
+    assert client.evaluations["run-0", "review_completed"]["score"] == 0
+    assert reconcile(report, receipt, client)["mismatched"] == []
+    changed = cfg.model_copy(update={"architecture_options": {"review": ArchitectureOptions()}})
+    with pytest.raises(ValueError, match="config changed"):
+        await run_matrix(changed, path, resume=True)
 
 
 @pytest.mark.parametrize("strategy", ["single", "review"])
@@ -372,7 +409,7 @@ async def test_cumulative_request_reserves_and_output_cap(
             return ModelResponse(
                 parts=[ToolCallPart("submit_candidate", {"values": case.expected})]
             )
-        if (strategy == "single" and calls <= 3) or (strategy == "review" and calls == 2):
+        if strategy == "single" and calls <= 3:
             return ModelResponse(parts=[ToolCallPart("query", {"sql": "SELECT 1"})])
         return ModelResponse(
             parts=[ToolCallPart(info.output_tools[0].name, {"values": case.expected})]
@@ -397,10 +434,10 @@ async def test_cumulative_request_reserves_and_output_cap(
     assert [p["name"] for p in t["phases"]] == (
         ["solve", "finalize"] if strategy == "single" else ["draft", "review"]
     )
-    assert t["phases"][0]["status"] == "budget_exhausted"
+    assert t["phases"][0]["status"] == ("budget_exhausted" if strategy == "single" else "completed")
 
 
-async def test_json_candidate_and_validation_are_explicit_and_budgeted(
+async def test_json_checkpoint_returns_no_grader_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from pydantic_ai import TextPart
@@ -411,23 +448,19 @@ async def test_json_candidate_and_validation_are_explicit_and_budgeted(
     async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         nonlocal calls
         calls += 1
-        action = {1: "candidate", 2: "validate"}.get(calls, "values")
+        action = "candidate" if calls == 1 else "values"
         return ModelResponse(parts=[TextPart(json.dumps({action: case.expected}))])
 
     monkeypatch.setattr(runner, "resolve_model", partial(_model_for_spec, FunctionModel(model)))
     cfg = matrix().model_copy(
         update={
             "strategies": ["single-json"],
-            "architecture_options": {
-                "single-json": ArchitectureOptions(
-                    candidate_submission=True, constraint_feedback=True
-                )
-            },
+            "architecture_options": {"single-json": ArchitectureOptions(candidate_submission=True)},
         }
     )
     t = await run_trial(case, cfg.models[0], "single-json", 1, cfg)
-    assert t["scores"]["exact"] == 1 and t["total_tool_calls"] == 2
-    assert [c["source"] for c in t["candidates"]] == ["submitted", "validated", "output"]
+    assert t["scores"]["exact"] == 1 and t["total_tool_calls"] == 1
+    assert [c["source"] for c in t["candidates"]] == ["submitted", "output"]
 
 
 def test_suite_telemetry_does_not_instrument_provider_sdks(monkeypatch: pytest.MonkeyPatch) -> None:
