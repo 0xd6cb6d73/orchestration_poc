@@ -296,6 +296,13 @@ synthesis, and exact artifact lineage. The standard workload has at least 12 wor
 tasks across four workflows. `hybrid_v1` additionally runs sealed independent
 proposals, critiques, scoring, and independent verification.
 
+For task-independent evaluation of the actual scheduler components, use the
+[SQL orchestration suite](docs/evaluation.md#models-and-strategies), which exposes all
+four modes plus hybrid, with native-tool and JSON protocols. The incident benchmark
+below records mode authority, but ordinary non-hybrid runs still use the shared DAG
+worker path; it is an incident regression check, not evidence of pool arbitration or
+speculative candidate execution.
+
 The default command runs all four orchestration modes with the same offline worker
 implementation and prints completion, quality, latency, tool, worker, and token
 metrics:

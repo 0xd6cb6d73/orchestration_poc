@@ -94,8 +94,10 @@ offline, review completion, recovery, cancelled usage, and per-phase latency.
 
 Saved-draft replay is useful to isolate reviewer behavior, with identical evidence supplied
 to every reviewer. Label it a component evaluation: it excludes drafting costs and success
-rates and cannot replace an end-to-end orchestration benchmark. Evaluate real hierarchical,
-board, pool and speculative implementations through thin adapters before comparing them.
+rates and cannot replace an end-to-end orchestration benchmark. The suite now provides generic SQL adapters for the hierarchical,
+board, pool, speculative and hybrid controllers; see [evaluation methods](evaluation.md#models-and-strategies).
+Their `sql-team-v1` policies use serial model calls and fixed team shapes, so those comparisons
+do not measure parallel fanout latency or the incident workflow.
 
 The next bounded experiment should compare a small fixed set of model teams and one
 execution policy at a time. Do not add automatic constraint feedback or retune the task

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from poc.evaluation.suite.adapters import ADAPTERS
 from poc.evaluation.suite.models import Matrix
 from poc.evaluation.suite.phoenix import publish, reconcile
 from poc.evaluation.suite.runner import read_report, run_matrix
@@ -37,6 +38,7 @@ def main() -> None:
         "--no-env-file", action="store_true", help="Use only exported environment variables"
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("list", help="List registered orchestration strategies and task families")
     run = commands.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
@@ -83,6 +85,11 @@ def main() -> None:
             parser.error(str(exc))
     for module in args.plugin:
         importlib.import_module(module)
+    if args.command == "list":
+        from poc.evaluation.suite.tasks import FACTORIES
+
+        print(json.dumps({"strategies": sorted(ADAPTERS), "families": sorted(FACTORIES)}, indent=2))
+        return
     if args.command == "inspect":
         report = read_report(args.report)
         result = {k: report[k] for k in ("coverage", "summaries", "comparisons")}

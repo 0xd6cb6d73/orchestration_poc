@@ -32,15 +32,11 @@ from poc.evaluation.suite.tasks import FACTORIES, GRADERS, generate
 
 def implementation_digest() -> str:
     digest = hashlib.sha256()
-    paths = [
-        *Path(__file__).parent.glob("*.py"),
-        *[
-            Path(__file__).resolve().parents[2] / "execution" / name
-            for name in ("review.py", "sql_contracts.py", "sql_ports.py", "sql_strategy.py")
-        ],
-    ]
-    for path in sorted(paths):
-        digest.update(path.name.encode())
+    # Runtime adapters depend on the scheduler, authority, persistence and hybrid
+    # components as well as the suite. Changes in any of these invalidate resume.
+    package = Path(__file__).resolve().parents[2]
+    for path in sorted(package.rglob("*.py")):
+        digest.update(path.relative_to(package).as_posix().encode())
         digest.update(path.read_bytes())
     lockfile = Path(__file__).resolve().parents[3] / "uv.lock"
     if lockfile.exists():

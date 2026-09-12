@@ -139,10 +139,44 @@ protocol for endpoints without native tools. Do not pool scores from different p
 `sql-baseline` is an independent deterministic reference implementation for the three
 analysis families, for validating generators and graders. It does not solve scheduling.
 
-These are reference orchestration adapters, not aliases for the incident runtime's
-board-claim, managed-pool, or hybrid modes. Those modes still operate on incident-specific
-roles/tools. Connecting them to these new tasks requires a generic-task adapter; the
-public adapter interface is intentionally independent of those roles and workflow shapes.
+The suite also supports every built-in execution method through generic SQL task bindings
+in `poc/execution/sql_orchestration.py`. These invoke the existing scheduler and hybrid
+controllers with trial-local authority and storage; they do not run the incident workflow.
+
+| Strategy | SQL task policy (`sql-team-v1`) |
+| --- | --- |
+| `hierarchical_dag` | LangGraph plan → solve DAG, with a persistent execution authority record |
+| `board_claim` | Two workers claim dependency-ordered plan/solve tasks under fenced leases |
+| `managed_pool` | Two eligible pool slots bid for plan/solve offers; the pool arbitrates and completes assignments |
+| `speculative` | Two authorized independent candidate submissions, followed by a model reconciliation and persisted reconciliation decision |
+| `hybrid_v1` | Two sealed board-claimed proposals, fresh critiques, controller selection, independent model verification, and the existing acceptance/delivery gates |
+
+Every method also has a `-json` variant. Discover registered strategies (including plugins):
+
+```bash
+uv run python -m poc.evaluation.suite list
+uv run python -m poc.evaluation.suite run \
+  --config configs/evaluation-methods.json --output var/evaluation/methods.jsonl
+```
+
+The example compares all seven native model strategies on one model, two families and
+one seed (14 trials). Edit the matrix model entry for your endpoint. Subset flags select
+entries already present in that matrix; add `-json` names to the matrix to use that protocol.
+
+The SQL team policies are intentionally bounded: candidate generation and worker model
+calls within a trial are **serial**, with one shared request/token/tool budget and absolute
+deadline. This measures candidate diversity and coordination behavior, not parallel fanout
+latency or distributed worker throughput. No candidate sees another sealed proposal.
+Hybrid scores and verification are model judgments over public SQL data; the official
+grader sees only the final returned answer. Rejected verification fails the trial.
+
+All team workers use the matrix model, or the strategy's `phase_models.solve` binding.
+Review-specific options remain exclusive to `review`/`review-json`. Team adapters currently
+reject finalization reserves; configure those only for single/review strategies. Prompts,
+fanout (two), and hybrid round count (one) are versioned in the implementation, not supplied
+by the grader. Scheduler events are saved under `event.orchestration`, including the method
+and policy version. The implementation digest includes the runtime components, so scheduler
+changes invalidate resume just as strategy changes do.
 
 ## Tasks and difficulty
 
@@ -275,9 +309,10 @@ remains a harness self-check, not a competitive model strategy.
 The execution layer owns prompts, internal phase allocations, model selection, retries,
 and submission/failure policies. `ArchitectureOptions` and `Budget` are persisted execution
 configuration, re-exported by the suite for compatibility; internal allocations do not
-increase the harness's hard total budget. The current SQL strategies are small reference
-strategies, not adapters for every hierarchical, board, pool or speculative runtime. Results
-from them must not be presented as measurements of those other runtimes.
+increase the harness's hard total budget. Single/review remain small reference strategies.
+The generic team adapters exercise the existing hierarchical, board, pool, speculative
+and hybrid components using the explicit SQL policies above. Results describe those policies;
+they are not measurements of the incident workflow or concurrent/distributed scheduling.
 
 ### Observations are not assistance
 

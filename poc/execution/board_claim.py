@@ -74,7 +74,15 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
             ]
             if missing:
                 raise StrategyError(f"unknown dependencies: {missing}")
-            state = "blocked" if dependencies else "ready"
+            pending = any(
+                tx.execute(
+                    "SELECT state FROM swarm_tasks WHERE execution_id=? AND task_id=?",
+                    (execution_id, dep),
+                ).fetchone()[0]
+                != "completed"
+                for dep in dependencies
+            )
+            state = "blocked" if pending else "ready"
             try:
                 tx.execute(
                     "INSERT INTO swarm_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",

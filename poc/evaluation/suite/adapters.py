@@ -11,6 +11,7 @@ from pydantic_ai.usage import RunUsage
 
 from poc.evaluation.suite.environment import TaskEnvironment
 from poc.evaluation.suite.models import Answer, Budget, TaskInput
+from poc.execution.sql_orchestration import METHODS, adapter
 from poc.execution.sql_strategy import (
     resolve_model as resolve_model,
 )
@@ -93,3 +94,9 @@ register_adapter("sql-baseline", sql_baseline)
 
 register_adapter("single-json", single_json)
 register_adapter("review-json", review_json)
+
+# Bind the real execution controllers, with the same public task/tool boundary.
+
+for method in METHODS:
+    register_adapter(method, adapter(method))
+    register_adapter(f"{method}-json", adapter(method, json_protocol=True))
