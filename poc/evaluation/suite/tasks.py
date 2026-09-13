@@ -5,6 +5,8 @@ import random
 from collections.abc import Callable
 from typing import Any
 
+from poc.evaluation.authorization.generator import authorization
+from poc.evaluation.authorization.grading import grade_authorization
 from poc.evaluation.suite.coordination_tasks import dependency_join
 from poc.evaluation.suite.models import Answer, TaskCase, TaskInput, grade
 from poc.evaluation.suite.routing import grade_routing, routing
@@ -164,6 +166,8 @@ register_task("access", access)
 register_task("scheduling", scheduling, grade_schedule)
 
 register_task("routing", routing, grade_routing)
+
+register_task("authorization", authorization, grade_authorization)
 
 
 def partitioned_ledger(rng: random.Random, size: int) -> tuple[TaskInput, dict[str, Any]]:

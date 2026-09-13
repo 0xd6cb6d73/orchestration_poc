@@ -21,6 +21,24 @@ class TaskEnvironment:
         self.state = TrialState(task)
         self.validation_calls: list[dict[str, Any]] = []
         self.schema: dict[str, list[str]] = {}
+        self.row_limit = 200
+        self.result_bytes = 64000
+        self.replay_calls = 0
+        if "auth_runtime" in task.tables and "auth_requests" in task.tables:
+            from poc.evaluation.authorization.simulator import AuthorizationSandbox
+
+            self.row_limit = 2000
+            self.result_bytes = 1048576
+            sandbox = AuthorizationSandbox(task.tables)
+
+            def replay(changes_json: str, request_id: str) -> str:
+                # SQLite's opcode budget does not count work inside a Python function.
+                self.replay_calls += 1
+                if self.replay_calls > 2000:
+                    raise ValueError("at most 2000 replays per SQL query")
+                return sandbox.replay(changes_json, request_id)
+
+            self.db.create_function("authz_replay", 2, replay)
         for table, rows in task.tables.items():
             if not rows:
                 raise ValueError(f"empty table without a schema: {table}")
@@ -36,7 +54,7 @@ class TaskEnvironment:
                 [tuple(row[c] for c in columns) for row in rows],
             )
         self.db.commit()
-        self.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 64000)
+        self.db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, self.result_bytes)
         self.db.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 16000)
         self.db.set_authorizer(self._authorize)
 
@@ -55,8 +73,9 @@ class TaskEnvironment:
         return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
 
     def query(self, sql: str) -> dict[str, Any]:
-        """Run read-only SQLite SQL. Up to 200 rows; use LIMIT/OFFSET to paginate.
+        """Run read-only SQLite SQL. Use LIMIT/OFFSET to paginate.
 
+        Default: 200 rows / 64KB. Task prompts may specify larger bounds.
         Joins, aggregates, window functions and recursive CTEs are available.
         """
         if self.tool_calls >= self.max_calls:
@@ -64,6 +83,7 @@ class TaskEnvironment:
         call: dict[str, Any] = {"sql": sql}
         self.calls.append(call)
         ticks = 0
+        self.replay_calls = 0
 
         def progress() -> int:
             nonlocal ticks
@@ -77,17 +97,25 @@ class TaskEnvironment:
             span.set_attribute("input.value", sql)
             try:
                 cursor = self.db.execute(sql)
-                rows = cursor.fetchmany(201)
+                rows = cursor.fetchmany(self.row_limit + 1)
                 result: dict[str, Any] = {
                     "columns": [d[0] for d in cursor.description or []],
-                    "rows": [list(row) for row in rows[:200]],
-                    "truncated": len(rows) > 200,
+                    "rows": [list(row) for row in rows[: self.row_limit]],
+                    "truncated": len(rows) > self.row_limit,
                 }
                 # Bound result size as well as row count (e.g. group_concat/hex).
-                if len(json.dumps(result)) > 64000:
-                    result = {"error": "Result exceeds 64KB; select fewer rows or columns."}
+                if len(json.dumps(result).encode("utf-8")) > self.result_bytes:
+                    result = {
+                        "error": f"Result exceeds {self.result_bytes} bytes; select fewer rows or columns."
+                    }
             except sqlite3.Error as exc:
-                result = {"error": str(exc)}
+                result = {
+                    "error": (
+                        "Replay exceeds 2000 invocations; narrow the query before replaying."
+                        if self.replay_calls > 2000
+                        else str(exc)
+                    )
+                }
             call["result"] = result
             span.set_attribute("output.value", json.dumps(result))
             return result

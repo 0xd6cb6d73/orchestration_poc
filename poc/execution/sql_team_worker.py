@@ -296,7 +296,7 @@ class TeamWorker:
         evidence: set[str] = set()
 
         def execute_query(sql: str) -> dict[str, Any]:
-            """Read-only SQLite query; 200 rows / 64KB maximum. Paginate with LIMIT/OFFSET."""
+            """Read-only SQLite query. Bounds are in the task; default 200 rows / 64KB. Paginate."""
             if self.tool_calls >= budget.tool_calls:
                 raise ToolBudgetExceeded("stage tool allocation exhausted")
             self.tool_calls += 1
@@ -343,7 +343,7 @@ class TeamWorker:
         if not self.json_protocol:
 
             async def query(sql: str) -> dict[str, Any]:
-                """Read-only SQLite query; 200 rows / 64KB maximum. Paginate with LIMIT/OFFSET."""
+                """Read-only SQLite query. Bounds are in the task; default 200 rows / 64KB. Paginate."""
                 # Pydantic runs synchronous tools in a worker thread. The environment's
                 # SQLite connection is owned by this event-loop thread.
                 return execute_query(sql)

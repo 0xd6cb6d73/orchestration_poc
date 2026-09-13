@@ -390,7 +390,8 @@ async def _solve_json(
                 else '{"values": {"id": value}} for your COMPLETE final answer. '
             )
             + "No markdown. SQLite joins, windows and recursive CTEs are supported. "
-            "Queries return at most 200 rows / 64KB; use LIMIT/OFFSET pagination. "
+            "Queries default to 200 rows / 64KB unless the task specifies larger limits; "
+            "use LIMIT/OFFSET pagination. "
             "Inspect and compute over the tables, check edge cases, never invent results."
         ),
     )
@@ -472,7 +473,7 @@ async def _solve_native(
     )
 
     async def query(sql: str) -> dict[str, Any]:
-        """Read-only SQLite query; 200 rows and 64KB maximum. Paginate with LIMIT/OFFSET."""
+        """Read-only SQLite query. Bounds are in the task; default 200 rows / 64KB. Paginate."""
         return env.query(sql)
 
     async def submit_candidate(values: dict[str, Any]) -> dict[str, Any]:

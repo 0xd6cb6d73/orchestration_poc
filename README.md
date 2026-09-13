@@ -395,6 +395,13 @@ tested in-process; worker process materialization remains a trusted runtime conc
 
 ## Task-independent orchestration evaluations
 
+The [tenant authorization incident benchmark](docs/authorization-evaluation.md) adds a
+generated multi-source investigation: identify affected tenants after an identity
+migration and repair authorization behavior without expanding permissions. Standard
+cases contain about 61 MB of public evidence; all data is generated from checked-in
+code and can be exported under ignored `var/`. Agents can replay configuration changes
+through SQL, and hidden requests check the resulting access behavior.
+
 See [the evaluation suite guide](docs/evaluation.md) for seeded reconciliation, dependency,
 access-policy, resource-constrained scheduling and vehicle-routing tasks; six configurable small-model entries;
 single-agent/review comparisons under shared budgets; and Phoenix datasets, experiments and traces.

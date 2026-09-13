@@ -192,6 +192,12 @@ changes invalidate resume just as strategy changes do.
 
 ## Tasks and difficulty
 
+The new opt-in [`authorization` incident family](authorization-evaluation.md) adds
+multi-source investigation and executable configuration repair. Standard cases contain
+roughly 61 MB of generated public evidence, with SQL replay experiments and up to 1 MiB
+tool responses. Use `configs/evaluation-authorization.json`; scheduling/routing defaults
+and their existing data/tool limits remain unchanged.
+
 All built-in data is generated in Python. No external evaluation corpus is committed or
 needed. Generated data and reports belong in ignored `var/`, not source directories.
 Cases identify generator version, seed, split, difficulty, and SHA-256. `dev` and `test`

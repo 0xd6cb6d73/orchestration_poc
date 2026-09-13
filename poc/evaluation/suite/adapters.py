@@ -64,7 +64,7 @@ async def sql_baseline(
                     (finished[p] for child, p in edges if child == job), default=0
                 )
         return Answer(values=finished)
-    else:
+    elif "queries" in env.schema and "policies" in env.schema:
         sql = """WITH RECURSIVE effective(user,group_id) AS (
         SELECT user,group_id FROM memberships UNION
         SELECT e.user,n.parent FROM effective e JOIN nesting n ON n.child=e.group_id)
@@ -73,6 +73,8 @@ async def sql_baseline(
         SUM(CASE WHEN p.effect='deny' THEN 1 ELSE 0 END)=0 THEN 'allow' ELSE 'deny' END
         FROM queries q LEFT JOIN effective e ON e.user=q.user
         LEFT JOIN policies p ON p.group_id=e.group_id AND p.resource=q.resource GROUP BY q.id"""
+    else:
+        raise ValueError("sql-baseline supports only ledger, dependencies and access")
     return Answer(values={str(row[0]): row[1] for row in _rows(env, sql)})
 
 
