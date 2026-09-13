@@ -28,6 +28,7 @@ from poc.evaluation.suite.models import Answer, Matrix, ModelSpec, TaskCase
 from poc.evaluation.suite.reports import append, comparisons, coverage, locked, records, trial_key
 from poc.evaluation.suite.runtime import RequestTimeout, ToolBudgetExceeded, TrialState
 from poc.evaluation.suite.tasks import FACTORIES, GRADERS, generate
+from poc.execution.sql_ports import PhaseTimeout, failure_details
 
 
 def implementation_digest() -> str:
@@ -84,6 +85,7 @@ async def run_trial(
     answer = Answer(values={})
     error: str | None = None
     error_status_code: int | None = None
+    failure: dict[str, Any] | None = None
     status = "completed"
     tracer = trace.get_tracer(__name__)
     with tracer.start_as_current_span("evaluation.trial") as span:
@@ -112,16 +114,61 @@ async def run_trial(
                 or env.tool_calls > matrix.budget.tool_calls
             ):
                 raise UsageLimitExceeded("shared trial budget exceeded")
-        except (UsageLimitExceeded, ToolBudgetExceeded):
-            status, error = "budget_exhausted", "shared trial budget exhausted"
-        except RequestTimeout:
+        except (UsageLimitExceeded, ToolBudgetExceeded) as exc:
+            status, error = "budget_exhausted", type(exc).__name__
+            failure = failure_details(
+                exc,
+                scope="trial",
+                stage=env.state.phase,
+                threshold={
+                    "tokens": matrix.budget.total_tokens,
+                    "requests": matrix.budget.requests,
+                    "tools": matrix.budget.tool_calls,
+                },
+                consumption={
+                    "tokens": usage.total_tokens,
+                    "requests": usage.requests,
+                    "tools": env.tool_calls,
+                },
+            )
+        except RequestTimeout as exc:
             status, error = "request_timeout", "model request timeout"
-        except TimeoutError:
+            failure = failure_details(
+                exc,
+                scope="request",
+                stage=env.state.phase,
+                threshold={"seconds": matrix.budget.request_timeout_seconds},
+                consumption={},
+            )
+        except PhaseTimeout as exc:
+            status, error = "phase_timeout", "phase wall-clock budget exhausted"
+            failure = failure_details(
+                exc,
+                scope="phase",
+                stage=env.state.phase,
+                threshold={},
+                consumption={"seconds": perf_counter() - started},
+            )
+        except TimeoutError as exc:
             status, error = "timeout", "trial wall-clock budget exhausted"
+            failure = failure_details(
+                exc,
+                scope="trial",
+                stage=env.state.phase,
+                threshold={"seconds": matrix.budget.seconds},
+                consumption={"seconds": perf_counter() - started},
+            )
         except Exception as exc:
             # Do not persist provider exception bodies, which may contain request credentials.
             status, error = "error", type(exc).__name__
             error_status_code = getattr(exc, "status_code", None)
+            failure = failure_details(
+                exc,
+                scope="request" if error_status_code else "phase",
+                stage=env.state.phase,
+                threshold={},
+                consumption={},
+            )
         finally:
             env.close()
         recovery = env.state.recovery if status == "completed" else None
@@ -201,6 +248,8 @@ async def run_trial(
         "review_decision": env.state.review_decision,
         "error": error,
         "error_status_code": error_status_code,
+        "failure": failure,
+        "submission_status": "submitted" if status == "completed" else "none",
         "scores": scores,
         "answer": answer.model_dump(),
         "tool_calls": env.calls,
@@ -212,7 +261,9 @@ async def run_trial(
         "phases": env.state.phases,
         "review_started": any(p["name"] == "review" for p in env.state.phases),
         "exhausted_phase": env.state.exhausted_phase
-        or (env.state.phase if status in {"timeout", "budget_exhausted"} else None),
+        or (
+            env.state.phase if status in {"timeout", "phase_timeout", "budget_exhausted"} else None
+        ),
         "architecture_options": env.state.options.model_dump(),
         "request_attempts": env.state.request_attempts,
         "request_responses": env.state.request_responses,
@@ -222,6 +273,7 @@ async def run_trial(
         "requests": usage.requests,
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
+        "unreported_token_reserve": env.state.unreported_token_reserve,
         "estimated_cost_usd": cost,
         "elapsed_seconds": perf_counter() - started,
         "start_time": start_time.isoformat(),
@@ -287,8 +339,11 @@ def summarize(trials: list[dict[str, Any]], matrix: Matrix | None = None) -> lis
                     r.get("total_tool_calls", len(r["tool_calls"])) for r in rows
                 ),
                 "invalid_answers": sum(
-                    r.get("diagnostics", {}).get("answer_valid") is False for r in rows
+                    r["status"] == "completed"
+                    and r.get("diagnostics", {}).get("answer_valid") is False
+                    for r in rows
                 ),
+                "no_submissions": sum(r["status"] != "completed" for r in rows),
                 "feasible_candidates": sum(
                     bool(
                         r.get("best_candidate")
@@ -357,7 +412,7 @@ async def _run_matrix(matrix: Matrix, output: Path, *, resume: bool) -> dict[str
         if trial_key({"case_id": c.id, "model_name": m.name, "strategy": s, "repetition": r})
         not in completed
     ]
-    if schedule and set(matrix.strategies) & {"single", "review", "single-json", "review-json"}:
+    if schedule and set(matrix.strategies) - {"sql-baseline"}:
         configured_models = [
             *matrix.models,
             *[

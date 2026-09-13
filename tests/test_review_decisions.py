@@ -101,7 +101,9 @@ async def test_decisions_through_adapter_preserve_actual_outputs(
         strategies=[strategy],
         architecture_options={
             strategy: ArchitectureOptions(
-                review_protocol="decision-v1", review_failure_policy="return_submitted_draft"
+                artifact_contract="legacy-v1",
+                review_protocol="decision-v1",
+                review_failure_policy="return_submitted_draft",
             )
         },
     )
@@ -143,6 +145,7 @@ async def test_invalid_decisions_have_bounded_retries_and_explicit_recovery(
         strategies=[strategy],
         architecture_options={
             strategy: ArchitectureOptions(
+                artifact_contract="legacy-v1",
                 review_protocol="decision-v1",
                 output_retries=1,
                 review_failure_policy="return_submitted_draft",

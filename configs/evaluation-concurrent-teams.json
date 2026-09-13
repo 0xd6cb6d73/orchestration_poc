@@ -1,0 +1,228 @@
+{
+  "models": [
+    {
+      "name": "qwen3.7-flash",
+      "model_class": "frontier-flash",
+      "model": "qwen/qwen3.7-flash",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "temperature": 0
+      },
+      "context_window": 1000000,
+      "role_profiles": {
+        "critique": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 25093,
+          "request_timeout_seconds": 187.37450369999806
+        },
+        "draft": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 93193,
+          "request_timeout_seconds": 945.0137724700016
+        },
+        "plan": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 10519,
+          "request_timeout_seconds": 123.46055590749984
+        },
+        "proposal": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 28783,
+          "request_timeout_seconds": 247.2123424924996
+        },
+        "review": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 82857,
+          "request_timeout_seconds": 479.2118472462471
+        },
+        "solve": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 139522,
+          "request_timeout_seconds": 1066.6284390337478
+        }
+      }
+    },
+    {
+      "name": "deepseek-v4-flash-0731",
+      "model_class": "frontier-flash",
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "temperature": 0
+      },
+      "context_window": 1048576,
+      "role_profiles": {
+        "critique": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 7398,
+          "request_timeout_seconds": 43.90522824875006
+        },
+        "draft": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 26182,
+          "request_timeout_seconds": 945.00241915875
+        },
+        "plan": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 49300,
+          "request_timeout_seconds": 692.9310549912498
+        },
+        "proposal": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 41189,
+          "request_timeout_seconds": 393.7016425925003
+        },
+        "reconcile": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 20784,
+          "request_timeout_seconds": 127.1309229374998
+        },
+        "review": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 12014,
+          "request_timeout_seconds": 259.1361463337489
+        },
+        "solve": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 227910,
+          "request_timeout_seconds": 1124.9615718437497
+        },
+        "verify": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 3913,
+          "request_timeout_seconds": 35.12688004749975
+        }
+      }
+    },
+    {
+      "name": "mistral-nemo",
+      "model_class": "baseline",
+      "model": "mistralai/mistral-nemo",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "temperature": 0
+      },
+      "context_window": 131072,
+      "role_profiles": {
+        "critique": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 147,
+          "request_timeout_seconds": 3.379545536250248
+        },
+        "draft": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 3872,
+          "request_timeout_seconds": 83.15842531000271
+        },
+        "plan": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 1615,
+          "request_timeout_seconds": 31.010181504999537
+        },
+        "proposal": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 5382,
+          "request_timeout_seconds": 337.44234994625003
+        },
+        "reconcile": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 499,
+          "request_timeout_seconds": 8.12837375499953
+        },
+        "review": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 1508,
+          "request_timeout_seconds": 56.553157987500526
+        },
+        "solve": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 47160,
+          "request_timeout_seconds": 1124.9427689874983
+        },
+        "verify": {
+          "version": "role-budget-v1",
+          "measurement_source": "three-model-900s-1m-20260913:364-trials; phase totals; 1.25 headroom",
+          "max_output_tokens": 385,
+          "request_timeout_seconds": 8.478837661248235
+        }
+      },
+      "endpoint_context_window": 128000
+    }
+  ],
+  "strategies": [
+    "hierarchical_dag-json",
+    "board_claim-json",
+    "managed_pool-json",
+    "speculative-json",
+    "hybrid_v1-json"
+  ],
+  "families": [
+    "partitioned_ledger",
+    "dependency_join"
+  ],
+  "seeds": [
+    101,
+    102
+  ],
+  "split": "test",
+  "repetitions": 1,
+  "budget": {
+    "requests": 90,
+    "tool_calls": 180,
+    "total_tokens": 1000000,
+    "seconds": 900,
+    "draft_fraction": 0.65
+  },
+  "architecture_options": {
+    "hierarchical_dag-json": {
+      "team_policy": "concurrent-v1",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2
+    },
+    "board_claim-json": {
+      "team_policy": "concurrent-v1",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2
+    },
+    "managed_pool-json": {
+      "team_policy": "concurrent-v1",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2
+    },
+    "speculative-json": {
+      "team_policy": "concurrent-v1",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2,
+      "speculative_failure_policy": "return_first_submitted"
+    },
+    "hybrid_v1-json": {
+      "team_policy": "concurrent-v1",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2
+    }
+  }
+}

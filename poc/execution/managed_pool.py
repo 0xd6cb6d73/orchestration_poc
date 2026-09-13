@@ -473,6 +473,44 @@ class ManagedPoolStrategy(PersistentExecutionStrategy):
         ).fetchone()
         return row is not None
 
+    def fail_assignment(self, assignment: Assignment) -> None:
+        """Fence a failed worker and reopen its offer for a different idle slot."""
+        execution, _ = self._active_execution(assignment.execution_id)
+        with self.db.transaction() as tx:
+            changed = tx.execute(
+                "UPDATE swarm_assignments SET state='expired',updated_at=? "
+                "WHERE assignment_id=? AND generation=? AND token_hash=? AND state='active'",
+                (
+                    utc_now(),
+                    assignment.assignment_id,
+                    assignment.generation,
+                    _token_hash(assignment.token),
+                ),
+            )
+            if changed.rowcount != 1:
+                raise StaleAssignment("assignment no longer owns the task")
+            tx.execute(
+                "UPDATE swarm_pool_slots SET status='dead' WHERE slot_id=?", (assignment.slot_id,)
+            )
+            tx.execute(
+                "UPDATE swarm_offers SET state='open' WHERE offer_id=?", (assignment.offer_id,)
+            )
+            tx.execute("DELETE FROM swarm_bids WHERE offer_id=?", (assignment.offer_id,))
+            self.db.append_event(
+                tx,
+                EventRecord(
+                    run_id=execution["run_id"],
+                    event_type="assignment.failed",
+                    actor_id=assignment.worker_id,
+                    data={
+                        "task_id": assignment.task_id,
+                        "assignment_id": assignment.assignment_id,
+                        "assignment_generation": assignment.generation,
+                        "offer_id": assignment.offer_id,
+                    },
+                ),
+            )
+
     def _mode_snapshot(self, execution_id: str) -> dict[str, Any]:
         pool_id = self.db.conn.execute(
             "SELECT pool_id FROM swarm_pools WHERE execution_id=?", (execution_id,)

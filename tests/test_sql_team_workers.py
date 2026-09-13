@@ -44,6 +44,7 @@ async def test_critic_schema_retries_before_artifact_commit(native: bool) -> Non
         return ModelResponse(parts=[TextPart(json.dumps(payload))])
 
     env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     try:
         worker = TeamWorker(
             "hybrid_v1",
@@ -97,6 +98,7 @@ async def test_stage_deadline_leaves_future_time_and_cancellation_propagates() -
         raise AssertionError("unreachable")
 
     env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     try:
         worker = TeamWorker(
             "board_claim",

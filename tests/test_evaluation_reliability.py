@@ -45,7 +45,9 @@ async def test_baseline_has_no_extra_tools_or_feedback(monkeypatch: pytest.Monke
         )
 
     monkeypatch.setattr(runner, "resolve_model", partial(_model_for_spec, FunctionModel(model)))
-    cfg = matrix()
+    cfg = matrix(
+        architecture_options={"single": ArchitectureOptions(artifact_contract="legacy-v1")}
+    )
     t = await run_trial(
         generate("scheduling", 0, "dev", "standard"), cfg.models[0], "single", 1, cfg
     )
@@ -84,7 +86,7 @@ async def test_checkpoint_survives_timeout_without_becoming_a_pass(
     path = tmp_path / "timeout.jsonl"
     report = await run_matrix(cfg, path)
     t = report["trials"][0]
-    assert t["status"] == "timeout" and t["scores"]["exact"] == 0
+    assert t["status"] == "phase_timeout" and t["scores"]["exact"] == 0
     assert t["best_candidate"]["diagnostics"]["feasible"] is True
     assert t["answer"] == {"values": {}} and t["usage_complete"] is False
     assert t["request_attempts"] == 2 and t["request_responses"] == 1

@@ -39,6 +39,16 @@ def main() -> None:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="List registered orchestration strategies and task families")
+    monitor_parser = commands.add_parser(
+        "monitor", help="Count trials and expected batch verification files"
+    )
+    monitor_parser.add_argument("directory", type=Path)
+    calibration = commands.add_parser(
+        "calibrate", help="Derive role budgets from recorded usage and time"
+    )
+    calibration.add_argument("reports", type=Path, nargs="+")
+    calibration.add_argument("--source", required=True)
+    calibration.add_argument("--headroom", type=float, default=1.25)
     run = commands.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
@@ -85,6 +95,26 @@ def main() -> None:
             parser.error(str(exc))
     for module in args.plugin:
         importlib.import_module(module)
+    if args.command == "monitor":
+        from poc.evaluation.suite.batches import monitor
+
+        print(json.dumps(monitor(args.directory), indent=2))
+        return
+    if args.command == "calibrate":
+        from poc.evaluation.suite.budget_profiles import measured_profiles
+
+        trials = [trial for path in args.reports for trial in read_report(path)["trials"]]
+        profiles = measured_profiles(trials, args.source, headroom=args.headroom)
+        print(
+            json.dumps(
+                {
+                    model: {role: p.model_dump() for role, p in roles.items()}
+                    for model, roles in profiles.items()
+                },
+                indent=2,
+            )
+        )
+        return
     if args.command == "list":
         from poc.evaluation.suite.tasks import FACTORIES
 

@@ -95,6 +95,20 @@ class TaskEnvironment:
     def close(self) -> None:
         self.db.close()
 
+    def fork(self, max_calls: int) -> TaskEnvironment:
+        """Independent SQLite connection with a reserved share of the trial tool budget."""
+        child = TaskEnvironment(self.state.task, max_calls)
+        child.state = TrialState(self.state.task, self.state.options, self.state.emit)
+        return child
+
+    def absorb(self, child: object) -> None:
+        if not isinstance(child, TaskEnvironment):
+            raise TypeError("cannot absorb a foreign environment")
+        self.calls.extend(child.calls)
+        self.validation_calls.extend(child.validation_calls)
+        self.state.candidates.extend(child.state.candidates)
+        self.state.diagnostic_candidates.extend(child.state.diagnostic_candidates)
+
     @property
     def tool_calls(self) -> int:
         return len(self.calls) + len(self.validation_calls)

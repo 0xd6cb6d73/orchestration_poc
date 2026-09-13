@@ -5,6 +5,7 @@ import random
 from collections.abc import Callable
 from typing import Any
 
+from poc.evaluation.suite.coordination_tasks import dependency_join
 from poc.evaluation.suite.models import Answer, TaskCase, TaskInput, grade
 from poc.evaluation.suite.routing import grade_routing, routing
 from poc.evaluation.suite.scheduling import grade_schedule, scheduling
@@ -163,3 +164,24 @@ register_task("access", access)
 register_task("scheduling", scheduling, grade_schedule)
 
 register_task("routing", routing, grade_routing)
+
+
+def partitioned_ledger(rng: random.Random, size: int) -> tuple[TaskInput, dict[str, Any]]:
+    task, expected = ledger(rng, size)
+    ids = sorted({row["invoice"] for row in task.tables["invoices"]})
+    return task.model_copy(
+        update={
+            "prompt": task.prompt + " The public partitions table groups invoices into independent "
+            "work units. Combine every partition into one final mapping.",
+            "tables": {
+                **task.tables,
+                "partitions": [
+                    {"invoice": key, "partition": index % 4} for index, key in enumerate(ids)
+                ],
+            },
+        }
+    ), expected
+
+
+register_task("partitioned_ledger", partitioned_ledger)
+register_task("dependency_join", dependency_join)

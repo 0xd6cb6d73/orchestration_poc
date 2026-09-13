@@ -149,7 +149,7 @@ class CollaborationController:
         self.db.put_collaboration_round(updated)
         return candidate
 
-    def release(self, round_id: str) -> list[Candidate]:
+    def release(self, round_id: str, *, minimum_proposals: int | None = None) -> list[Candidate]:
         round_ = self.db.get_collaboration_round(round_id)
         if round_ is None:
             raise KeyError(round_id)
@@ -168,7 +168,10 @@ class CollaborationController:
             }:
                 return candidates
             raise CollaborationError(f"round cannot release from phase {round_.phase.value!r}")
-        if len(candidates) != round_.expected_proposals:
+        minimum = round_.expected_proposals if minimum_proposals is None else minimum_proposals
+        if not 1 <= minimum <= round_.expected_proposals:
+            raise ValueError("proposal quorum must be between one and the expected population")
+        if len(candidates) < minimum:
             raise CollaborationError(
                 "sealed proposals cannot release before the submission condition"
             )

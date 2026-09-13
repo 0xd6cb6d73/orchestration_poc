@@ -42,6 +42,7 @@ class TrialState:
         self.request_attempts = 0
         self.request_responses = 0
         self.usage_complete = True
+        self.unreported_token_reserve = 0
         self.exhausted_phase: str | None = None
         self.recovery: dict[str, Any] | None = None
         self.answer_source: str | None = None

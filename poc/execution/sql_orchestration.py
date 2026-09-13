@@ -1,7 +1,7 @@
 """Generic SQL task bindings for the persistent orchestration components.
 
-Policies live here, outside grading. Workers share one environment, usage counter and
-absolute deadline. Candidate generation is serial to preserve strict shared accounting.
+Policies live here, outside grading. Serial workers share usage and an environment;
+concurrent workers reserve disjoint allowances and use isolated connections.
 """
 
 from __future__ import annotations
@@ -28,18 +28,21 @@ from poc.execution.capacity import CapacityScheduler, InProcessWorkerMaterialize
 from poc.execution.hierarchical_strategy import HierarchicalDAGStrategy
 from poc.execution.managed_pool import ManagedPoolStrategy
 from poc.execution.speculative import SpeculativeStrategy
+from poc.execution.sql_artifacts import CommittedCandidates, validate_artifact
+from poc.execution.sql_concurrency import ConcurrentTeamWorker, gather_branches
 from poc.execution.sql_contracts import Answer, ArchitectureOptions, Budget, PhaseName, TaskInput
 from poc.execution.sql_ports import (
     PhaseTimeout,
     RequestTimeout,
     TaskEnvironment,
     ToolBudgetExceeded,
+    failure_details,
 )
 from poc.execution.sql_strategy import single, single_json
-from poc.execution.sql_team_worker import TeamWorker
-from poc.hybrid.collaboration_controller import CollaborationController
+from poc.execution.sql_team_worker import SupportedCritiqueValues, TeamWorker
+from poc.hybrid.collaboration_controller import CollaborationController, CollaborationError
 from poc.hybrid.communication import CommunicationService
-from poc.hybrid.completion_gate import CompletionGate
+from poc.hybrid.completion_gate import CompletionGate, DeliveryBlocked
 from poc.hybrid.contracts import (
     CollaborationPhase,
     ContextManifest,
@@ -51,6 +54,7 @@ from poc.hybrid.policies import SwarmPolicyResolver
 from poc.hybrid.verification_service import VerificationService
 from poc.models import (
     AgentInstance,
+    EventRecord,
     ExecutionMode,
     ExecutionPolicy,
     HybridConfig,
@@ -65,6 +69,14 @@ from poc.services.artifact_store import ArtifactStore
 
 METHODS = (*[mode.value for mode in ExecutionMode], "hybrid_v1")
 Solve = Callable[[str, PhaseName], Awaitable[Answer]]
+RECOVERABLE = (
+    PhaseTimeout,
+    RequestTimeout,
+    UsageLimitExceeded,
+    ToolBudgetExceeded,
+    ModelAPIError,
+    UnexpectedModelBehavior,
+)
 
 
 class SQLTeam:
@@ -82,15 +94,15 @@ class SQLTeam:
         options: ArchitectureOptions | None = None,
     ):
         self.options = options or ArchitectureOptions()
-        self.policy_version = (
-            "sql-team-v2" if self.options.team_policy == "bounded-v1" else "sql-team-v1"
-        )
+        self.policy_version = self.options.team_policy
+        self.reliable = self.options.team_policy in {"reliable-v2", "concurrent-v1"}
+        self.concurrent = self.options.team_policy == "concurrent-v1"
         self.task = task
         self.backend = backend
         self.model_name = model_name
         self.db = Database(root / "scheduler.sqlite")
         self.emitted = 0
-        self.submitted: list[Answer] = []
+        self.submitted = CommittedCandidates()
         self.artifacts = ArtifactStore(root / "artifacts", self.db)
         self.mode = ExecutionMode.BOARD_CLAIM if method == "hybrid_v1" else ExecutionMode(method)
         swarm = SwarmStrategy.HYBRID_V1 if method == "hybrid_v1" else SwarmStrategy.BOARD
@@ -141,6 +153,22 @@ class SQLTeam:
             ExecutionMode.MANAGED_POOL: ManagedPoolStrategy,
             ExecutionMode.SPECULATIVE: SpeculativeStrategy,
         }[self.mode](self.db)
+
+    def commit_candidate(self, answer: Answer, source: str) -> None:
+        validate_artifact(self.task, answer, self.options.artifact_contract)
+        self.submitted.append(answer)
+        serialized = answer.model_dump_json()
+        self.db.record_event(
+            EventRecord(
+                run_id="sql-run",
+                event_type="sql.candidate_committed",
+                data={
+                    "source": source,
+                    "sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+                    "answer": answer.model_dump(),
+                },
+            )
+        )
 
     def model_for(self, role: PhaseName) -> str:
         binding = self.options.phase_models.get(role) or self.options.phase_models.get("solve")
@@ -208,7 +236,7 @@ class SQLTeam:
             board.complete(claim, result_ref=answer.model_dump_json())
             return answer
         except BaseException:
-            board.release(claim, reason="SQL worker interrupted")
+            board.release(claim, reason="SQL worker interrupted", abandon=self.reliable)
             raise
 
     async def run(self, method: str, solve: Solve) -> Answer:
@@ -223,6 +251,21 @@ class SQLTeam:
                 "Solve the original task completely. Use this worker's plan critically: "
                 + plan.model_dump_json()
             )
+
+        if self.concurrent and method == "hierarchical_dag":
+            # Two independent predecessors join before the final solver may start.
+            plans = await gather_branches(
+                [solve(plan_prompt + f" Independent branch {i}.", "plan") for i in range(2)]
+            )
+            return await solve(
+                "Solve using these independent plans critically: "
+                + json.dumps([p.model_dump() for p in plans]),
+                "solve",
+            )
+        if self.concurrent and method == "board_claim":
+            return await self.contended_board(solve, plan_prompt)
+        if self.concurrent and method == "managed_pool":
+            return await self.reassigning_pool(solve, plan_prompt)
 
         if method == "hierarchical_dag":
 
@@ -284,14 +327,22 @@ class SQLTeam:
                 )
                 for w in self.workers[:2]
             ]
-            for index, grant in enumerate(grants):
+
+            async def propose(index: int) -> Answer:
+                grant = grants[index]
                 answer = await solve(
                     f"Independently solve the complete task. You are candidate {index + 1}.",
                     "proposal",
                 )
-                candidates.append(answer)
                 speculative.complete_candidate(grant, result_ref=answer.model_dump_json())
-                self.submitted.append(answer.model_copy(deep=True))
+                self.commit_candidate(answer, f"proposal-{index}")
+                return answer
+
+            if self.concurrent:
+                candidates = await gather_branches([propose(i) for i in range(2)])
+            else:
+                for i in range(2):
+                    candidates.append(await propose(i))
             answer = await solve(
                 "Reconcile these independent candidate answers. Inspect SQL as needed "
                 "and return your complete final answer: "
@@ -308,6 +359,115 @@ class SQLTeam:
             return answer
         return await self.hybrid(solve)
 
+    async def contended_board(self, solve: Solve, prompt: str) -> Answer:
+        board = cast(BoardClaimStrategy, self.strategy)
+        capacity = CapacityScheduler(
+            self.db, InProcessWorkerMaterializer(SpawnPolicy(self.db, RoleRegistry()))
+        )
+        for worker in self.workers:
+            capacity.activate_existing(self.handle, worker)
+        for i in range(2):
+            board.post_task(
+                execution_id=self.handle.execution_id,
+                task_id=f"plan-{i}",
+                required_role="sql-worker",
+                task_spec_ref=f"plan-{i}",
+            )
+
+        async def claim(index: int) -> Answer | None:
+            grant = board.claim_next(
+                execution_id=self.handle.execution_id,
+                worker_id=self.workers[index].agent_instance_id,
+            )
+            if grant is None:
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run", event_type="sql.claim_contended", data={"worker": index}
+                    )
+                )
+                return None
+            try:
+                answer = await solve(prompt + f" Independent task {grant.task_id}.", "plan")
+                board.complete(grant, result_ref=answer.model_dump_json())
+                return answer
+            except BaseException:
+                board.release(grant, reason="SQL worker interrupted")
+                raise
+
+        plans = await gather_branches([claim(i) for i in range(3)])
+        return await self.board_work(
+            0,
+            "solve",
+            solve,
+            "Solve using these plans critically: "
+            + json.dumps([p.model_dump() for p in plans if p is not None]),
+            ("plan-0", "plan-1"),
+        )
+
+    async def reassigning_pool(self, solve: Solve, prompt: str) -> Answer:
+        pool = cast(ManagedPoolStrategy, self.strategy)
+        slots = [
+            pool.start_slot(execution_id=self.handle.execution_id, worker_id=w.agent_instance_id)
+            for w in self.workers
+        ]
+        failed: list[tuple[str, str]] = []
+
+        def assign(offer: str):
+            for slot in slots:
+                row = self.db.conn.execute(
+                    "SELECT status FROM swarm_pool_slots WHERE slot_id=?", (slot,)
+                ).fetchone()
+                if row[0] == "idle":
+                    pool.submit_bid(
+                        execution_id=self.handle.execution_id, offer_id=offer, slot_id=slot
+                    )
+            return pool.arbitrate(execution_id=self.handle.execution_id, offer_id=offer)
+
+        def offer(task: str) -> str:
+            return pool.publish_offer(
+                execution_id=self.handle.execution_id,
+                task_id=task,
+                eligible_roles=["sql-worker"],
+                bid_deadline=datetime.now(UTC) + timedelta(days=1),
+            )
+
+        async def plan(index: int) -> Answer | None:
+            task = f"plan-{index}"
+            offer_id = offer(task)
+            assignment = assign(offer_id)
+            try:
+                answer = await solve(prompt + f" Independent branch {index}.", "plan")
+                pool.complete(assignment, result_ref=answer.model_dump_json())
+                return answer
+            except RECOVERABLE:
+                pool.fail_assignment(assignment)
+                failed.append((task, offer_id))
+                return None
+
+        plans = await gather_branches([plan(0), plan(1)])
+        if len(failed) > 1:
+            raise UnexpectedModelBehavior("pool retry allocation exhausted: two failed branches")
+        # One reserved third planning allocation: reassignment or an independent check.
+        assignment = assign(failed[0][1] if failed else offer("plan-check"))
+        try:
+            extra = await solve(prompt + " Check and complete the planning work.", "plan")
+            pool.complete(assignment, result_ref=extra.model_dump_json())
+        except BaseException:
+            pool.fail_assignment(assignment)
+            raise
+        final_assignment = assign(offer("solve"))
+        try:
+            answer = await solve(
+                "Solve using these plans critically: "
+                + json.dumps([p.model_dump() for p in [*plans, extra] if p is not None]),
+                "solve",
+            )
+        except BaseException:
+            pool.fail_assignment(final_assignment)
+            raise
+        pool.complete(final_assignment, result_ref=answer.model_dump_json())
+        return answer
+
     async def hybrid(self, solve: Solve) -> Answer:
         controller = CollaborationController(
             self.db, self.artifacts, BlackboardService(self.db), CommunicationService(self.db)
@@ -320,14 +480,34 @@ class SQLTeam:
             config=HybridConfig(proposals_per_round=2),
         )
         answers: dict[str, Answer] = {}
-        for index, worker in enumerate(self.workers[:2]):
-            answer = await self.board_work(
-                index,
-                f"proposal-{index}",
-                solve,
-                f"Independently solve the complete task. You are sealed proposer {index + 1}.",
-                role="proposal",
-            )
+        critic_records: dict[str, dict[str, Any]] = {}
+
+        async def propose(index: int) -> None:
+            worker = self.workers[index]
+            try:
+                answer = await self.board_work(
+                    index,
+                    f"proposal-{index}",
+                    solve,
+                    f"Independently solve the complete task. You are sealed proposer {index + 1}.",
+                    role="proposal",
+                )
+                validate_artifact(
+                    self.task,
+                    answer,
+                    "public-v1" if self.reliable else self.options.artifact_contract,
+                )
+            except RECOVERABLE as exc:
+                if not self.reliable:
+                    raise
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run",
+                        event_type="sql.branch_failed",
+                        data={"stage": "proposal", "index": index, "error": type(exc).__name__},
+                    )
+                )
+                return
             artifact = self.artifacts.write(
                 "sql-run",
                 {"proposal": index, "answer": answer.model_dump()},
@@ -375,34 +555,80 @@ class SQLTeam:
                 artifact_id=artifact.artifact_id,
                 evidence_refs=(),
             )
-            answers[candidate.candidate_id] = answer
-        candidates = controller.release(round_.round_id)
+            answers[candidate.candidate_id] = answer.model_copy(deep=True)
+            self.commit_candidate(answer, candidate.candidate_id)
+
+        if self.concurrent:
+            await gather_branches([propose(i) for i in range(2)])
+        else:
+            for i in range(2):
+                await propose(i)
+        candidates = controller.release(
+            round_.round_id,
+            minimum_proposals=self.options.hybrid_proposal_quorum if self.reliable else None,
+        )
         controller.cluster_candidates(round_.round_id)
         for index, candidate in enumerate(candidates):
-            critique = await self.board_work(
-                2,
-                f"critique-{index}",
-                solve,
-                'Critique this proposed answer using SQL. Return {"values":{"validity":0,'
-                '"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} '
-                "with each score an integer 0..5 (5 strongest). These are your judgments, "
-                "not benchmark feedback. Candidate: "
-                + answers[candidate.candidate_id].model_dump_json(),
-                role="critique",
-            )
-            evaluation = EvaluationVector.model_validate(critique.values)
+            refs: tuple[str, ...] = ()
+            try:
+                critique = await self.board_work(
+                    2,
+                    f"critique-{index}",
+                    solve,
+                    "Critique this proposed answer using SQL. "
+                    + (
+                        "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
+                        "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "
+                        if self.reliable
+                        else 'Return {"values":{"validity":0,"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} with integer scores 0..5. '
+                    )
+                    + "Candidate: "
+                    + answers[candidate.candidate_id].model_dump_json(),
+                    role="critique",
+                )
+                if self.reliable:
+                    decision = SupportedCritiqueValues.model_validate(critique.values)
+                    evaluation = decision.evaluation
+                    refs = tuple(decision.evidence_refs)
+                    passed = (
+                        decision.structural_validity
+                        and decision.feasibility == "supported"
+                        and bool(refs)
+                        and evaluation.constraint_satisfaction > 0
+                        and evaluation.validity > 0
+                        and evaluation.evidence > 0
+                    )
+                else:
+                    evaluation = EvaluationVector.model_validate(critique.values)
+                    passed = evaluation.validity > 0
+                critique_data = critique.model_dump()
+            except RECOVERABLE as exc:
+                if not self.reliable:
+                    raise
+                # A failed critique abstains for this candidate; other branches can proceed.
+                evaluation = EvaluationVector(
+                    validity=0, evidence=0, usefulness=0, novelty=0, constraint_satisfaction=0
+                )
+                passed = False
+                critique_data = {"abstention": type(exc).__name__}
             artifact = self.artifacts.write(
                 "sql-run",
-                {"candidate": candidate.candidate_id, "evaluation": evaluation.model_dump()},
+                {"candidate": candidate.candidate_id, "decision": critique_data},
                 producer_task_id=f"critique-{index}",
             )
+            critic_records[candidate.candidate_id] = {
+                "artifact_id": artifact.artifact_id,
+                "decision": critique_data,
+            }
             controller.record_evaluation(
                 candidate_id=candidate.candidate_id,
                 critic=self.workers[2],
                 critique_artifact_id=artifact.artifact_id,
-                passed=evaluation.validity > 0,
-                findings=("SQL model critique",),
-                evidence_refs=(),
+                passed=passed,
+                findings=(
+                    "SQL model critique; supported-v1" if self.reliable else "SQL model critique",
+                ),
+                evidence_refs=(artifact.artifact_id,) if refs else (),
                 evaluation=evaluation,
             )
         for phase in (
@@ -428,20 +654,25 @@ class SQLTeam:
             "verify",
             solve,
             "Independently verify this selected answer against the SQL data and all task constraints. "
-            'Return {"values":{"answer_supported":true}} if supported, or false otherwise. '
-            "This is your judgment, not a benchmark score. Answer: "
+            + (
+                "Use supported-v1: answer_supported, evidence_refs from your own SQL queries, and reason. "
+                if self.reliable
+                else 'Return {"values":{"answer_supported":true}} if supported, or false otherwise. '
+            )
+            + "Critic evidence references: "
+            + json.dumps(critic_records[selected.candidate_id])
+            + " This is your judgment, not a benchmark score. Answer: "
             + answers[selected.candidate_id].model_dump_json(),
             role="verify",
         )
-        if (
-            set(check.values) != {"answer_supported"}
-            or type(check.values["answer_supported"]) is not bool
-        ):
+        if (not self.reliable and set(check.values) != {"answer_supported"}) or type(
+            check.values["answer_supported"]
+        ) is not bool:
             raise ValueError("hybrid verification must return a boolean answer_supported")
         verdict = verification.complete(
             verification_id=request.verification_id,
             verifier=self.workers[2],
-            checks=check.values,
+            checks={"answer_supported": check.values["answer_supported"]},
             findings=("Independent SQL model verification",),
             evidence_refs=(),
             limitations=("Model judgment; no private reference or grading access",),
@@ -464,7 +695,7 @@ class SQLTeam:
             )
         )
         controller.complete(round_.round_id)
-        return answers[selected.candidate_id]
+        return answers[selected.candidate_id].model_copy(deep=True)
 
 
 def adapter(method: str, *, json_protocol: bool = False):
@@ -487,22 +718,33 @@ def adapter(method: str, *, json_protocol: bool = False):
             raise ValueError("SQL runtime adapters do not support finalization reserves")
         worker = single_json if json_protocol else single
 
-        bounded_worker = TeamWorker(
+        worker_type = (
+            ConcurrentTeamWorker if env.state.options.team_policy == "concurrent-v1" else TeamWorker
+        )
+        bounded_worker = worker_type(
             method, task, env, model, settings, budget, usage, json_protocol=json_protocol
         )
 
         async def solve(instruction: str, role: PhaseName) -> Answer:
             team.flush(env.state.emit, method)
-            if env.state.options.team_policy == "bounded-v1":
+            if env.state.options.team_policy != "legacy-v1":
                 return await bounded_worker(instruction, role)
-            return await worker(
-                task.model_copy(update={"prompt": task.prompt + "\n" + instruction}),
-                env,
-                model,
-                settings,
-                budget,
-                usage,
-            )
+            options = env.state.options
+            env.state.options = options.model_copy(update={"artifact_contract": "legacy-v1"})
+            try:
+                answer = await worker(
+                    task.model_copy(update={"prompt": task.prompt + "\n" + instruction}),
+                    env,
+                    model,
+                    settings,
+                    budget,
+                    usage,
+                )
+            finally:
+                env.state.options = options
+            if role not in {"plan", "critique", "verify"}:
+                validate_artifact(task, answer, options.artifact_contract)
+            return answer
 
         with TemporaryDirectory(prefix="sql-orchestration-") as directory:
             binding = env.state.options.phase_models.get("solve")
@@ -524,6 +766,26 @@ def adapter(method: str, *, json_protocol: bool = False):
                 await team.start()
                 try:
                     return await team.run(method, solve)
+                except (CollaborationError, DeliveryBlocked) as exc:
+                    details = failure_details(
+                        exc,
+                        scope="phase",
+                        stage=env.state.phase,
+                        threshold={
+                            "proposal_quorum": env.state.options.hybrid_proposal_quorum,
+                            "verification_required": True,
+                        },
+                        consumption={"committed_candidates": len(team.submitted)},
+                    )
+                    details["code"] = (
+                        "verification_rejected"
+                        if isinstance(exc, DeliveryBlocked)
+                        else "proposal_quorum_not_met"
+                        if len(team.submitted) < env.state.options.hybrid_proposal_quorum
+                        else "no_admissible_candidate"
+                    )
+                    env.state.emit({"delivery_blocked": details})
+                    raise
                 except (
                     PhaseTimeout,
                     RequestTimeout,

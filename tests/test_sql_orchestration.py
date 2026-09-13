@@ -13,7 +13,7 @@ from pydantic_ai.usage import RunUsage
 
 from poc.evaluation.suite.adapters import ADAPTERS
 from poc.evaluation.suite.environment import TaskEnvironment
-from poc.execution.sql_contracts import Budget, TaskInput
+from poc.execution.sql_contracts import ArchitectureOptions, Budget, TaskInput
 from poc.execution.sql_orchestration import METHODS
 from poc.models import ExecutionMode
 
@@ -46,6 +46,7 @@ def model() -> FunctionModel:
 async def test_all_methods_execute_real_controllers(method: str, suffix: str) -> None:
     events: list[dict[str, Any]] = []
     env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     env.state.emit = events.append
     usage = RunUsage()
     try:
@@ -84,6 +85,7 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
 @pytest.mark.parametrize("method", METHODS)
 async def test_workers_share_request_ceiling(method: str) -> None:
     env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     usage = RunUsage()
     try:
         with pytest.raises(UsageLimitExceeded):
@@ -114,6 +116,7 @@ async def test_cancelled_trial_cleans_scheduler_directory(
         raise AssertionError("unreachable")
 
     env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     task = asyncio.ensure_future(
         ADAPTERS["board_claim"](TASK, env, FunctionModel(respond), {}, Budget(), RunUsage())
     )
@@ -139,6 +142,7 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
         return ModelResponse(parts=[TextPart('{"values":{"x":7}}')])
 
     env = TaskEnvironment(TASK, 1)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     usage = RunUsage()
     try:
         with pytest.raises(ToolBudgetExceeded):
@@ -179,6 +183,7 @@ async def test_full_matrix_records_and_grades_all_methods(
     matrix = Matrix(
         models=[ModelSpec(name="fake", model_class="baseline", model="test")],
         strategies=strategies,
+        architecture_options={s: ArchitectureOptions(team_policy="bounded-v1") for s in strategies},
         families=["ledger"],
         seeds=[0],
         repetitions=1,
@@ -212,6 +217,7 @@ async def test_hybrid_rejected_verification_does_not_submit_selected_candidate()
         return ModelResponse(parts=[TextPart(json.dumps({"values": values}))])
 
     env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     try:
         with pytest.raises(DeliveryBlocked):
             await ADAPTERS["hybrid_v1-json"](

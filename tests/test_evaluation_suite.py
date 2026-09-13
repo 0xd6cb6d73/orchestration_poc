@@ -92,6 +92,8 @@ def test_environment_blocks_side_effects_bounds_queries_and_counts_errors() -> N
 
 
 async def test_model_json_tool_loop_and_shared_review_budget() -> None:
+    from poc.execution.sql_contracts import ArchitectureOptions
+
     calls = 0
 
     async def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -103,6 +105,7 @@ async def test_model_json_tool_loop_and_shared_review_budget() -> None:
 
     case = generate("ledger", 0, "dev", "standard")
     env = TaskEnvironment(case.input, 10)
+    env.state.options = ArchitectureOptions(artifact_contract="legacy-v1")
     usage = RunUsage()
     try:
         result = await single_json(case.input, env, FunctionModel(model), {}, Budget(), usage)
@@ -206,6 +209,7 @@ async def test_native_tool_adapter_runs_query_before_structured_answer() -> None
     from pydantic_ai import ToolCallPart
 
     from poc.evaluation.suite.adapters import single
+    from poc.execution.sql_contracts import ArchitectureOptions
 
     calls = 0
 
@@ -220,6 +224,7 @@ async def test_native_tool_adapter_runs_query_before_structured_answer() -> None
 
     case = generate("dependencies", 0, "dev", "standard")
     env = TaskEnvironment(case.input, 2)
+    env.state.options = ArchitectureOptions(artifact_contract="legacy-v1")
     usage = RunUsage()
     try:
         await single(case.input, env, FunctionModel(model), {}, Budget(), usage)

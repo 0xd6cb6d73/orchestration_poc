@@ -314,14 +314,21 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
         return expires_at
 
     def release(
-        self, claim: Claim, *, retry_at: datetime | str | None = None, reason: str = "released"
+        self,
+        claim: Claim,
+        *,
+        retry_at: datetime | str | None = None,
+        reason: str = "released",
+        abandon: bool = False,
     ) -> None:
         execution, _ = self._active_execution(claim.execution_id)
         now = utc_now()
         available_at = _timestamp(retry_at) if retry_at else now
         with self.db.transaction() as tx:
             row = self._owned_row(tx, claim, require_unexpired=False)
-            state = "ready" if row["attempt_count"] < row["max_attempts"] else "failed"
+            state = (
+                "ready" if not abandon and row["attempt_count"] < row["max_attempts"] else "failed"
+            )
             tx.execute(
                 "UPDATE swarm_tasks SET state=?,claimant_id=NULL,claim_token_hash=NULL,"
                 "lease_expires_at=NULL,available_at=?,updated_at=? WHERE execution_id=? AND task_id=?",
@@ -343,6 +350,7 @@ class BoardClaimStrategy(PersistentExecutionStrategy):
                         "attempt_id": claim.attempt_id,
                         "claim_generation": claim.generation,
                         "reason": reason,
+                        "next_state": state,
                         "next_eligible_at": available_at if state == "ready" else None,
                     },
                 ),

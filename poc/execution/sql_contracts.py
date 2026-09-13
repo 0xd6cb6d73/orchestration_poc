@@ -49,6 +49,9 @@ class ModelSpec(StrictModel):
     api_key_env: str = "OPENAI_API_KEY"
     settings: dict[str, Any] = Field(default_factory=lambda: {"temperature": 0})
     context_window: int | None = Field(default=None, gt=0)
+    endpoint_context_window: int | None = Field(default=None, gt=0)
+    completion_limit: int | None = Field(default=None, gt=0)
+    role_profiles: dict[str, RoleBudgetProfile] = Field(default_factory=dict)
     input_usd_per_million: float | None = Field(default=None, ge=0)
     output_usd_per_million: float | None = Field(default=None, ge=0)
 
@@ -56,6 +59,15 @@ class ModelSpec(StrictModel):
 PhaseName: TypeAlias = Literal[
     "solve", "draft", "review", "finalize", "plan", "proposal", "critique", "verify", "reconcile"
 ]
+
+
+class RoleBudgetProfile(StrictModel):
+    """Measured allowances, including provider reasoning tokens; no implicit escalation."""
+
+    version: str = "role-budget-v1"
+    measurement_source: str = Field(min_length=1)
+    max_output_tokens: int = Field(ge=1)
+    request_timeout_seconds: float = Field(gt=0)
 
 
 class ArchitectureOptions(StrictModel):
@@ -68,7 +80,15 @@ class ArchitectureOptions(StrictModel):
     output_retries: int = Field(default=1, ge=0)
     review_failure_policy: Literal["fail", "return_submitted_draft"] = "fail"
     review_protocol: Literal["replace", "decision-v1"] = "replace"
-    team_policy: Literal["legacy-v1", "bounded-v1"] = "bounded-v1"
+    team_policy: Literal["legacy-v1", "bounded-v1", "reliable-v2", "concurrent-v1"] = "reliable-v2"
+    artifact_contract: Literal["legacy-v1", "public-v1"] = "public-v1"
+    role_profiles: dict[PhaseName, RoleBudgetProfile] = Field(
+        default_factory=dict[PhaseName, RoleBudgetProfile]
+    )
+    transport_policy: Literal["strict-v1", "json-normalize-v1"] = "strict-v1"
+    provider_retries: int = Field(default=0, ge=0, le=3)
+    return_reserve_seconds: float = Field(default=0.05, ge=0)
+    hybrid_proposal_quorum: int = Field(default=2, ge=1, le=2)
     speculative_failure_policy: Literal["fail", "return_first_submitted"] = "fail"
     stage_weights: list[float] | None = None
 
@@ -85,3 +105,6 @@ class ArchitectureOptions(StrictModel):
 
 class Answer(StrictModel):
     values: dict[str, Any]
+
+
+ModelSpec.model_rebuild()

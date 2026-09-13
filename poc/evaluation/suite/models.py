@@ -78,6 +78,10 @@ class Matrix(StrictModel):
             if method in team_phases:
                 allowed_phases = team_phases[method] | {"solve"}
                 expected = 5 if method == "hybrid_v1" else 3 if method == "speculative" else 2
+                if options.team_policy == "concurrent-v1":
+                    from poc.execution.sql_concurrency import CONCURRENT_WEIGHTS
+
+                    expected = len(CONCURRENT_WEIGHTS[method])
                 if options.stage_weights is not None and len(options.stage_weights) != expected:
                     raise ValueError("stage_weights length must match the strategy stage count")
             elif options.stage_weights is not None:

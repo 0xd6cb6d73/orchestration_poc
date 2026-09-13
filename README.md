@@ -400,3 +400,5 @@ access-policy, resource-constrained scheduling and vehicle-routing tasks; six co
 single-agent/review comparisons under shared budgets; and Phoenix datasets, experiments and traces.
 Start with `configs/evaluation-smoke.json` for offline validation, then calibrate a small subset
 of `configs/evaluation-models.json` before a full sweep.
+
+SQL reliability and concurrent execution policies, calibration, and new evaluation configs are documented in [docs/sql-infrastructure.md](docs/sql-infrastructure.md).

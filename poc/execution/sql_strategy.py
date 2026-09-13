@@ -9,24 +9,39 @@ from time import perf_counter
 from typing import Any, cast
 
 from opentelemetry import trace
-from pydantic_ai import Agent, ModelMessage, ModelResponse, UsageLimits
+from pydantic_ai import Agent, ModelMessage, ModelResponse, ModelRetry, UsageLimits
 from pydantic_ai.capabilities import Instrumentation
-from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior, UsageLimitExceeded
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.exceptions import (
+    ModelAPIError,
+    ModelHTTPError,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+)
+from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart, ToolCallPart
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
 
 from poc.execution.review import ReviewDecision, review_decision_submission, review_submission
-from poc.execution.sql_contracts import Answer, Budget, ModelSpec, PhaseName, TaskInput
+from poc.execution.sql_artifacts import ArtifactContractError, validate_artifact
+from poc.execution.sql_contracts import (
+    Answer,
+    Budget,
+    ModelSpec,
+    PhaseName,
+    RoleBudgetProfile,
+    TaskInput,
+)
 from poc.execution.sql_ports import (
     PhaseTimeout,
     RequestTimeout,
     TaskEnvironment,
     ToolBudgetExceeded,
     TrialState,
+    failure_details,
 )
+from poc.execution.sql_protocol import ProtocolError, parse_action
 
 
 def resolve_model(spec: ModelSpec) -> Model | str:
@@ -43,7 +58,12 @@ def resolve_model(spec: ModelSpec) -> Model | str:
                 api_key=os.environ[spec.api_key_env],
             ),
         )
-    return ContextBoundModel(resolved, spec.context_window) if spec.context_window else resolved
+    context = spec.endpoint_context_window or spec.context_window
+    return (
+        ContextBoundModel(resolved, context, spec.completion_limit, spec.role_profiles)
+        if context or spec.completion_limit or spec.role_profiles
+        else resolved
+    )
 
 
 def input_token_bound(messages: list[ModelMessage], parameters: ModelRequestParameters) -> int:
@@ -66,9 +86,35 @@ class ContextAdmissionExceeded(UsageLimitExceeded):
 
 
 class ContextBoundModel(WrapperModel):
-    def __init__(self, model: Model | str, context_window: int):
+    def __init__(
+        self,
+        model: Model | str,
+        context_window: int | None,
+        completion_limit: int | None = None,
+        role_profiles: dict[str, RoleBudgetProfile] | None = None,
+    ):
         super().__init__(cast(Any, model))
         self.context_window = context_window
+        self.completion_limit = completion_limit
+        self.role_profiles = role_profiles or {}
+
+    def admit(
+        self,
+        messages: list[ModelMessage],
+        settings: ModelSettings | None,
+        parameters: ModelRequestParameters,
+    ) -> ModelSettings:
+        effective = dict(settings or {})
+        cap = cast(int, effective.get("max_tokens") or 16384)
+        if self.context_window is not None:
+            room = self.context_window - input_token_bound(messages, parameters)
+            if room < 1:
+                raise ContextAdmissionExceeded("model context admission limit exhausted")
+            cap = min(cap, room)
+        if self.completion_limit is not None:
+            cap = min(cap, self.completion_limit)
+        effective["max_tokens"] = cap
+        return cast(ModelSettings, effective)
 
     async def request(
         self,
@@ -76,14 +122,8 @@ class ContextBoundModel(WrapperModel):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
-        room = self.context_window - input_token_bound(messages, model_request_parameters)
-        if room < 1:
-            raise ContextAdmissionExceeded("model context admission limit exhausted")
-        settings = dict(model_settings or {})
-        settings["max_tokens"] = min(cast(int, settings.get("max_tokens") or room), room)
-        return await self.wrapped.request(
-            messages, cast(ModelSettings, settings), model_request_parameters
-        )
+        settings = self.admit(messages, model_settings, model_request_parameters)
+        return await self.wrapped.request(messages, settings, model_request_parameters)
 
 
 class ObservedModel(WrapperModel):
@@ -102,10 +142,14 @@ class ObservedModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         settings = dict(model_settings or {})
+        settings["max_tokens"] = (
+            settings.get("max_tokens") or self.budget.max_output_tokens or 16384
+        )
         if self.usage is not None:
             room = (
                 self.budget.total_tokens
                 - self.usage.total_tokens
+                - self.state.unreported_token_reserve
                 - input_token_bound(messages, model_request_parameters)
             )
             if room < 1:
@@ -116,29 +160,181 @@ class ObservedModel(WrapperModel):
                 cast(int, settings.get("max_tokens") or self.budget.max_output_tokens),
                 self.budget.max_output_tokens,
             )
-        try:
-            self.state.request_attempts += 1
-            async with asyncio.timeout(self.budget.request_timeout_seconds):
-                response = await self.wrapped.request(
-                    messages, cast(ModelSettings, settings), model_request_parameters
+        if isinstance(self.wrapped, ContextBoundModel):
+            try:
+                settings = dict(
+                    self.wrapped.admit(
+                        messages, cast(ModelSettings, settings), model_request_parameters
+                    )
                 )
-        except ContextAdmissionExceeded:
-            self.state.request_attempts -= 1
-            raise
-        except TimeoutError as exc:
-            self.state.usage_complete = False
-            self.state.exhausted_phase = self.state.phase
-            raise RequestTimeout("model request timeout") from exc
-        except BaseException:
-            self.state.usage_complete = False
-            raise
+            except ContextAdmissionExceeded as exc:
+                failure_details(
+                    exc,
+                    scope="request",
+                    stage=self.state.phase,
+                    threshold={
+                        "context_window": self.wrapped.context_window,
+                        "completion_limit": self.wrapped.completion_limit,
+                    },
+                    consumption={
+                        "input_token_bound": input_token_bound(messages, model_request_parameters),
+                        "requests": 0,
+                    },
+                )
+                raise
+        self.state.emit(
+            {
+                "request_settings": {
+                    "stage": self.state.phase,
+                    "max_tokens": settings["max_tokens"],
+                    "input_token_bound": input_token_bound(messages, model_request_parameters),
+                    "request_timeout_seconds": self.budget.request_timeout_seconds,
+                    "context_window": getattr(self.wrapped, "context_window", None),
+                    "completion_limit": getattr(self.wrapped, "completion_limit", None),
+                }
+            }
+        )
+        for attempt in range(self.state.options.provider_retries + 1):
+            started = perf_counter()
+            input_bound = input_token_bound(messages, model_request_parameters)
+            if self.usage is not None:
+                room = (
+                    self.budget.total_tokens
+                    - self.usage.total_tokens
+                    - self.state.unreported_token_reserve
+                    - input_bound
+                )
+                if room < 1:
+                    raise UsageLimitExceeded(
+                        "request reservation exhausted by unreported provider usage"
+                    )
+                settings["max_tokens"] = min(cast(int, settings["max_tokens"]), room)
+            reserved = input_bound + cast(int, settings["max_tokens"])
+            if attempt:
+                self.state.emit(
+                    {
+                        "request_settings": {
+                            "stage": self.state.phase,
+                            "retry": attempt,
+                            "max_tokens": settings["max_tokens"],
+                            "input_token_bound": input_bound,
+                            "unreported_token_reserve": self.state.unreported_token_reserve,
+                        }
+                    }
+                )
+            try:
+                self.state.request_attempts += 1
+                async with asyncio.timeout(self.budget.request_timeout_seconds):
+                    response = await self.wrapped.request(
+                        messages, cast(ModelSettings, settings), model_request_parameters
+                    )
+                break
+            except ModelHTTPError as exc:
+                self.state.usage_complete = False
+                # Failed calls consume requests too; retry only unambiguous transient HTTP failures.
+                if self.usage is not None:
+                    self.usage.requests += 1
+                if exc.status_code != 429:
+                    self.state.unreported_token_reserve += reserved
+                failure_details(
+                    exc,
+                    scope="request",
+                    stage=self.state.phase,
+                    threshold={
+                        "requests": self.budget.requests,
+                        "seconds": self.budget.request_timeout_seconds,
+                    },
+                    consumption={
+                        "requests": self.usage.requests if self.usage else None,
+                        "unreported_token_reserve": self.state.unreported_token_reserve,
+                    },
+                )
+                if (
+                    exc.status_code not in {429, 502, 503, 504}
+                    or attempt >= self.state.options.provider_retries
+                    or self.usage is None
+                    or self.usage.requests >= self.budget.requests
+                ):
+                    raise
+                self.state.emit(
+                    {
+                        "provider_retry": {
+                            "stage": self.state.phase,
+                            "status_code": exc.status_code,
+                            "attempt": attempt + 1,
+                        }
+                    }
+                )
+                await asyncio.sleep(min(0.25 * 2**attempt, 1))
+            except TimeoutError as exc:
+                if self.usage is not None:
+                    self.usage.requests += 1
+                self.state.unreported_token_reserve += reserved
+                self.state.usage_complete = False
+                self.state.exhausted_phase = self.state.phase
+                error = RequestTimeout("model request timeout")
+                failure_details(
+                    error,
+                    scope="request",
+                    stage=self.state.phase,
+                    threshold={"seconds": self.budget.request_timeout_seconds},
+                    consumption={"seconds": perf_counter() - started},
+                )
+                raise error from exc
+            except BaseException:
+                if self.usage is not None:
+                    self.usage.requests += 1
+                self.state.unreported_token_reserve += reserved
+                self.state.usage_complete = False
+                raise
+        else:
+            raise AssertionError("provider retry loop exhausted")
         self.state.request_responses += 1
+        shape = {
+            "stage": self.state.phase,
+            "parts": [p.part_kind for p in response.parts],
+            "finish_reason": response.finish_reason,
+        }
+        self.state.emit({"response_shape": shape})
         if response.usage.input_tokens == 0 and response.usage.output_tokens == 0:
             self.state.usage_complete = False
+            self.state.unreported_token_reserve += reserved
+        protocol_failure: str | None = None
+        tool_parts = [part for part in response.parts if isinstance(part, ToolCallPart)]
+        if len(tool_parts) > 1:
+            protocol_failure = "multiple_native_actions"
+        else:
+            for part in tool_parts:
+                if isinstance(part.args, str):
+                    try:
+                        parse_action(part.args, self.state.options.transport_policy)
+                    except ValueError:
+                        protocol_failure = "invalid_native_arguments"
+        if (
+            protocol_failure
+            or response.finish_reason == "error"
+            or not any(
+                isinstance(p, (TextPart, ToolCallPart))
+                and (not isinstance(p, TextPart) or p.content.strip())
+                for p in response.parts
+            )
+        ):
+            if self.usage is not None:
+                self.usage.incr(response.usage)
+                self.usage.requests += 1
+            raise UnexpectedModelBehavior(
+                protocol_failure
+                or (
+                    "provider_finish_error"
+                    if response.finish_reason == "error"
+                    else "reasoning_only_response"
+                )
+            )
         return response
 
 
-def _check_output(env: TaskEnvironment, answer: Answer) -> Answer:
+def _check_output(task: TaskInput, env: TaskEnvironment, answer: Answer) -> Answer:
+    validate_artifact(task, answer, env.state.options.artifact_contract)
     env.state.candidate(answer, "output")
     return answer
 
@@ -157,12 +353,12 @@ Do not rewrite or copy the draft when accepting it. No decision guarantees corre
 
 
 def _record_decision(
-    env: TaskEnvironment, decision: ReviewDecision[Answer]
+    task: TaskInput, env: TaskEnvironment, decision: ReviewDecision[Answer]
 ) -> ReviewDecision[Answer]:
+    if decision.replacement is not None:
+        _check_output(task, env, decision.replacement)
     env.state.review_decision = decision.model_dump()
     env.state.emit({"review_decision": env.state.review_decision})
-    if decision.replacement is not None:
-        _check_output(env, decision.replacement)
     return decision
 
 
@@ -181,7 +377,7 @@ async def _solve_json(
     )
     # The same text JSON protocol works even when a provider lacks native function calling.
     agent = Agent(
-        ObservedModel(model, env.state, budget),
+        ObservedModel(model, env.state, budget, usage),
         output_type=str,
         model_settings=settings,
         capabilities=[Instrumentation()],
@@ -224,28 +420,34 @@ async def _solve_json(
         )
         history = result.all_messages()
         try:
-            action = json.loads(result.output)
-            if (
-                isinstance(action, dict)
-                and set(cast(dict[str, Any], action)) == {"sql"}
-                and isinstance(action["sql"], str)
-            ):
+            action = parse_action(result.output, env.state.options.transport_policy)
+            if set(action) == {"sql"} and isinstance(action["sql"], str):
                 if finalizing:
                     prompt = "No tools in finalization; return your final values mapping."
                 else:
                     prompt = "SQL result: " + json.dumps(env.query(action["sql"]))
             elif (
-                isinstance(action, dict)
-                and set(cast(dict[str, Any], action)) == {"candidate"}
+                set(action) == {"candidate"}
                 and env.state.options.candidate_submission
                 and not finalizing
             ):
-                prompt = json.dumps(env.submit_candidate(cast(dict[str, Any], action)["candidate"]))
+                prompt = json.dumps(env.submit_candidate(action["candidate"]))
             else:
                 if decision_mode:
-                    return _record_decision(env, ReviewDecision[Answer].model_validate(action))
-                return _check_output(env, Answer.model_validate(action))
-        except (ValueError, TypeError):
+                    return _record_decision(
+                        task, env, ReviewDecision[Answer].model_validate(action)
+                    )
+                return _check_output(task, env, Answer.model_validate(action))
+        except (ValueError, TypeError) as exc:
+            env.state.emit(
+                {
+                    "protocol_error": {
+                        "stage": env.state.phase,
+                        "type": type(exc).__name__,
+                        "code": str(exc) if isinstance(exc, ProtocolError) else "output_contract",
+                    }
+                }
+            )
             invalid_outputs += 1
             if invalid_outputs > env.state.options.output_retries:
                 raise UnexpectedModelBehavior("SQL output retries exhausted") from None
@@ -281,7 +483,7 @@ async def _solve_native(
     if not finalizing and env.state.options.candidate_submission:
         tool_functions.append(submit_candidate)
     agent = Agent(
-        ObservedModel(model, env.state, budget),
+        ObservedModel(model, env.state, budget, usage),
         output_type=ReviewDecision[Answer] if decision_mode else Answer,
         tools=tool_functions,
         retries={"output": env.state.options.output_retries},
@@ -314,9 +516,12 @@ async def _solve_native(
     async def validate_output(
         answer: Answer | ReviewDecision[Answer],
     ) -> Answer | ReviewDecision[Answer]:
-        if isinstance(answer, ReviewDecision):
-            return _record_decision(env, answer)
-        return _check_output(env, answer)
+        try:
+            if isinstance(answer, ReviewDecision):
+                return _record_decision(task, env, answer)
+            return _check_output(task, env, answer)
+        except ArtifactContractError as exc:
+            raise ModelRetry(str(exc)) from exc
 
     result = await agent.run(
         prompt,
@@ -346,7 +551,11 @@ async def _orchestrate(
     solve = _solve_json if json_protocol else _solve_native
     state = env.state
     deadline = state.started + budget.seconds
-    work_deadline = deadline - budget.finalization_seconds
+    work_deadline = (
+        deadline
+        - budget.finalization_seconds
+        - min(state.options.return_reserve_seconds, budget.seconds / 10)
+    )
     work_tokens = budget.total_tokens - budget.finalization_tokens
     work_requests = budget.requests - budget.finalization_requests
 
@@ -379,6 +588,48 @@ async def _orchestrate(
         phase_budget = budget.model_copy(
             update={"total_tokens": token_limit, "requests": request_limit}
         )
+        profile = state.options.role_profiles.get(name) or (
+            binding.role_profiles.get(name)
+            if binding
+            else (model.role_profiles.get(name) if isinstance(model, ContextBoundModel) else None)
+        )
+        if profile:
+            phase_budget = phase_budget.model_copy(
+                update={
+                    "max_output_tokens": min(
+                        profile.max_output_tokens,
+                        budget.max_output_tokens or profile.max_output_tokens,
+                    ),
+                    "request_timeout_seconds": min(
+                        profile.request_timeout_seconds,
+                        budget.request_timeout_seconds or profile.request_timeout_seconds,
+                    ),
+                }
+            )
+        record.update(
+            token_limit=token_limit,
+            request_limit=request_limit,
+            deadline_seconds=until - state.started,
+            budget_profile=profile.model_dump() if profile else None,
+        )
+
+        def annotate(exc: BaseException) -> None:
+            record["failure"] = failure_details(
+                exc,
+                scope="phase",
+                stage=name,
+                threshold={
+                    "seconds": until - state.started,
+                    "tokens": token_limit,
+                    "requests": request_limit,
+                },
+                consumption={
+                    "seconds": perf_counter() - state.started,
+                    "tokens": usage.total_tokens,
+                    "requests": usage.requests,
+                },
+            )
+
         with trace.get_tracer(__name__).start_as_current_span("evaluation.phase") as span:
             span.set_attribute("openinference.span.kind", "CHAIN")
             span.set_attribute("evaluation.phase", name)
@@ -403,19 +654,24 @@ async def _orchestrate(
                     record["review_action"] = result.action
                     span.set_attribute("orchestration.review.action", result.action)
                 return result
-            except RequestTimeout:
+            except RequestTimeout as exc:
+                annotate(exc)
                 record["status"] = "request_timeout"
                 state.exhausted_phase = name
                 raise
             except TimeoutError as exc:
                 record["status"] = "timeout"
                 state.exhausted_phase = name
-                raise PhaseTimeout("phase wall-clock budget exhausted") from exc
-            except (UsageLimitExceeded, ToolBudgetExceeded):
+                error = PhaseTimeout("phase wall-clock budget exhausted")
+                annotate(error)
+                raise error from exc
+            except (UsageLimitExceeded, ToolBudgetExceeded) as exc:
+                annotate(exc)
                 record["status"] = "budget_exhausted"
                 state.exhausted_phase = name
                 raise
-            except BaseException:
+            except BaseException as exc:
+                annotate(exc)
                 record["status"] = "interrupted"
                 raise
             finally:

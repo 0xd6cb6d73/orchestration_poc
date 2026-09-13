@@ -84,7 +84,9 @@ async def test_harness_grades_whatever_execution_returns(
         models=[ModelSpec(name="test", model_class="baseline", model="test")],
         strategies=[strategy],
         architecture_options={
-            strategy: ArchitectureOptions(review_failure_policy="return_submitted_draft")
+            strategy: ArchitectureOptions(
+                artifact_contract="legacy-v1", review_failure_policy="return_submitted_draft"
+            )
         },
     )
     result = await runner.run_trial(case, cfg.models[0], strategy, 1, cfg)
@@ -118,7 +120,11 @@ async def test_hard_harness_deadline_never_selects_a_candidate(
         budget=Budget(seconds=0.3),
         architecture_options={
             "review": ArchitectureOptions.model_validate(
-                {"review_failure_policy": "return_submitted_draft", "review_protocol": protocol}
+                {
+                    "review_failure_policy": "return_submitted_draft",
+                    "review_protocol": protocol,
+                    "return_reserve_seconds": 0,
+                }
             )
         },
     )
@@ -191,7 +197,11 @@ async def test_heterogeneous_models_settings_usage_and_prices(
     cfg = Matrix(
         models=[primary],
         strategies=["review"],
-        architecture_options={"review": ArchitectureOptions(phase_models={"review": secondary})},
+        architecture_options={
+            "review": ArchitectureOptions(
+                artifact_contract="legacy-v1", phase_models={"review": secondary}
+            )
+        },
     )
     result = await runner.run_trial(case, primary, "review", 1, cfg)
     assert seen == ["drafter", "reviewer"]
