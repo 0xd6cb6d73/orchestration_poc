@@ -8,6 +8,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from poc.evaluation.diagnostic.cli import add_arguments as diagnostic_arguments
+from poc.evaluation.diagnostic.cli import run_cli as run_diagnostic_cli
 from poc.evaluation.suite.adapters import ADAPTERS
 from poc.evaluation.suite.models import Matrix
 from poc.evaluation.suite.phoenix import publish, reconcile
@@ -39,6 +41,10 @@ def main() -> None:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("list", help="List registered orchestration strategies and task families")
+    diagnostic = commands.add_parser(
+        "diagnose", help="Fast infrastructure probes, without performance scoring"
+    )
+    diagnostic_arguments(diagnostic)
     monitor_parser = commands.add_parser(
         "monitor", help="Count trials and expected batch verification files"
     )
@@ -95,6 +101,12 @@ def main() -> None:
             parser.error(str(exc))
     for module in args.plugin:
         importlib.import_module(module)
+    if args.command == "diagnose":
+        try:
+            status = run_diagnostic_cli(args)
+        except (ValueError, FileExistsError) as exc:
+            parser.error(str(exc))
+        raise SystemExit(status)
     if args.command == "monitor":
         from poc.evaluation.suite.batches import monitor
 

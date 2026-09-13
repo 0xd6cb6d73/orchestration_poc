@@ -5,6 +5,17 @@ The task-independent suite lives in `poc/evaluation/suite`. The existing
 regression checks. Their report phrase and worker-count gates are not capability scores.
 The new suite grades final answers and constraints, without rewarding extra agents or calls.
 
+## Fast infrastructure check
+
+Use [the diagnostic evaluation](infrastructure-diagnostics.md) to exercise every strategy
+and known failure/recovery paths in seconds, without running the benchmark matrix:
+
+```sh
+.venv/bin/python -m poc.evaluation.suite --no-env-file diagnose
+```
+
+It also offers short live-provider canaries for one selected model binding.
+
 ## Run
 
 ```bash

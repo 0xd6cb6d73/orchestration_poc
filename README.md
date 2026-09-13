@@ -402,3 +402,5 @@ Start with `configs/evaluation-smoke.json` for offline validation, then calibrat
 of `configs/evaluation-models.json` before a full sweep.
 
 SQL reliability and concurrent execution policies, calibration, and new evaluation configs are documented in [docs/sql-infrastructure.md](docs/sql-infrastructure.md).
+
+For a quick infrastructure check across every SQL strategy, run `.venv/bin/python -m poc.evaluation.suite --no-env-file diagnose`. See [the diagnostic guide](docs/infrastructure-diagnostics.md) for evidence reports and short live-provider canaries.

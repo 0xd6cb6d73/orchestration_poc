@@ -96,6 +96,10 @@ not evidence of better end-to-end solving or scalability.
 
 ## Reporting and running
 
+For fast regression detection, use [infrastructure diagnostics](infrastructure-diagnostics.md):
+`python -m poc.evaluation.suite --no-env-file diagnose`. It exercises all strategies and
+injected failures with a small public task, without launching the full matrix.
+
 Trial failures include sanitized exception type, request/phase/trial scope, stage/index,
 thresholds, and consumption. Phase timeouts use `phase_timeout`; failed submissions are
 counted in `no_submissions`, separate from malformed returned `invalid_answers`.
