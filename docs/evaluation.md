@@ -170,7 +170,8 @@ latency or distributed worker throughput. No candidate sees another sealed propo
 Hybrid scores and verification are model judgments over public SQL data; the official
 grader sees only the final returned answer. Rejected verification fails the trial.
 
-All team workers use the matrix model, or the strategy's `phase_models.solve` binding.
+Team workers use the matrix model unless an execution role has a `phase_models`
+binding; `phase_models.solve` remains the fallback for unbound team roles.
 Review-specific options remain exclusive to `review`/`review-json`. Team adapters currently
 reject finalization reserves; configure those only for single/review strategies. Prompts,
 fanout (two), and hybrid round count (one) are versioned in the implementation, not supplied
@@ -433,3 +434,71 @@ feasible answer; Qwen3.8 timed out before review in all six trials. The live run
 not exercise accept, decline, or protocol-error recovery; deterministic tests cover
 those branches. The protocol remains opt-in, with no demonstrated task-success gain
 from this small comparison.
+
+### Bounded SQL team workers
+
+Team strategies now default to `architecture_options.<strategy>.team_policy="bounded-v1"`
+(`sql-team-v2` in events). `legacy-v1` retains the earlier shared solve worker for
+policy comparisons; the common malformed-JSON retry fix still applies. To compare
+against the exact pre-fix implementation, run checkpoint `d5acbfc` separately.
+
+The execution worker supplies typed plan, critique, and verification outputs in both
+native and JSON transports. Final answers retain the public task's answer mapping;
+structural conformance does not imply semantic correctness. Intermediate plans and
+scores are no longer recorded as candidate task answers. Malformed actions receive
+at most `output_retries` retries. Repeating the same SQL error more than
+`output_retries + 1` times without a successful query stops the worker.
+
+Every stage has a cumulative fraction of the original wall-clock, token, request,
+and tool ceilings. Unused earlier allocation carries forward; later allocation
+cannot be borrowed. Default weights are:
+
+| Methods | Stages | Weights |
+|---|---|---|
+| DAG, board, pool | plan, solve | .20, .80 |
+| speculative | proposal, proposal, reconcile | .35, .35, .30 |
+| hybrid | proposal, proposal, critique, critique, verify | .30, .30, .12, .12, .16 |
+
+An explicit `stage_weights` list may override these; it must match the stage count
+and sum to one. These defaults are hypotheses to evaluate, not tuned success claims.
+Bounded workers default to a 60s request timeout and completion caps of 4096 tokens
+for plan/critique/verify and 16384 for other roles. Explicit budget settings override
+these defaults. Cancelled requests retain incomplete usage accounting.
+
+A `ModelSpec.context_window` enables conservative input-plus-completion admission
+control, including schemas. The estimate uses serialized UTF-8 bytes plus framing
+allowance, not the provider's exact tokenizer. It can stop earlier than necessary;
+it never truncates or summarizes task inputs. Bounded workers also reserve estimated
+input tokens before setting each request's completion cap. Provider usage remains
+the accounting authority and hard-budget overshoots remain failures.
+
+`phase_models` accepts `plan`/`solve` for DAG, board and pool; `proposal`/`reconcile`
+for speculation; and `proposal`/`critique`/`verify` for hybrid. Repeated roles share a
+binding. A legacy `solve` binding is the fallback for unbound team roles. These change
+model invocation, not just worker labels. Phase records include the role, stage
+index, actual model, cumulative limits and measured usage.
+
+Speculative execution supports an explicit `speculative_failure_policy` of
+`return_first_submitted`. After an eligible later-stage failure it can return the
+first controller-committed candidate within the original hard limits, recording
+`first_submitted_fallback` and the failure. It never picks by benchmark score.
+The default is `fail`. External cancellation propagates. Hybrid always requires
+selection and accepted verification; speculative retention does not bypass its gate.
+
+The [DeepSeek tuning matrix](../configs/evaluation-deepseek-role-tuning.json) is a
+separate, single-seed configuration experiment. It raises request timeouts to 180s,
+allows up to 65536 completion tokens for planning, 32768 for solving/proposals/
+reconciliation, and 16384 for critique/verification. DAG, board and pool allocate
+70% cumulatively to planning; hybrid uses .30, .30, .20, .10, .10. The total remains
+300000 tokens and 300s. These allowances include provider-reported completion usage,
+which can greatly exceed the size of the visible structured output. The public task,
+SQL tools, role contracts and grader are unchanged. Treat this as a tuning candidate,
+not a generally validated model profile.
+
+The [300k-token seed-0 comparison](../var/evaluation/deepseek-bounded-300k-20260912/analysis.md)
+measured 1/80 feasible team finals with the initial bounded profile versus 9/80 with
+the exact pre-fix control. Typed role outputs and finite retry handling address
+protocol defects, but the initial time/completion limits also cut off productive
+DeepSeek calls. These defaults are not a demonstrated quality improvement. Keep
+execution completion, final feasibility and incomplete usage separate when comparing
+profiles; larger allowances and heterogeneous bindings require their own trials.

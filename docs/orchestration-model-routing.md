@@ -36,7 +36,7 @@ The [pilot report](../var/evaluation/review-recovery-seed0-analysis.md) preserve
 
 | Strategy/component | Existing heterogeneous support | Next integration step |
 |---|---|---|
-| Single/review SQL agents | This change adds independent solve/draft/review/finalize bindings and records per-phase usage. | Compare fixed model teams; add an execution-owned accept/revise review protocol before dynamic routing. |
+| Single/review SQL agents | Independent solve/draft/review/finalize bindings, per-phase usage, and versioned accept/revise/decline decisions are implemented. | Compare fixed model teams and identical-draft reviewer replays before dynamic routing. |
 | Hierarchical DAG/workflows | `TaskSpec.agent_provider`, `agent_model`, and `agent_options` override `RoleSpec`; `WorkerAdapter.execute` resolves these into the spawned agent. `PydanticAIAgentExecutor` uses that binding. | Declare planner, domain worker and reviewer bindings in versioned workflow configuration; benchmark the real workflow path rather than relabeling the SQL review adapter as hierarchical. |
 | Board claims | Tasks have required roles; workers carry provider/model identity. Capacity is reconciled per role. | Use distinct roles for model specializations and avoid a global `ExecutionPolicy.agent_model` override that homogenizes workers. Add explicit per-role bindings to policy if roles should remain model-independent. |
 | Managed pool | Role quotas, eligible-role offers and worker identities already constrain assignment. | Include model capability/provider/latency information in offers and deterministic assignment policy. Prices/latency estimates must come from declared configuration or prior observations, never current-task gold scores. |
@@ -97,10 +97,20 @@ Saved-draft replay is useful to isolate reviewer behavior, with identical eviden
 to every reviewer. Label it a component evaluation: it excludes drafting costs and success
 rates and cannot replace an end-to-end orchestration benchmark. The suite now provides generic SQL adapters for the hierarchical,
 board, pool, speculative and hybrid controllers; see [evaluation methods](evaluation.md#models-and-strategies).
-Their `sql-team-v1` policies use serial model calls and fixed team shapes, so those comparisons
+Their legacy and bounded policies use serial model calls and fixed team shapes, so those comparisons
 do not measure parallel fanout latency or the incident workflow.
 
 The next bounded experiment should compare a small fixed set of model teams and one
 execution policy at a time. Do not add automatic constraint feedback or retune the task
 until the runs pass. Mixed models, escalation, and a structured review protocol are
 hypotheses to measure; this change does not assert that any particular model team wins.
+
+## Implemented SQL role bindings
+
+The bounded SQL team worker now accepts real `phase_models` overrides for `plan`,
+`proposal`, `critique`, `verify`, and `reconcile`, alongside the existing `solve`
+fallback. The worker resolves each role's model and settings independently, and the
+phase record reports the actual invocation. Typed outputs and stage admission are
+owned by execution. See [bounded SQL team workers](evaluation.md#bounded-sql-team-workers)
+for configuration and limits. Worker bidding remains a deterministic policy; these
+bindings do not introduce learned model selection or parallel candidate generation.

@@ -134,6 +134,8 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
     async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         if "SQL result:" not in str(messages):
             return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+        if "Develop a solution plan" in str(messages):
+            return ModelResponse(parts=[TextPart('{"values":{"plan":"SELECT x FROM data"}}')])
         return ModelResponse(parts=[TextPart('{"values":{"x":7}}')])
 
     env = TaskEnvironment(TASK, 1)

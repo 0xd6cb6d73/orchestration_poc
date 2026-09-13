@@ -12,6 +12,7 @@ from opentelemetry import trace
 from pydantic_ai import Agent, ModelMessage, ModelResponse, UsageLimits
 from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior, UsageLimitExceeded
+from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
@@ -29,26 +30,45 @@ from poc.execution.sql_ports import (
 
 
 def resolve_model(spec: ModelSpec) -> Model | str:
+    resolved: Model | str = spec.model
     if spec.base_url_env:
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
 
         endpoint = os.environ[spec.base_url_env]
-        return OpenAIChatModel(
+        resolved = OpenAIChatModel(
             spec.model,
             provider=OpenAIProvider(
                 base_url=endpoint,
                 api_key=os.environ[spec.api_key_env],
             ),
         )
-    return spec.model
+    return ContextBoundModel(resolved, spec.context_window) if spec.context_window else resolved
 
 
-class ObservedModel(WrapperModel):
-    def __init__(self, model: Model | str, state: TrialState, budget: Budget):
+def input_token_bound(messages: list[ModelMessage], parameters: ModelRequestParameters) -> int:
+    """Conservative UTF-8 byte estimate, including tool schemas and framing allowance.
+
+    This is admission control, not billable usage or an exact provider tokenizer.
+    No input is truncated or silently summarized.
+    """
+    schemas = [
+        {"name": t.name, "description": t.description, "schema": t.parameters_json_schema}
+        for t in [*parameters.function_tools, *parameters.output_tools]
+    ]
+    return (
+        len(ModelMessagesTypeAdapter.dump_json(messages)) + len(json.dumps(schemas).encode()) + 1024
+    )
+
+
+class ContextAdmissionExceeded(UsageLimitExceeded):
+    """Rejected locally, before any provider request or billable usage."""
+
+
+class ContextBoundModel(WrapperModel):
+    def __init__(self, model: Model | str, context_window: int):
         super().__init__(cast(Any, model))
-        self.state = state
-        self.budget = budget
+        self.context_window = context_window
 
     async def request(
         self,
@@ -56,18 +76,55 @@ class ObservedModel(WrapperModel):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
-        self.state.request_attempts += 1
+        room = self.context_window - input_token_bound(messages, model_request_parameters)
+        if room < 1:
+            raise ContextAdmissionExceeded("model context admission limit exhausted")
         settings = dict(model_settings or {})
+        settings["max_tokens"] = min(cast(int, settings.get("max_tokens") or room), room)
+        return await self.wrapped.request(
+            messages, cast(ModelSettings, settings), model_request_parameters
+        )
+
+
+class ObservedModel(WrapperModel):
+    def __init__(
+        self, model: Model | str, state: TrialState, budget: Budget, usage: RunUsage | None = None
+    ):
+        super().__init__(cast(Any, model))
+        self.state = state
+        self.budget = budget
+        self.usage = usage
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        settings = dict(model_settings or {})
+        if self.usage is not None:
+            room = (
+                self.budget.total_tokens
+                - self.usage.total_tokens
+                - input_token_bound(messages, model_request_parameters)
+            )
+            if room < 1:
+                raise UsageLimitExceeded("stage request admission limit exhausted")
+            settings["max_tokens"] = min(cast(int, settings.get("max_tokens") or room), room)
         if self.budget.max_output_tokens is not None:
             settings["max_tokens"] = min(
                 cast(int, settings.get("max_tokens") or self.budget.max_output_tokens),
                 self.budget.max_output_tokens,
             )
         try:
+            self.state.request_attempts += 1
             async with asyncio.timeout(self.budget.request_timeout_seconds):
                 response = await self.wrapped.request(
                     messages, cast(ModelSettings, settings), model_request_parameters
                 )
+        except ContextAdmissionExceeded:
+            self.state.request_attempts -= 1
+            raise
         except TimeoutError as exc:
             self.state.usage_complete = False
             self.state.exhausted_phase = self.state.phase
@@ -189,12 +246,10 @@ async def _solve_json(
                     return _record_decision(env, ReviewDecision[Answer].model_validate(action))
                 return _check_output(env, Answer.model_validate(action))
         except (ValueError, TypeError):
+            invalid_outputs += 1
+            if invalid_outputs > env.state.options.output_retries:
+                raise UnexpectedModelBehavior("SQL output retries exhausted") from None
             if decision_mode:
-                invalid_outputs += 1
-                if invalid_outputs > env.state.options.output_retries:
-                    raise UnexpectedModelBehavior(
-                        "review decision output retries exhausted"
-                    ) from None
                 prompt = "Invalid review protocol output." + REVIEW_DECISION_INSTRUCTIONS
                 continue
             prompt = 'Invalid action. Return ONLY {"sql":"..."} or {"values":{...}}.'

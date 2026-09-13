@@ -48,11 +48,14 @@ class ModelSpec(StrictModel):
     base_url_env: str | None = None
     api_key_env: str = "OPENAI_API_KEY"
     settings: dict[str, Any] = Field(default_factory=lambda: {"temperature": 0})
+    context_window: int | None = Field(default=None, gt=0)
     input_usd_per_million: float | None = Field(default=None, ge=0)
     output_usd_per_million: float | None = Field(default=None, ge=0)
 
 
-PhaseName: TypeAlias = Literal["solve", "draft", "review", "finalize"]
+PhaseName: TypeAlias = Literal[
+    "solve", "draft", "review", "finalize", "plan", "proposal", "critique", "verify", "reconcile"
+]
 
 
 class ArchitectureOptions(StrictModel):
@@ -65,6 +68,19 @@ class ArchitectureOptions(StrictModel):
     output_retries: int = Field(default=1, ge=0)
     review_failure_policy: Literal["fail", "return_submitted_draft"] = "fail"
     review_protocol: Literal["replace", "decision-v1"] = "replace"
+    team_policy: Literal["legacy-v1", "bounded-v1"] = "bounded-v1"
+    speculative_failure_policy: Literal["fail", "return_first_submitted"] = "fail"
+    stage_weights: list[float] | None = None
+
+    @model_validator(mode="after")
+    def valid_stage_weights(self) -> ArchitectureOptions:
+        if self.stage_weights is not None and (
+            not self.stage_weights
+            or any(not 0 < w <= 1 for w in self.stage_weights)
+            or abs(sum(self.stage_weights) - 1) > 1e-6
+        ):
+            raise ValueError("stage_weights must be positive and sum to one")
+        return self
 
 
 class Answer(StrictModel):

@@ -1,0 +1,100 @@
+{
+  "models": [
+    {
+      "name": "qwen-2.5-7b",
+      "model_class": "7B",
+      "model": "qwen/qwen-2.5-7b-instruct",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "temperature": 0
+      },
+      "input_usd_per_million": 0.1,
+      "output_usd_per_million": 0.2,
+      "context_window": 32768
+    },
+    {
+      "name": "deepseek-v4-flash-0731",
+      "model_class": "frontier-flash",
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "temperature": 0
+      },
+      "input_usd_per_million": 0.04,
+      "output_usd_per_million": 0.08,
+      "context_window": 1048576
+    }
+  ],
+  "strategies": [
+    "hierarchical_dag",
+    "board_claim",
+    "managed_pool",
+    "speculative",
+    "hybrid_v1",
+    "hierarchical_dag-json",
+    "board_claim-json",
+    "managed_pool-json",
+    "speculative-json",
+    "hybrid_v1-json"
+  ],
+  "families": [
+    "scheduling",
+    "routing"
+  ],
+  "seeds": [
+    0
+  ],
+  "split": "dev",
+  "difficulty": "standard",
+  "repetitions": 2,
+  "budget": {
+    "requests": 40,
+    "tool_calls": 80,
+    "total_tokens": 300000,
+    "seconds": 300.0,
+    "request_timeout_seconds": null,
+    "max_output_tokens": null,
+    "finalization_seconds": 0,
+    "finalization_tokens": 0,
+    "finalization_requests": 0,
+    "draft_fraction": 0.6
+  },
+  "order_seed": 1729,
+  "max_concurrency": 4,
+  "architecture_options": {
+    "hierarchical_dag": {
+      "team_policy": "bounded-v1"
+    },
+    "board_claim": {
+      "team_policy": "bounded-v1"
+    },
+    "managed_pool": {
+      "team_policy": "bounded-v1"
+    },
+    "speculative": {
+      "team_policy": "bounded-v1",
+      "speculative_failure_policy": "return_first_submitted"
+    },
+    "hybrid_v1": {
+      "team_policy": "bounded-v1"
+    },
+    "hierarchical_dag-json": {
+      "team_policy": "bounded-v1"
+    },
+    "board_claim-json": {
+      "team_policy": "bounded-v1"
+    },
+    "managed_pool-json": {
+      "team_policy": "bounded-v1"
+    },
+    "speculative-json": {
+      "team_policy": "bounded-v1",
+      "speculative_failure_policy": "return_first_submitted"
+    },
+    "hybrid_v1-json": {
+      "team_policy": "bounded-v1"
+    }
+  }
+}

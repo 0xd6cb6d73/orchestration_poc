@@ -12,9 +12,11 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import perf_counter
 from typing import Any, cast
 
 from langgraph.graph import END, START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
+from pydantic_ai.exceptions import ModelAPIError, UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
@@ -26,9 +28,15 @@ from poc.execution.capacity import CapacityScheduler, InProcessWorkerMaterialize
 from poc.execution.hierarchical_strategy import HierarchicalDAGStrategy
 from poc.execution.managed_pool import ManagedPoolStrategy
 from poc.execution.speculative import SpeculativeStrategy
-from poc.execution.sql_contracts import Answer, Budget, TaskInput
-from poc.execution.sql_ports import TaskEnvironment
+from poc.execution.sql_contracts import Answer, ArchitectureOptions, Budget, PhaseName, TaskInput
+from poc.execution.sql_ports import (
+    PhaseTimeout,
+    RequestTimeout,
+    TaskEnvironment,
+    ToolBudgetExceeded,
+)
 from poc.execution.sql_strategy import single, single_json
+from poc.execution.sql_team_worker import TeamWorker
 from poc.hybrid.collaboration_controller import CollaborationController
 from poc.hybrid.communication import CommunicationService
 from poc.hybrid.completion_gate import CompletionGate
@@ -56,7 +64,7 @@ from poc.roles.registry import RoleRegistry
 from poc.services.artifact_store import ArtifactStore
 
 METHODS = (*[mode.value for mode in ExecutionMode], "hybrid_v1")
-Solve = Callable[[str], Awaitable[Answer]]
+Solve = Callable[[str, PhaseName], Awaitable[Answer]]
 
 
 class SQLTeam:
@@ -71,12 +79,18 @@ class SQLTeam:
         *,
         backend: str,
         model_name: str,
+        options: ArchitectureOptions | None = None,
     ):
+        self.options = options or ArchitectureOptions()
+        self.policy_version = (
+            "sql-team-v2" if self.options.team_policy == "bounded-v1" else "sql-team-v1"
+        )
         self.task = task
         self.backend = backend
         self.model_name = model_name
         self.db = Database(root / "scheduler.sqlite")
         self.emitted = 0
+        self.submitted: list[Answer] = []
         self.artifacts = ArtifactStore(root / "artifacts", self.db)
         self.mode = ExecutionMode.BOARD_CLAIM if method == "hybrid_v1" else ExecutionMode(method)
         swarm = SwarmStrategy.HYBRID_V1 if method == "hybrid_v1" else SwarmStrategy.BOARD
@@ -128,6 +142,10 @@ class SQLTeam:
             ExecutionMode.SPECULATIVE: SpeculativeStrategy,
         }[self.mode](self.db)
 
+    def model_for(self, role: PhaseName) -> str:
+        binding = self.options.phase_models.get(role) or self.options.phase_models.get("solve")
+        return binding.model if binding else self.model_name
+
     def agent(self, name: str, tier: Tier, parent: str) -> AgentInstance:
         agent = AgentInstance(
             agent_instance_id=name,
@@ -146,7 +164,7 @@ class SQLTeam:
     def flush(self, emit: Callable[[dict[str, Any]], None], method: str) -> None:
         events = self.db.events("sql-run")
         for event in events[self.emitted :]:
-            emit({"orchestration": {"method": method, "policy": "sql-team-v1", **event}})
+            emit({"orchestration": {"method": method, "policy": self.policy_version, **event}})
         self.emitted = len(events)
 
     async def start(self) -> None:
@@ -164,9 +182,11 @@ class SQLTeam:
         solve: Solve,
         prompt: str,
         dependencies: tuple[str, ...] = (),
+        role: PhaseName = "solve",
     ) -> Answer:
         board = cast(BoardClaimStrategy, self.strategy)
-        worker = self.workers[index]
+        worker = self.workers[index].model_copy(update={"agent_model": self.model_for(role)})
+        self.db.put_agent(worker)
         capacity = CapacityScheduler(
             self.db, InProcessWorkerMaterializer(SpawnPolicy(self.db, RoleRegistry()))
         )
@@ -184,7 +204,7 @@ class SQLTeam:
         if claim is None or claim.task_id != task_id:
             raise RuntimeError("SQL worker could not claim its ready task")
         try:
-            answer = await solve(prompt)
+            answer = await solve(prompt, role)
             board.complete(claim, result_ref=answer.model_dump_json())
             return answer
         except BaseException:
@@ -207,10 +227,10 @@ class SQLTeam:
         if method == "hierarchical_dag":
 
             async def plan_node(state: dict[str, Any]) -> dict[str, Any]:
-                return {"plan": await solve(plan_prompt)}
+                return {"plan": await solve(plan_prompt, "plan")}
 
             async def solve_node(state: dict[str, Any]) -> dict[str, Any]:
-                return {"answer": await solve(final_prompt(state["plan"]))}
+                return {"answer": await solve(final_prompt(state["plan"]), "solve")}
 
             graph = cast(Any, StateGraph(cast(Any, dict)))
             graph.add_node("plan", plan_node)
@@ -221,7 +241,7 @@ class SQLTeam:
             result = await graph.compile().ainvoke({})
             return cast(Answer, result["answer"])
         if method == "board_claim":
-            plan = await self.board_work(0, "plan", solve, plan_prompt)
+            plan = await self.board_work(0, "plan", solve, plan_prompt, role="plan")
             return await self.board_work(1, "solve", solve, final_prompt(plan), ("plan",))
         if method == "managed_pool":
             pool = cast(ManagedPoolStrategy, self.strategy)
@@ -232,7 +252,7 @@ class SQLTeam:
                 for w in self.workers[:2]
             ]
 
-            async def assigned(task_id: str, prompt: str) -> Answer:
+            async def assigned(task_id: PhaseName, prompt: str) -> Answer:
                 offer = pool.publish_offer(
                     execution_id=self.handle.execution_id,
                     task_id=task_id,
@@ -244,7 +264,7 @@ class SQLTeam:
                         execution_id=self.handle.execution_id, offer_id=offer, slot_id=slot
                     )
                 assignment = pool.arbitrate(execution_id=self.handle.execution_id, offer_id=offer)
-                answer = await solve(prompt)
+                answer = await solve(prompt, task_id)
                 pool.complete(assignment, result_ref=answer.model_dump_json())
                 return answer
 
@@ -266,14 +286,17 @@ class SQLTeam:
             ]
             for index, grant in enumerate(grants):
                 answer = await solve(
-                    f"Independently solve the complete task. You are candidate {index + 1}."
+                    f"Independently solve the complete task. You are candidate {index + 1}.",
+                    "proposal",
                 )
                 candidates.append(answer)
                 speculative.complete_candidate(grant, result_ref=answer.model_dump_json())
+                self.submitted.append(answer.model_copy(deep=True))
             answer = await solve(
                 "Reconcile these independent candidate answers. Inspect SQL as needed "
                 "and return your complete final answer: "
-                + json.dumps([a.model_dump() for a in candidates])
+                + json.dumps([a.model_dump() for a in candidates]),
+                "reconcile",
             )
             speculative.reconcile(
                 execution_id=self.handle.execution_id,
@@ -303,6 +326,7 @@ class SQLTeam:
                 f"proposal-{index}",
                 solve,
                 f"Independently solve the complete task. You are sealed proposer {index + 1}.",
+                role="proposal",
             )
             artifact = self.artifacts.write(
                 "sql-run",
@@ -325,7 +349,7 @@ class SQLTeam:
                 agent_instance_id=worker.agent_instance_id,
                 task_id=f"proposal-{index}",
                 attempt_id=f"proposal-{index}-1",
-                context_policy_version="sql-team-v1",
+                context_policy_version=self.policy_version,
                 goal_contract_id=goal.goal_contract_id,
             )
             self.db.put_context_manifest(manifest)
@@ -340,7 +364,7 @@ class SQLTeam:
                     role_version=1,
                     prompt_fingerprint=hashlib.sha256(self.task.prompt.encode()).hexdigest(),
                     agent_backend=self.backend,
-                    model=self.model_name,
+                    model=self.model_for("proposal"),
                     context_manifest_id=manifest.context_manifest_id,
                 )
             )
@@ -364,6 +388,7 @@ class SQLTeam:
                 "with each score an integer 0..5 (5 strongest). These are your judgments, "
                 "not benchmark feedback. Candidate: "
                 + answers[candidate.candidate_id].model_dump_json(),
+                role="critique",
             )
             evaluation = EvaluationVector.model_validate(critique.values)
             artifact = self.artifacts.write(
@@ -406,6 +431,7 @@ class SQLTeam:
             'Return {"values":{"answer_supported":true}} if supported, or false otherwise. '
             "This is your judgment, not a benchmark score. Answer: "
             + answers[selected.candidate_id].model_dump_json(),
+            role="verify",
         )
         if (
             set(check.values) != {"answer_supported"}
@@ -423,7 +449,7 @@ class SQLTeam:
         verification.accept(
             request=request,
             verdict=verdict,
-            policy_version="sql-team-v1",
+            policy_version=self.policy_version,
             downstream_uses=("submit_answer",),
         )
         controller.advance(round_.round_id, CollaborationPhase.VERIFIED_AND_SCORED)
@@ -461,8 +487,14 @@ def adapter(method: str, *, json_protocol: bool = False):
             raise ValueError("SQL runtime adapters do not support finalization reserves")
         worker = single_json if json_protocol else single
 
-        async def solve(instruction: str) -> Answer:
+        bounded_worker = TeamWorker(
+            method, task, env, model, settings, budget, usage, json_protocol=json_protocol
+        )
+
+        async def solve(instruction: str, role: PhaseName) -> Answer:
             team.flush(env.state.emit, method)
+            if env.state.options.team_policy == "bounded-v1":
+                return await bounded_worker(instruction, role)
             return await worker(
                 task.model_copy(update={"prompt": task.prompt + "\n" + instruction}),
                 env,
@@ -486,10 +518,35 @@ def adapter(method: str, *, json_protocol: bool = False):
                 budget,
                 backend="sql-json" if json_protocol else "sql-native",
                 model_name=model_name,
+                options=env.state.options,
             )
             try:
                 await team.start()
-                return await team.run(method, solve)
+                try:
+                    return await team.run(method, solve)
+                except (
+                    PhaseTimeout,
+                    RequestTimeout,
+                    UsageLimitExceeded,
+                    ToolBudgetExceeded,
+                    ModelAPIError,
+                    UnexpectedModelBehavior,
+                ) as exc:
+                    if not (
+                        method == "speculative"
+                        and env.state.options.speculative_failure_policy == "return_first_submitted"
+                        and team.submitted
+                        and perf_counter() < env.state.started + budget.seconds
+                        and usage.total_tokens <= budget.total_tokens
+                        and usage.requests <= budget.requests
+                    ):
+                        raise
+                    # First committed artifact, never the grader's best candidate. Hybrid's
+                    # verification gate is not bypassed by this speculative-only policy.
+                    env.state.answer_source = "first_submitted_fallback"
+                    env.state.recovery = {"error": type(exc).__name__, "phase": env.state.phase}
+                    env.state.emit({"recovery": env.state.recovery})
+                    return team.submitted[0].model_copy(deep=True)
             finally:
                 try:
                     team.flush(env.state.emit, method)

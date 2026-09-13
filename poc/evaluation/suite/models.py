@@ -62,11 +62,38 @@ class Matrix(StrictModel):
         if set(self.architecture_options) - set(self.strategies):
             raise ValueError("architecture_options must refer to configured strategies")
         for strategy, options in self.architecture_options.items():
+            method = strategy.removesuffix("-json")
+            team_phases = {
+                "hierarchical_dag": {"plan", "solve"},
+                "board_claim": {"plan", "solve"},
+                "managed_pool": {"plan", "solve"},
+                "speculative": {"proposal", "reconcile"},
+                "hybrid_v1": {"proposal", "critique", "verify"},
+            }
             allowed_phases = (
                 {"draft", "review", "finalize"}
                 if strategy in {"review", "review-json"}
                 else {"solve", "finalize"}
             )
+            if method in team_phases:
+                allowed_phases = team_phases[method] | {"solve"}
+                expected = 5 if method == "hybrid_v1" else 3 if method == "speculative" else 2
+                if options.stage_weights is not None and len(options.stage_weights) != expected:
+                    raise ValueError("stage_weights length must match the strategy stage count")
+            elif options.stage_weights is not None:
+                raise ValueError("stage_weights require a team strategy")
+            if options.speculative_failure_policy != "fail" and method != "speculative":
+                raise ValueError("speculative failure policy requires speculative execution")
+            if (
+                options.team_policy == "legacy-v1"
+                and (
+                    options.stage_weights is not None
+                    or set(options.phase_models) - {"solve"}
+                    or options.speculative_failure_policy != "fail"
+                )
+                and method in team_phases
+            ):
+                raise ValueError("legacy team policy only supports the solve model binding")
             if set(options.phase_models) - allowed_phases:
                 raise ValueError("phase_models contains phases unused by this strategy")
             if (
