@@ -180,7 +180,8 @@
     "board_claim-json",
     "managed_pool-json",
     "speculative-json",
-    "hybrid_v1-json"
+    "hybrid_v1-json",
+    "hybrid_v2-json"
   ],
   "families": [
     "scheduling",
@@ -249,6 +250,12 @@
       "team_policy": "reliable-v2",
       "artifact_contract": "public-v1",
       "return_reserve_seconds": 2
+    },
+    "hybrid_v2-json": {
+      "team_policy": "reliable-v2",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2,
+      "hybrid_plan_fanout": 2
     }
   }
 }

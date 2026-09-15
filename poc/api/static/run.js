@@ -71,7 +71,7 @@
 
   const renderHybrid = (hybrid, plan) => {
     const panel = document.getElementById("hybrid-panel");
-    const enabled = plan?.swarm_strategy === "hybrid_v1";
+    const enabled = ["hybrid_v1", "hybrid_v2"].includes(plan?.swarm_strategy);
     panel.hidden = !enabled;
     if (!enabled) return;
 

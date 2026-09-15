@@ -18,10 +18,14 @@
   };
 
   const syncSwarmStrategy = () => {
-    const hybrid = swarmStrategy.querySelector('option[value="hybrid_v1"]');
     const boardMode = executionMode.value === "board_claim";
-    hybrid.disabled = !boardMode;
-    if (!boardMode && swarmStrategy.value === "hybrid_v1") swarmStrategy.value = "board";
+    ["hybrid_v1", "hybrid_v2"].forEach((value) => {
+      const option = swarmStrategy.querySelector(`option[value="${value}"]`);
+      option.disabled = !boardMode;
+    });
+    if (!boardMode && ["hybrid_v1", "hybrid_v2"].includes(swarmStrategy.value)) {
+      swarmStrategy.value = "board";
+    }
   };
 
   backend.addEventListener("change", syncModelFields);

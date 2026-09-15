@@ -178,7 +178,8 @@
     "board_claim-json",
     "managed_pool-json",
     "speculative-json",
-    "hybrid_v1-json"
+    "hybrid_v1-json",
+    "hybrid_v2-json"
   ],
   "families": [
     "partitioned_ledger",
@@ -223,6 +224,12 @@
       "team_policy": "concurrent-v1",
       "artifact_contract": "public-v1",
       "return_reserve_seconds": 2
+    },
+    "hybrid_v2-json": {
+      "team_policy": "concurrent-v1",
+      "artifact_contract": "public-v1",
+      "return_reserve_seconds": 2,
+      "hybrid_plan_fanout": 2
     }
   }
 }

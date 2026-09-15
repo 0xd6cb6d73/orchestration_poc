@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from poc.models import (
+    HYBRID_STRATEGIES,
     AgentBackend,
     ExecutionMode,
     HybridConfig,
@@ -39,10 +40,10 @@ class OrchestrationBenchmarkVariant(BaseModel):
                     f"{self.agent_backend} benchmark variants require a provider or provider:model"
                 )
         if (
-            self.swarm_strategy == SwarmStrategy.HYBRID_V1
+            self.swarm_strategy in HYBRID_STRATEGIES
             and self.execution_mode != ExecutionMode.BOARD_CLAIM
         ):
-            raise ValueError("hybrid_v1 requires board_claim execution mode")
+            raise ValueError(f"{self.swarm_strategy.value} requires board_claim execution mode")
         return self
 
 

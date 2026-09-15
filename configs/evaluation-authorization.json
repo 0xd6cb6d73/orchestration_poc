@@ -10,7 +10,7 @@
       "settings": {"temperature": 0}
     }
   ],
-  "strategies": ["single", "review", "hierarchical_dag", "board_claim", "managed_pool", "speculative", "hybrid_v1"],
+  "strategies": ["single", "review", "hierarchical_dag", "board_claim", "managed_pool", "speculative", "hybrid_v1", "hybrid_v2"],
   "families": ["authorization"],
   "seeds": [0, 1, 2],
   "split": "dev",

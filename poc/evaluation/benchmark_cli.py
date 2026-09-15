@@ -14,7 +14,13 @@ from poc.evaluation.benchmark_models import (
     OrchestrationBenchmarkReport,
     OrchestrationBenchmarkVariant,
 )
-from poc.models import AgentBackend, ExecutionMode, SwarmStrategy, is_pydantic_ai_backend
+from poc.models import (
+    HYBRID_STRATEGIES,
+    AgentBackend,
+    ExecutionMode,
+    SwarmStrategy,
+    is_pydantic_ai_backend,
+)
 
 _API_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -87,8 +93,8 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
         parser.error("--max-concurrency must be at least 1")
     modes = [ExecutionMode(value) for value in args.mode] if args.mode else list(ExecutionMode)
     strategy = SwarmStrategy(args.strategy)
-    if strategy == SwarmStrategy.HYBRID_V1 and modes != [ExecutionMode.BOARD_CLAIM]:
-        parser.error("--strategy hybrid_v1 requires exactly --mode board_claim")
+    if strategy in HYBRID_STRATEGIES and modes != [ExecutionMode.BOARD_CLAIM]:
+        parser.error(f"--strategy {strategy.value} requires exactly --mode board_claim")
     provider = args.provider
     if provider is None and args.model and ":" in args.model:
         provider = args.model.split(":", 1)[0]

@@ -15,7 +15,8 @@
     "board_claim",
     "managed_pool",
     "speculative",
-    "hybrid_v1"
+    "hybrid_v1",
+    "hybrid_v2"
   ],
   "families": [
     "scheduling",

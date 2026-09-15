@@ -20,11 +20,13 @@
     "managed_pool",
     "speculative",
     "hybrid_v1",
+    "hybrid_v2",
     "hierarchical_dag-json",
     "board_claim-json",
     "managed_pool-json",
     "speculative-json",
-    "hybrid_v1-json"
+    "hybrid_v1-json",
+    "hybrid_v2-json"
   ],
   "families": [
     "scheduling",
@@ -189,6 +191,89 @@
           "settings": {
             "temperature": 0,
             "max_tokens": 32768
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        }
+      }
+    },
+    "hybrid_v2": {
+      "team_policy": "bounded-v1",
+      "hybrid_plan_fanout": 2,
+      "hybrid_pool_weights": {
+        "orchestrate": 0.24,
+        "task": 0.3,
+        "critique": 0.34,
+        "integrate": 0.05,
+        "verify": 0.07
+      },
+      "phase_models": {
+        "orchestrate": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 65536
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "task": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 32768
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "critique": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 16384
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "integrate": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 32768
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "verify": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 16384
           },
           "input_usd_per_million": 0.04,
           "output_usd_per_million": 0.08,
@@ -448,6 +533,89 @@
         0.1,
         0.1
       ]
+    },
+    "hybrid_v2-json": {
+      "team_policy": "bounded-v1",
+      "hybrid_plan_fanout": 2,
+      "hybrid_pool_weights": {
+        "orchestrate": 0.24,
+        "task": 0.3,
+        "critique": 0.34,
+        "integrate": 0.05,
+        "verify": 0.07
+      },
+      "phase_models": {
+        "orchestrate": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 65536
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "task": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 32768
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "critique": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 16384
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "integrate": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 32768
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        },
+        "verify": {
+          "name": "deepseek-v4-flash-0731",
+          "model_class": "frontier-flash",
+          "model": "deepseek/deepseek-v4-flash-0731",
+          "base_url_env": "OPENAI_BASE_URL",
+          "api_key_env": "OPENAI_API_KEY",
+          "settings": {
+            "temperature": 0,
+            "max_tokens": 16384
+          },
+          "input_usd_per_million": 0.04,
+          "output_usd_per_million": 0.08,
+          "context_window": 1048576
+        }
+      }
     }
   }
 }

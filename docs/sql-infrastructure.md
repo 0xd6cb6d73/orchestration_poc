@@ -54,6 +54,18 @@ them. Failed critiques abstain for that candidate. `hybrid_proposal_quorum` defa
 two and can explicitly be set to one. Surviving candidates must still pass criticism,
 selection, verification and the completion gate; timeouts never bypass these gates.
 
+`hybrid_v2` extends the collaboration engine with an LLM orchestrator that decomposes
+the task into 2–8 scoped tasks (`poc/hybrid/planning.py`). Plans are data, never
+authority: two sealed plan candidates are judged with the same evidence-based critique
+protocol and selected deterministically by score; the selected plan passes hard
+validation (scope, definition of done, acyclic dependencies, 2–8 tasks) with one
+bounded repair attempt before it becomes the round's plan of record. Tasks run in
+dependency waves under per-task goal contracts, receive targeted critiques, and an
+orchestrator decision loop accepts, revises, adds or escalates — bounded by
+`max_collaboration_rounds`. Revised and added tasks become derived candidates through
+`revise_candidate`. Integration, independent verification and the completion gate are
+unchanged from `hybrid_v1`.
+
 ## Measured role profiles
 
 Each model can specify `role_profiles`, with a version, `measurement_source`,

@@ -33,11 +33,13 @@
     "managed_pool",
     "speculative",
     "hybrid_v1",
+    "hybrid_v2",
     "hierarchical_dag-json",
     "board_claim-json",
     "managed_pool-json",
     "speculative-json",
-    "hybrid_v1-json"
+    "hybrid_v1-json",
+    "hybrid_v2-json"
   ],
   "families": [
     "scheduling",
@@ -80,6 +82,10 @@
     "hybrid_v1": {
       "team_policy": "bounded-v1"
     },
+    "hybrid_v2": {
+      "team_policy": "bounded-v1",
+      "hybrid_plan_fanout": 2
+    },
     "hierarchical_dag-json": {
       "team_policy": "bounded-v1"
     },
@@ -95,6 +101,10 @@
     },
     "hybrid_v1-json": {
       "team_policy": "bounded-v1"
+    },
+    "hybrid_v2-json": {
+      "team_policy": "bounded-v1",
+      "hybrid_plan_fanout": 2
     }
   }
 }

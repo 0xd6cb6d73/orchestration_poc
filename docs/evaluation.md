@@ -161,6 +161,7 @@ controllers with trial-local authority and storage; they do not run the incident
 | `managed_pool` | Two eligible pool slots bid for plan/solve offers; the pool arbitrates and completes assignments |
 | `speculative` | Two authorized independent candidate submissions, followed by a model reconciliation and persisted reconciliation decision |
 | `hybrid_v1` | Two sealed board-claimed proposals, fresh critiques, controller selection, independent model verification, and the existing acceptance/delivery gates |
+| `hybrid_v2` | An LLM orchestrator decomposes the task into 2–8 small scoped tasks (with per-task scope and definition of done), two sealed plan candidates are judged and deterministically selected, tasks run in dependency waves with per-task critiques, an orchestrator decision loop (accept/revise/add/escalate) drives bounded revisions, and integration flows through the existing independent verification and delivery gates |
 
 Every method also has a `-json` variant. Discover registered strategies (including plugins):
 
@@ -475,12 +476,22 @@ cannot be borrowed. Default weights are:
 | DAG, board, pool | plan, solve | .20, .80 |
 | speculative | proposal, proposal, reconcile | .35, .35, .30 |
 | hybrid | proposal, proposal, critique, critique, verify | .30, .30, .12, .12, .16 |
+| hybrid_v2 | orchestrate, task, critique, integrate, verify (role pools) | .24, .30, .34, .05, .07 |
 
 An explicit `stage_weights` list may override these; it must match the stage count
 and sum to one. These defaults are hypotheses to evaluate, not tuned success claims.
 Bounded workers default to a 60s request timeout and completion caps of 4096 tokens
 for plan/critique/verify and 16384 for other roles. Explicit budget settings override
 these defaults. Cancelled requests retain incomplete usage accounting.
+
+`hybrid_v2` replaces the positional stage array with per-role budget pools because its
+call count is adaptive (plan repairs and decision rounds). Each call consumes
+`pool(role) / planned(role)` of the trial budget, with unused allocation carrying
+forward and the verifier (the final stage) inheriting all unallocated budget.
+`POOL_PLANNED` fixes the expected calls per role: orchestrate = plan fan-out,
+task = 8, critique = fan-out + 2, integrate and verify = 1. An explicit
+`hybrid_pool_weights` mapping may override the pools; it must cover all five roles
+and sum to one.
 
 A `ModelSpec.context_window` enables conservative input-plus-completion admission
 control, including schemas. The estimate uses serialized UTF-8 bytes plus framing
@@ -490,10 +501,14 @@ input tokens before setting each request's completion cap. Provider usage remain
 the accounting authority and hard-budget overshoots remain failures.
 
 `phase_models` accepts `plan`/`solve` for DAG, board and pool; `proposal`/`reconcile`
-for speculation; and `proposal`/`critique`/`verify` for hybrid. Repeated roles share a
+for speculation; and `proposal`/`critique`/`verify` for hybrid. `hybrid_v2` adds
+`orchestrate`, `task` and `integrate` bindings. Repeated roles share a
 binding. A legacy `solve` binding is the fallback for unbound team roles. These change
 model invocation, not just worker labels. Phase records include the role, stage
-index, actual model, cumulative limits and measured usage.
+index, actual model, cumulative limits and measured usage. The shipped v2 tuning
+config binds `orchestrate` (the plan author and decision loop) to a frontier-class
+model; per-role overrides remain user-editable through the same `phase_models`
+mechanism.
 
 Speculative execution supports an explicit `speculative_failure_policy` of
 `return_first_submitted`. After an eligible later-stage failure it can return the

@@ -16,8 +16,8 @@ The standalone command `python -m poc.evaluation.diagnostic` runs the same check
 
 ## Coverage
 
-All seven orchestration strategies are exercised: single, review, hierarchical DAG,
-board claim, managed pool, speculative, and hybrid. Each runs with native tools and JSON
+All built-in orchestration strategies are exercised: single, review, hierarchical DAG,
+board claim, managed pool, speculative, and both hybrid strategies. Each runs with native tools and JSON
 transport. Team strategies exercise both `reliable-v2` serial execution and
 `concurrent-v1`; the SQL baseline also checks the public tool environment. Older
 `legacy-v1` and `bounded-v1` controls are outside this diagnostic's acceptance contract.

@@ -96,7 +96,10 @@ offline, review completion, recovery, cancelled usage, and per-phase latency.
 Saved-draft replay is useful to isolate reviewer behavior, with identical evidence supplied
 to every reviewer. Label it a component evaluation: it excludes drafting costs and success
 rates and cannot replace an end-to-end orchestration benchmark. The suite now provides generic SQL adapters for the hierarchical,
-board, pool, speculative and hybrid controllers; see [evaluation methods](evaluation.md#models-and-strategies).
+board, pool, speculative and both hybrid controllers; see [evaluation methods](evaluation.md#models-and-strategies).
+`hybrid_v2` binds the orchestrator role (`orchestrate`) per phase through `phase_models`;
+the shipped tuning config defaults it to a frontier-class model, and any role
+(`orchestrate`, `task`, `critique`, `integrate`, `verify`) can be overridden by the user.
 Their legacy and bounded policies use serial model calls and fixed team shapes, so those comparisons
 do not measure parallel fanout latency or the incident workflow.
 
