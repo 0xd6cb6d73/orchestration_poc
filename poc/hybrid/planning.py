@@ -249,6 +249,21 @@ def validate_decision(
     return decision
 
 
+def wave_order(plan: OrchestratorPlan) -> tuple[tuple[PlannedTask, ...], ...]:
+    """Group tasks into dependency waves; wave k may run once wave k-1 is accepted."""
+    remaining: list[PlannedTask] = list(plan.tasks)
+    done: set[str] = set()
+    waves: list[tuple[PlannedTask, ...]] = []
+    while remaining:
+        ready = tuple(task for task in remaining if all(dep in done for dep in task.dependencies))
+        if not ready:
+            raise PlanValidationError(["plan dependencies are not satisfiable"])
+        waves.append(ready)
+        done.update(task.task_id for task in ready)
+        remaining = [task for task in remaining if task not in ready]
+    return tuple(waves)
+
+
 def apply_decision(plan: OrchestratorPlan, decision: OrchestratorDecision) -> OrchestratorPlan:
     """Return the plan after one revise or add_task decision."""
     if decision.decision == "revise" and decision.revision is not None:

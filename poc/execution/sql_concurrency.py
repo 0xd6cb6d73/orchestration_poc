@@ -17,7 +17,7 @@ from pydantic_ai.usage import RunUsage
 
 from poc.execution.sql_contracts import Answer, Budget, PhaseName, TaskInput
 from poc.execution.sql_ports import TaskEnvironment
-from poc.execution.sql_team_worker import TeamWorker
+from poc.execution.sql_team_worker import POOL_PLANNED, ROLE_POOLS, TeamWorker
 
 T = TypeVar("T")
 
@@ -58,30 +58,68 @@ class ConcurrentTeamWorker:
         self.method, self.task, self.env, self.model = method, task, env, model
         self.settings, self.budget, self.usage = settings, budget, usage
         self.json_protocol = json_protocol
-        self.weights = env.state.options.stage_weights or CONCURRENT_WEIGHTS[method]
-        if len(self.weights) != len(CONCURRENT_WEIGHTS[method]):
-            raise ValueError("concurrent stage_weights length does not match strategy")
-        self.index = 0
+        self.pool_shares: dict[str, float] | None = None
+        self.pool_planned: dict[str, int] = {}
+        self.consumed = 0.0
+        self.reserved = {"requests": 0, "tool_calls": 0, "total_tokens": 0}
+        if method == "hybrid_v2":
+            shares = env.state.options.hybrid_pool_weights or ROLE_POOLS["hybrid_v2"]
+            self.pool_shares = dict(shares)
+            self.pool_planned = dict(POOL_PLANNED)
+            self.pool_planned["orchestrate"] = env.state.options.hybrid_plan_fanout
+            self.pool_planned["critique"] = env.state.options.hybrid_plan_fanout + 2
+            self.index = 0
+        else:
+            self.weights = env.state.options.stage_weights or CONCURRENT_WEIGHTS[method]
+            if len(self.weights) != len(CONCURRENT_WEIGHTS[method]):
+                raise ValueError("concurrent stage_weights length does not match strategy")
+            self.index = 0
 
     async def __call__(self, instruction: str, role: PhaseName = "solve") -> Answer:
-        if self.method == "hybrid_v1" and role in {"critique", "verify"}:
-            self.index = max(self.index, 2 if role == "critique" else 4)
-        elif self.method == "speculative" and role == "reconcile":
-            self.index = max(self.index, 2)
-        index = self.index
-        self.index += 1
-        if index >= len(self.weights):
-            raise UsageLimitExceeded("concurrent stage reservations exhausted")
-        weight = self.weights[index]
-        # The first two workers overlap and share a wall-clock window, not token allotments.
-        wave_end = max(2, index + 1)
-        until_fraction = sum(self.weights[:wave_end])
-        allocations = {
-            key: int(getattr(self.budget, key) * weight)
-            for key in ("requests", "tool_calls", "total_tokens")
-        }
-        if any(value < 1 for value in allocations.values()):
-            raise UsageLimitExceeded("concurrent stage has no reserved capacity")
+        if self.pool_shares is not None:
+            key = role if role in self.pool_shares else "task"
+            planned = max(1, self.pool_planned.get(key, 1))
+            share = self.pool_shares[key] / planned
+            if key == "verify":
+                # The verifier is the final stage; unallocated budget carries forward to it.
+                share = max(share, 1.0 - self.consumed)
+                until_fraction = 1.0
+                allocations = {
+                    resource: getattr(self.budget, resource) - self.reserved[resource]
+                    for resource in ("requests", "tool_calls", "total_tokens")
+                }
+            else:
+                until_fraction = min(1.0, self.consumed + share)
+                allocations = {
+                    resource: int(getattr(self.budget, resource) * share)
+                    for resource in ("requests", "tool_calls", "total_tokens")
+                }
+            if any(value < 1 for value in allocations.values()):
+                raise UsageLimitExceeded("concurrent stage has no reserved capacity")
+            for resource in allocations:
+                self.reserved[resource] += allocations[resource]
+            self.consumed = until_fraction
+            index = self.index
+            self.index += 1
+        else:
+            if self.method == "hybrid_v1" and role in {"critique", "verify"}:
+                self.index = max(self.index, 2 if role == "critique" else 4)
+            elif self.method == "speculative" and role == "reconcile":
+                self.index = max(self.index, 2)
+            index = self.index
+            self.index += 1
+            if index >= len(self.weights):
+                raise UsageLimitExceeded("concurrent stage reservations exhausted")
+            weight = self.weights[index]
+            # The first two workers overlap and share a wall-clock window, not token allotments.
+            wave_end = max(2, index + 1)
+            until_fraction = sum(self.weights[:wave_end])
+            allocations = {
+                key: int(getattr(self.budget, key) * weight)
+                for key in ("requests", "tool_calls", "total_tokens")
+            }
+            if any(value < 1 for value in allocations.values()):
+                raise UsageLimitExceeded("concurrent stage has no reserved capacity")
         child = self.env.fork(allocations["tool_calls"])
         child.state.started = self.env.state.started
         child.state.options = self.env.state.options.model_copy(update={"stage_weights": None})
@@ -113,6 +151,9 @@ class ConcurrentTeamWorker:
         )
         worker.weights = [1.0]
         worker.method = "reserved-branch"
+        worker.pool_shares = None
+        worker.pool_planned = {}
+        worker.consumed = 0.0
         worker.evidence_namespace = str(index + 1)
         emit(
             {

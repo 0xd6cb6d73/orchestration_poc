@@ -60,7 +60,14 @@ def query_result(messages: list[ModelMessage]) -> dict[str, Any] | None:
 
 def role_of(messages: list[ModelMessage], info: AgentInfo, method: str) -> str:
     instructions = info.instructions or ""
-    for noun, role in (("planner", "plan"), ("critic", "critique"), ("verifier", "verify")):
+    for noun, role in (
+        ("planner", "plan"),
+        ("critic", "critique"),
+        ("verifier", "verify"),
+        ("orchestrator", "orchestrate"),
+        ("scoped task executor", "task"),
+        ("integrator", "integrate"),
+    ):
         if f"Your role is {noun}" in instructions:
             return role
     prompt = str(messages[0])
@@ -139,7 +146,7 @@ class ScriptedProvider:
         if (
             self.concurrent
             and scenario == "healthy"
-            and role in {"plan", "proposal"}
+            and role in {"plan", "proposal", "orchestrate"}
             and len(self.initial_workers) < 2
         ):
             self.initial_workers.add(str(messages[0]))
@@ -166,10 +173,45 @@ class ScriptedProvider:
             # Intentionally infeasible but structurally valid. Retention must follow commit
             # provenance, not prefer the other candidate's better answer.
             values = {key: value + 101 for key, value in values.items()}
-        if scenario == "malformed_artifact" and role in {"solve", "draft", "proposal", "reconcile"}:
+        if scenario == "malformed_artifact" and role in {
+            "solve",
+            "draft",
+            "proposal",
+            "reconcile",
+            "task",
+            "integrate",
+        }:
             self.injected += 1
             return self.response({"values": {"0": 0}}, info)
-        if role == "plan":
+        if role == "orchestrate":
+            if "decompose it into between 2 and 8" not in str(messages[0]):
+                self.injected += 1
+                return self.response(
+                    {"decision": "escalate", "rationale": "fixture escalation"}, info
+                )
+            plan = {
+                "parent_objective": TASK.prompt,
+                "tasks": [
+                    {
+                        "task_id": "t1",
+                        "objective": "Read the schedule_jobs start times",
+                        "local_scope": "schedule_jobs table only",
+                        "definition_of_done": ["return every job's start time from its release"],
+                    },
+                    {
+                        "task_id": "t2",
+                        "objective": "Package the complete values mapping",
+                        "local_scope": "the t1 output only",
+                        "definition_of_done": ["values cover every job ID exactly once"],
+                        "dependencies": ["t1"],
+                    },
+                ],
+                "integration_definition_of_done": ["values cover every job ID exactly once"],
+            }
+            return self.response({"values": plan}, info)
+        if role == "task":
+            values = {str(row[0]): row[1] for row in result["rows"]}
+        elif role == "plan":
             values = {"plan": "Read id and release from schedule_jobs and return all IDs."}
         elif role == "critique":
             if scenario == "critic_contract":

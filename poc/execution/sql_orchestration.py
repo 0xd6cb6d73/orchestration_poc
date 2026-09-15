@@ -50,6 +50,16 @@ from poc.hybrid.contracts import (
     GoalContract,
     ProvenanceRecord,
 )
+from poc.hybrid.planning import (
+    OrchestratorPlan,
+    PlannedTask,
+    PlanValidationError,
+    apply_decision,
+    parse_decision,
+    parse_plan,
+    validate_decision,
+    wave_order,
+)
 from poc.hybrid.policies import SwarmPolicyResolver
 from poc.hybrid.verification_service import VerificationService
 from poc.models import (
@@ -67,7 +77,7 @@ from poc.persistence.database import Database
 from poc.roles.registry import RoleRegistry
 from poc.services.artifact_store import ArtifactStore
 
-METHODS = (*[mode.value for mode in ExecutionMode], "hybrid_v1")
+METHODS = (*[mode.value for mode in ExecutionMode], "hybrid_v1", "hybrid_v2")
 Solve = Callable[[str, PhaseName], Awaitable[Answer]]
 RECOVERABLE = (
     PhaseTimeout,
@@ -104,8 +114,15 @@ class SQLTeam:
         self.emitted = 0
         self.submitted = CommittedCandidates()
         self.artifacts = ArtifactStore(root / "artifacts", self.db)
-        self.mode = ExecutionMode.BOARD_CLAIM if method == "hybrid_v1" else ExecutionMode(method)
-        swarm = SwarmStrategy.HYBRID_V1 if method == "hybrid_v1" else SwarmStrategy.BOARD
+        self.mode = (
+            ExecutionMode.BOARD_CLAIM
+            if method in {"hybrid_v1", "hybrid_v2"}
+            else ExecutionMode(method)
+        )
+        swarm = {
+            "hybrid_v1": SwarmStrategy.HYBRID_V1,
+            "hybrid_v2": SwarmStrategy.HYBRID_V2,
+        }.get(method, SwarmStrategy.BOARD)
         policies = SwarmPolicyResolver().resolve(swarm)
         plan = MissionPlan(
             plan_id="sql-plan",
@@ -357,6 +374,8 @@ class SQLTeam:
                 reason="SQL model reconciled all submitted candidates; validity denotes schema only",
             )
             return answer
+        if method == "hybrid_v2":
+            return await self.hybrid_v2(solve)
         return await self.hybrid(solve)
 
     async def contended_board(self, solve: Solve, prompt: str) -> Answer:
@@ -697,6 +716,639 @@ class SQLTeam:
         controller.complete(round_.round_id)
         return answers[selected.candidate_id].model_copy(deep=True)
 
+    async def hybrid_v2(self, solve: Solve) -> Answer:
+        """LLM-orchestrated decomposition: plan fan-out, scoped tasks, decision loop."""
+        controller = CollaborationController(
+            self.db, self.artifacts, BlackboardService(self.db), CommunicationService(self.db)
+        )
+        fanout = self.options.hybrid_plan_fanout
+        workers = self.workers
+        plan_schema = json.dumps(
+            {
+                "parent_objective": "the original task, restated",
+                "tasks": [
+                    {
+                        "task_id": "t1",
+                        "objective": "what this task accomplishes",
+                        "local_scope": "exactly what is in scope: tables, artifacts, queries",
+                        "out_of_scope": ["explicit exclusions"],
+                        "definition_of_done": ["verifiable completion criteria"],
+                        "dependencies": ["ids of prerequisite tasks"],
+                        "output_schema": "Answer",
+                    }
+                ],
+                "integration_definition_of_done": ["criteria for combining all task outputs"],
+            }
+        )
+        plan_prompt = (
+            "Read the task and decompose it into between 2 and 8 small, independently "
+            "verifiable tasks over the public SQL tables. Each task must have a narrow "
+            "local scope, explicit out_of_scope exclusions, verifiable definition_of_done "
+            "criteria, and dependencies only on earlier task ids. Prefer tasks that can be "
+            "critiqued against SQL evidence. Return your plan as "
+            '{"values":' + plan_schema + "}. This is an orchestration task, not the final answer."
+        )
+        plans: dict[str, OrchestratorPlan] = {}
+
+        planning = controller.frame(
+            run_id="sql-run",
+            domain_id="sql",
+            steward=self.owner,
+            member_agent_ids=tuple(w.agent_instance_id for w in workers),
+            config=HybridConfig(proposals_per_round=fanout),
+            team_id="team:sql-run:planning",
+            round_id="round:sql-run:planning",
+        )
+
+        async def propose_plan(index: int) -> None:
+            worker = workers[index % len(workers)]
+            instruction = plan_prompt + f" You are sealed plan candidate {index + 1}."
+            try:
+                answer = await self.board_work(
+                    index % 2, f"plan-draft-{index}", solve, instruction, role="orchestrate"
+                )
+                try:
+                    plan = parse_plan(answer.values)
+                except PlanValidationError as exc:
+                    answer = await self.board_work(
+                        index % 2,
+                        f"plan-draft-{index}-repair",
+                        solve,
+                        instruction
+                        + " Your previous plan was rejected: "
+                        + "; ".join(exc.problems)
+                        + " Return one corrected plan. This is your only repair attempt.",
+                        role="orchestrate",
+                    )
+                    plan = parse_plan(answer.values)
+            except RECOVERABLE as exc:
+                if not self.reliable:
+                    raise
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run",
+                        event_type="sql.branch_failed",
+                        data={
+                            "stage": "plan_draft",
+                            "index": index,
+                            "error": type(exc).__name__,
+                        },
+                    )
+                )
+                return
+            artifact = self.artifacts.write(
+                "sql-run", {"plan": plan.model_dump()}, producer_task_id=f"plan-draft-{index}"
+            )
+            candidate = controller.submit_candidate(
+                round_id=planning.round_id,
+                author=worker,
+                hypothesis_key=f"plan-draft-{index}",
+                artifact_id=artifact.artifact_id,
+                evidence_refs=(),
+            )
+            plans[candidate.candidate_id] = plan
+
+        if self.concurrent:
+            await gather_branches([propose_plan(index) for index in range(fanout)])
+        else:
+            for index in range(fanout):
+                await propose_plan(index)
+        plan_candidates = controller.release(
+            planning.round_id,
+            minimum_proposals=self.options.hybrid_proposal_quorum if self.reliable else None,
+        )
+        controller.cluster_candidates(planning.round_id)
+        controller.advance(planning.round_id, CollaborationPhase.CRITIQUED)
+        for index, candidate in enumerate(plan_candidates):
+            refs: tuple[str, ...] = ()
+            try:
+                critique = await self.board_work(
+                    2,
+                    f"plan-judge-{index}",
+                    solve,
+                    "Judge this proposed decomposition of the original task using SQL to "
+                    "check feasibility claims. Cover: objective coverage, scope sharpness of "
+                    "every task, dependency soundness, and verifiable definition_of_done. "
+                    + (
+                        "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
+                        "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "
+                        if self.reliable
+                        else 'Return {"values":{"validity":0,"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} with integer scores 0..5. '
+                    )
+                    + "Candidate plan: "
+                    + plans[candidate.candidate_id].model_dump_json(),
+                    role="critique",
+                )
+                if self.reliable:
+                    judge = SupportedCritiqueValues.model_validate(critique.values)
+                    evaluation = judge.evaluation
+                    refs = tuple(judge.evidence_refs)
+                    passed = (
+                        judge.structural_validity
+                        and judge.feasibility == "supported"
+                        and bool(refs)
+                        and evaluation.constraint_satisfaction > 0
+                        and evaluation.validity > 0
+                        and evaluation.evidence > 0
+                    )
+                else:
+                    evaluation = EvaluationVector.model_validate(critique.values)
+                    passed = evaluation.validity > 0
+                critique_data = critique.model_dump()
+            except RECOVERABLE as exc:
+                if not self.reliable:
+                    raise
+                evaluation = EvaluationVector(
+                    validity=0, evidence=0, usefulness=0, novelty=0, constraint_satisfaction=0
+                )
+                passed = False
+                critique_data = {"abstention": type(exc).__name__}
+            judge_artifact = self.artifacts.write(
+                "sql-run",
+                {"candidate": candidate.candidate_id, "decision": critique_data},
+                producer_task_id=f"plan-judge-{index}",
+            )
+            controller.record_evaluation(
+                candidate_id=candidate.candidate_id,
+                critic=workers[2],
+                critique_artifact_id=judge_artifact.artifact_id,
+                passed=passed,
+                findings=(
+                    ("orchestrator plan critique; supported-v1",)
+                    if self.reliable
+                    else ("orchestrator plan critique",)
+                ),
+                evidence_refs=(judge_artifact.artifact_id,) if refs else (),
+                evaluation=evaluation,
+            )
+        controller.advance(planning.round_id, CollaborationPhase.TESTED)
+        controller.advance(planning.round_id, CollaborationPhase.RECOMBINED)
+        selected_plan = controller.select(planning.round_id)
+        plan = plans[selected_plan.candidate_id]
+        self.db.record_event(
+            EventRecord(
+                run_id="sql-run",
+                event_type="hybrid_v2.plan_selected",
+                data={"plan": plan.model_dump(), "candidate_id": selected_plan.candidate_id},
+            )
+        )
+
+        task_answers: dict[str, Answer] = {}
+        task_artifacts: dict[str, str] = {}
+        task_candidates: dict[str, str] = {}
+        task_states: dict[str, str] = {}
+        task_findings: dict[str, dict[str, Any]] = {}
+        task_attempts: dict[str, int] = {}
+
+        execution = controller.frame(
+            run_id="sql-run",
+            domain_id="sql",
+            steward=self.owner,
+            member_agent_ids=tuple(w.agent_instance_id for w in workers),
+            config=HybridConfig(proposals_per_round=max(2, len(plan.tasks))),
+            team_id="team:sql-run:execution",
+            round_id="round:sql-run:execution",
+        )
+
+        def task_prompt(task: PlannedTask) -> str:
+            return (
+                f"Execute ONLY this scoped task.\nTask id: {task.task_id}\n"
+                f"Objective: {task.objective}\nLocal scope: {task.local_scope}\n"
+                f"Out of scope: {'; '.join(task.out_of_scope) or 'nothing beyond the local scope'}\n"
+                "Definition of done:\n- "
+                + "\n- ".join(task.definition_of_done)
+                + "\nDo not work outside the local scope; other tasks cover the rest of "
+                "the objective. Return this task's output, not the whole answer."
+            )
+
+        async def execute_task(task: PlannedTask, index: int, attempt: int) -> None:
+            worker = workers[index % 2]
+            task_attempts[task.task_id] = attempt
+            task_id = (
+                f"task-{task.task_id}" if attempt == 1 else f"task-{task.task_id}-rev{attempt}"
+            )
+            dependencies = tuple(f"task-{dep}" for dep in task.dependencies)
+            try:
+                answer = await self.board_work(
+                    index % 2, task_id, solve, task_prompt(task), dependencies, role="task"
+                )
+            except RECOVERABLE as exc:
+                if not self.reliable:
+                    raise
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run",
+                        event_type="sql.branch_failed",
+                        data={"stage": "task", "index": task.task_id, "error": type(exc).__name__},
+                    )
+                )
+                return
+            artifact = self.artifacts.write(
+                "sql-run",
+                {"task": task.task_id, "attempt": attempt, "answer": answer.model_dump()},
+                producer_task_id=task_id,
+            )
+            goal = GoalContract(
+                run_id="sql-run",
+                plan_version=plan.version,
+                parent_objective=self.task.prompt,
+                local_scope=f"{task.objective} — {task.local_scope}",
+                global_invariants=("read-only SQL",),
+                input_artifact_refs=tuple(
+                    task_artifacts[dep] for dep in task.dependencies if dep in task_artifacts
+                ),
+                output_schema=task.output_schema,
+                evidence_requirements=task.evidence_requirements,
+                definition_of_done=task.definition_of_done,
+                budgets=task.budgets,
+                permissions=("query",),
+            )
+            self.db.put_goal_contract(goal)
+            manifest = ContextManifest(
+                run_id="sql-run",
+                plan_version=plan.version,
+                agent_instance_id=worker.agent_instance_id,
+                task_id=task_id,
+                attempt_id=f"{task_id}-1",
+                context_policy_version=self.policy_version,
+                goal_contract_id=goal.goal_contract_id,
+            )
+            self.db.put_context_manifest(manifest)
+            self.db.put_provenance(
+                ProvenanceRecord(
+                    run_id="sql-run",
+                    artifact_id=artifact.artifact_id,
+                    producer_agent_id=worker.agent_instance_id,
+                    task_id=task_id,
+                    attempt_id=manifest.attempt_id,
+                    role_id=worker.role_id,
+                    role_version=1,
+                    prompt_fingerprint=hashlib.sha256(
+                        (self.task.prompt + task.task_id + str(attempt)).encode()
+                    ).hexdigest(),
+                    agent_backend=self.backend,
+                    model=self.model_for("task"),
+                    context_manifest_id=manifest.context_manifest_id,
+                )
+            )
+            if attempt == 1:
+                candidate = controller.submit_candidate(
+                    round_id=execution.round_id,
+                    author=worker,
+                    hypothesis_key=task.task_id,
+                    artifact_id=artifact.artifact_id,
+                    evidence_refs=(),
+                )
+            else:
+                candidate = controller.revise_candidate(
+                    round_id=execution.round_id,
+                    author=worker,
+                    hypothesis_key=task.task_id,
+                    artifact_id=artifact.artifact_id,
+                    parent_candidate_ids=(
+                        (task_candidates[task.task_id],) if task.task_id in task_candidates else ()
+                    ),
+                )
+            task_answers[task.task_id] = answer.model_copy(deep=True)
+            task_artifacts[task.task_id] = artifact.artifact_id
+            task_candidates[task.task_id] = candidate.candidate_id
+            if attempt != 1:
+                critiqued.discard(task.task_id)
+
+        def critique_prompt(task: PlannedTask) -> str:
+            output = task_answers.get(task.task_id)
+            return (
+                "Critique this scoped task output against the task's own scope and "
+                "definition of done. Flag scope creep (work beyond local_scope) and "
+                "unmet definition_of_done criteria. "
+                + (
+                    "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
+                    "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "
+                    if self.reliable
+                    else 'Return {"values":{"validity":0,"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} with integer scores 0..5. '
+                )
+                + "Task contract: "
+                + json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "objective": task.objective,
+                        "local_scope": task.local_scope,
+                        "out_of_scope": list(task.out_of_scope),
+                        "definition_of_done": list(task.definition_of_done),
+                    }
+                )
+                + " Output: "
+                + (
+                    json.dumps(output.values)
+                    if output is not None
+                    else json.dumps({"missing": "the task produced no committed output"})
+                )
+            )
+
+        critiqued: set[str] = set()
+
+        async def critique_pass() -> None:
+            for task in plan.tasks:
+                if task.task_id in critiqued or task.task_id not in task_candidates:
+                    continue
+                refs = ()
+                try:
+                    critique = await self.board_work(
+                        2,
+                        f"critique-task-{task.task_id}-{task_attempts.get(task.task_id, 1)}",
+                        solve,
+                        critique_prompt(task),
+                        role="critique",
+                    )
+                    if self.reliable:
+                        decision = SupportedCritiqueValues.model_validate(critique.values)
+                        evaluation = decision.evaluation
+                        refs = tuple(decision.evidence_refs)
+                        passed = (
+                            decision.structural_validity
+                            and decision.feasibility == "supported"
+                            and bool(refs)
+                            and evaluation.constraint_satisfaction > 0
+                            and evaluation.validity > 0
+                            and evaluation.evidence > 0
+                        )
+                    else:
+                        evaluation = EvaluationVector.model_validate(critique.values)
+                        passed = evaluation.validity > 0
+                    critique_data = critique.model_dump()
+                except RECOVERABLE as exc:
+                    if not self.reliable:
+                        raise
+                    evaluation = EvaluationVector(
+                        validity=0, evidence=0, usefulness=0, novelty=0, constraint_satisfaction=0
+                    )
+                    passed = False
+                    critique_data = {"abstention": type(exc).__name__}
+                artifact = self.artifacts.write(
+                    "sql-run",
+                    {
+                        "task": task.task_id,
+                        "candidate": task_candidates[task.task_id],
+                        "decision": critique_data,
+                    },
+                    producer_task_id=(
+                        f"critique-task-{task.task_id}-{task_attempts.get(task.task_id, 1)}"
+                    ),
+                )
+                controller.record_evaluation(
+                    candidate_id=task_candidates[task.task_id],
+                    critic=workers[2],
+                    critique_artifact_id=artifact.artifact_id,
+                    passed=passed,
+                    findings=(
+                        ("scoped task critique; supported-v1",)
+                        if self.reliable
+                        else ("scoped task critique",)
+                    ),
+                    evidence_refs=(artifact.artifact_id,) if refs else (),
+                    evaluation=evaluation,
+                )
+                task_states[task.task_id] = "viable" if passed else "refuted"
+                task_findings[task.task_id] = critique_data
+                critiqued.add(task.task_id)
+
+        waves = wave_order(plan)
+        for wave in waves:
+            if self.concurrent:
+                await gather_branches(
+                    [execute_task(task, index, 1) for index, task in enumerate(wave)]
+                )
+            else:
+                for index, task in enumerate(wave):
+                    await execute_task(task, index, 1)
+        controller.release(execution.round_id, minimum_proposals=1)
+        controller.cluster_candidates(execution.round_id)
+        controller.advance(execution.round_id, CollaborationPhase.CRITIQUED)
+        await critique_pass()
+        controller.advance(execution.round_id, CollaborationPhase.TESTED)
+
+        def decision_prompt(task: PlannedTask, findings: dict[str, Any], suffix: str) -> str:
+            return (
+                "One scoped task failed its critique. Choose exactly one decision: "
+                '"revise" (re-issue the same task id with tightened or corrected scope), '
+                '"add_task" (only when the critique exposed a gap no existing task covers; '
+                "the added task may depend only on accepted tasks), or "
+                '"escalate" (only when no revision can fix it). Never accept a refuted output. '
+                'Return {"values": {"decision": ..., "rationale": ..., "revision": <revised task '
+                'object>, "added_task": <new task object>}}; omit fields that do not apply. '
+                "Task contract: "
+                + task.model_dump_json()
+                + " Critique findings: "
+                + json.dumps(findings)
+                + suffix
+            )
+
+        decision_rounds = 0
+        while decision_rounds < self.options.hybrid_max_decision_rounds:
+            pending = [task for task in plan.tasks if task_states.get(task.task_id) != "viable"]
+            if not pending:
+                break
+            decision_rounds += 1
+            for task in pending:
+                findings = task_findings.get(
+                    task.task_id, {"missing": task.task_id not in task_candidates}
+                )
+                decision_answer = await self.board_work(
+                    2,
+                    f"decision-{task.task_id}-{decision_rounds}",
+                    solve,
+                    decision_prompt(
+                        task,
+                        findings,
+                        f" Decision round {decision_rounds}.",
+                    ),
+                    role="orchestrate",
+                )
+                try:
+                    decision = parse_decision(decision_answer.values)
+                    validate_decision(decision, plan)
+                    if decision.added_task is not None and any(
+                        dep not in task_states or task_states[dep] != "viable"
+                        for dep in decision.added_task.dependencies
+                    ):
+                        raise PlanValidationError(
+                            ["added task dependencies must reference accepted tasks"]
+                        )
+                    if (
+                        decision.decision == "revise"
+                        and decision.revision is not None
+                        and any(
+                            dep not in task_states or task_states[dep] != "viable"
+                            for dep in decision.revision.dependencies
+                        )
+                    ):
+                        raise PlanValidationError(
+                            ["revision dependencies must reference accepted tasks"]
+                        )
+                except PlanValidationError as exc:
+                    decision_answer = await self.board_work(
+                        2,
+                        f"decision-{task.task_id}-{decision_rounds}-repair",
+                        solve,
+                        decision_prompt(task, findings, "")
+                        + " Your previous decision was rejected: "
+                        + "; ".join(exc.problems)
+                        + " Return one corrected decision.",
+                        role="orchestrate",
+                    )
+                    decision = parse_decision(decision_answer.values)
+                    validate_decision(decision, plan)
+                if decision.decision == "escalate":
+                    self.db.record_event(
+                        EventRecord(
+                            run_id="sql-run",
+                            event_type="hybrid_v2.escalated",
+                            data={"task": task.task_id, "rationale": decision.rationale},
+                        )
+                    )
+                    raise CollaborationError(
+                        f"orchestrator escalated task {task.task_id!r}: {decision.rationale}"
+                    )
+                if decision.decision == "revise" and decision.revision is not None:
+                    plan = apply_decision(plan, decision)
+                    await execute_task(decision.revision, 0, decision_rounds + 1)
+                if decision.decision == "add_task" and decision.added_task is not None:
+                    plan = apply_decision(plan, decision)
+                    await execute_task(decision.added_task, 1, decision_rounds + 1)
+            await critique_pass()
+        if any(task_states.get(task.task_id) != "viable" for task in plan.tasks):
+            raise CollaborationError("hybrid_v2 decision rounds exhausted before integration")
+
+        controller.advance(execution.round_id, CollaborationPhase.RECOMBINED)
+        integration_prompt = (
+            "Combine these scoped task outputs into the complete final answer for the "
+            "original task: "
+            + self.task.prompt
+            + ". Integration definition of done: "
+            + "; ".join(plan.integration_definition_of_done)
+            + ". Resolve conflicts between task outputs; never drop covered work. "
+            "Task outputs: "
+            + json.dumps(
+                [
+                    {"task": task.task_id, "answer": task_answers[task.task_id].model_dump()}
+                    for task in plan.tasks
+                ]
+            )
+        )
+        integrated = await self.board_work(
+            0,
+            "integrate",
+            solve,
+            integration_prompt,
+            tuple(f"task-{task.task_id}" for task in plan.tasks),
+            role="integrate",
+        )
+        self.commit_candidate(integrated, "integrate")
+        integration_artifact = self.artifacts.write(
+            "sql-run", {"integration": integrated.model_dump()}, producer_task_id="integrate"
+        )
+        integration_goal = GoalContract(
+            run_id="sql-run",
+            plan_version=plan.version,
+            parent_objective=self.task.prompt,
+            local_scope="Integrate accepted scoped task outputs into the complete answer",
+            global_invariants=("read-only SQL",),
+            input_artifact_refs=tuple(
+                task_artifacts[task.task_id]
+                for task in plan.tasks
+                if task.task_id in task_artifacts
+            ),
+            output_schema="Answer",
+            definition_of_done=plan.integration_definition_of_done,
+            permissions=("query",),
+        )
+        self.db.put_goal_contract(integration_goal)
+        integration_manifest = ContextManifest(
+            run_id="sql-run",
+            plan_version=plan.version,
+            agent_instance_id=workers[0].agent_instance_id,
+            task_id="integrate",
+            attempt_id="integrate-1",
+            context_policy_version=self.policy_version,
+            goal_contract_id=integration_goal.goal_contract_id,
+        )
+        self.db.put_context_manifest(integration_manifest)
+        self.db.put_provenance(
+            ProvenanceRecord(
+                run_id="sql-run",
+                artifact_id=integration_artifact.artifact_id,
+                producer_agent_id=workers[0].agent_instance_id,
+                task_id="integrate",
+                attempt_id=integration_manifest.attempt_id,
+                role_id=workers[0].role_id,
+                role_version=1,
+                prompt_fingerprint=hashlib.sha256(
+                    (self.task.prompt + "integrate" + str(plan.version)).encode()
+                ).hexdigest(),
+                agent_backend=self.backend,
+                model=self.model_for("integrate"),
+                context_manifest_id=integration_manifest.context_manifest_id,
+            )
+        )
+
+        verification = VerificationService(self.db)
+        request = verification.request(
+            run_id="sql-run",
+            subject_artifact_id=integration_artifact.artifact_id,
+            producer_agent_id=workers[0].agent_instance_id,
+            schema="Answer",
+            required_checks=("answer_supported",),
+            evidence_refs=(),
+        )
+        check = await self.board_work(
+            2,
+            "verify",
+            solve,
+            "Independently verify this integrated answer against the SQL data and all task "
+            "constraints. "
+            + (
+                "Use supported-v1: answer_supported, evidence_refs from your own SQL queries, and reason. "
+                if self.reliable
+                else 'Return {"values":{"answer_supported":true}} if supported, or false otherwise. '
+            )
+            + "Scoped task critique records: "
+            + json.dumps({task.task_id: task_states.get(task.task_id) for task in plan.tasks})
+            + " This is your judgment, not a benchmark score. Answer: "
+            + integrated.model_dump_json(),
+            role="verify",
+        )
+        if (not self.reliable and set(check.values) != {"answer_supported"}) or type(
+            check.values["answer_supported"]
+        ) is not bool:
+            raise ValueError("hybrid verification must return a boolean answer_supported")
+        verdict = verification.complete(
+            verification_id=request.verification_id,
+            verifier=workers[2],
+            checks={"answer_supported": check.values["answer_supported"]},
+            findings=("Independent SQL model verification of the integrated answer",),
+            evidence_refs=(),
+            limitations=("Model judgment; no private reference or grading access",),
+        )
+        verification.accept(
+            request=request,
+            verdict=verdict,
+            policy_version=self.policy_version,
+            downstream_uses=("submit_answer",),
+        )
+        controller.advance(execution.round_id, CollaborationPhase.VERIFIED_AND_SCORED)
+        gate = CompletionGate(self.db)
+        mission = self.db.get_plan("sql-run")
+        assert mission is not None
+        gate.require(
+            gate.evaluate(
+                plan=mission,
+                deliverable_artifact_id=integration_artifact.artifact_id,
+                required_accepted_artifacts=(integration_artifact.artifact_id,),
+            )
+        )
+        controller.complete(execution.round_id)
+        return integrated.model_copy(deep=True)
+
 
 def adapter(method: str, *, json_protocol: bool = False):
     if method not in METHODS:
@@ -742,7 +1394,7 @@ def adapter(method: str, *, json_protocol: bool = False):
                 )
             finally:
                 env.state.options = options
-            if role not in {"plan", "critique", "verify"}:
+            if role not in {"plan", "critique", "verify", "orchestrate", "task"}:
                 validate_artifact(task, answer, options.artifact_contract)
             return answer
 

@@ -23,11 +23,49 @@ TASK = TaskInput(prompt="Return the value of x.", tables={"data": [{"x": 7}]})
 def model() -> FunctionModel:
     async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         prompt = str(messages)
-        if "Critique this proposed" in prompt:
+        if "decompose it into between 2 and 8" in prompt:
+            values = {
+                "parent_objective": "Return the value of x.",
+                "tasks": [
+                    {
+                        "task_id": "t1",
+                        "objective": "Look up x",
+                        "local_scope": "the data table only",
+                        "definition_of_done": ["return the single row of the data table"],
+                    },
+                    {
+                        "task_id": "t2",
+                        "objective": "Package the answer",
+                        "local_scope": "the t1 output only",
+                        "definition_of_done": ["answer values equal the data table row"],
+                        "dependencies": ["t1"],
+                    },
+                ],
+                "integration_definition_of_done": ["values cover the data table row"],
+            }
+        elif "Judge this proposed" in prompt or "Critique this scoped task output" in prompt:
             values = dict.fromkeys(
                 ("validity", "evidence", "usefulness", "novelty", "constraint_satisfaction"), 4
             )
-        elif "Independently verify this selected" in prompt:
+        elif "One scoped task failed its critique" in prompt:
+            values = {
+                "decision": "revise",
+                "rationale": "tighten scope",
+                "revision": {
+                    "task_id": "t1",
+                    "objective": "Look up x",
+                    "local_scope": "the data table only",
+                    "definition_of_done": ["return the single row of the data table"],
+                },
+            }
+        elif "Critique this proposed" in prompt:
+            values = dict.fromkeys(
+                ("validity", "evidence", "usefulness", "novelty", "constraint_satisfaction"), 4
+            )
+        elif (
+            "Independently verify this integrated answer" in prompt
+            or "Independently verify this selected" in prompt
+        ):
             values = {"answer_supported": True}
         elif "Develop a solution plan" in prompt:
             values = {"plan": "SELECT x FROM data"}
@@ -60,6 +98,7 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
                 "managed_pool": 2,
                 "speculative": 3,
                 "hybrid_v1": 5,
+                "hybrid_v2": 10,
             }[method]
         )
         kinds = {e["orchestration"]["event_type"] for e in events if "orchestration" in e}
@@ -72,6 +111,16 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
                 "candidate.released",
                 "candidate.selected",
                 "claim.acquired",
+                "verification.completed",
+                "delivery.gated",
+            },
+            "hybrid_v2": {
+                "candidate.released",
+                "candidate.selected",
+                "claim.acquired",
+                "task.completed",
+                "worker.attached",
+                "hybrid_v2.plan_selected",
                 "verification.completed",
                 "delivery.gated",
             },
@@ -100,6 +149,8 @@ def test_every_runtime_mode_has_both_protocols() -> None:
         assert mode.value in ADAPTERS
         assert mode.value + "-json" in ADAPTERS
     assert "hybrid_v1" in ADAPTERS
+    assert "hybrid_v2" in ADAPTERS
+    assert "hybrid_v2-json" in ADAPTERS
 
 
 async def test_cancelled_trial_cleans_scheduler_directory(

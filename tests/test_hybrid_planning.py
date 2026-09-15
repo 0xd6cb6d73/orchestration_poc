@@ -140,9 +140,7 @@ def _blank_output_schema(values: dict[str, Any]) -> None:
         (_blank_output_schema, "output_schema"),
     ],
 )
-def test_parse_plan_hard_validates(
-    mutate: Callable[[dict[str, Any]], None], fragment: str
-) -> None:
+def test_parse_plan_hard_validates(mutate: Callable[[dict[str, Any]], None], fragment: str) -> None:
     values = _valid_values()
     mutate(values)
     with pytest.raises(PlanValidationError) as err:

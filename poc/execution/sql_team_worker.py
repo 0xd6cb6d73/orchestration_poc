@@ -28,6 +28,7 @@ from poc.execution.sql_ports import (
 from poc.execution.sql_protocol import ProtocolError, parse_action
 from poc.execution.sql_strategy import ContextBoundModel, ObservedModel, resolve_model
 from poc.hybrid.contracts import EvaluationVector
+from poc.hybrid.planning import MAX_PLAN_TASKS
 
 
 class PlanValues(StrictModel):
@@ -76,6 +77,8 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "plan": PlanOutput,
     "critique": CritiqueOutput,
     "verify": VerificationOutput,
+    "orchestrate": Answer,
+    "task": Answer,
 }
 INSTRUCTIONS = {
     "plan": "Your role is planner. Develop a concise plan grounded in the public tables. "
@@ -84,6 +87,12 @@ INSTRUCTIONS = {
     "and SQL data. Return the five integer evaluation scores, not a solution or a plan.",
     "verify": "Your role is verifier. Independently check the selected answer using public SQL "
     "data. Return the boolean answer_supported. Do not generate a replacement answer.",
+    "orchestrate": "Your role is orchestrator. Respond with exactly the JSON object requested "
+    "in the role task: an orchestrator plan or a decision. Do not perform task work yourself.",
+    "task": "Your role is scoped task executor. Complete only the assigned task. Stay strictly "
+    "inside the stated local scope and definition of done. Do not solve the whole task.",
+    "integrate": "Your role is integrator. Combine the supplied scoped task outputs into the "
+    "complete final answer for the original task. Resolve conflicts across outputs.",
 }
 WEIGHTS = {
     "hierarchical_dag": [0.2, 0.8],
@@ -91,6 +100,22 @@ WEIGHTS = {
     "managed_pool": [0.2, 0.8],
     "speculative": [0.35, 0.35, 0.3],
     "hybrid_v1": [0.3, 0.3, 0.12, 0.12, 0.16],
+}
+ROLE_POOLS: dict[str, dict[str, float]] = {
+    "hybrid_v2": {
+        "orchestrate": 0.24,
+        "task": 0.3,
+        "critique": 0.34,
+        "integrate": 0.05,
+        "verify": 0.07,
+    },
+}
+POOL_PLANNED: dict[str, int] = {
+    "orchestrate": 2,
+    "task": MAX_PLAN_TASKS,
+    "critique": 4,
+    "integrate": 1,
+    "verify": 1,
 }
 
 
@@ -111,25 +136,48 @@ class TeamWorker:
         self.method = method
         self.settings, self.budget, self.usage = settings, budget, usage
         self.json_protocol = json_protocol
-        self.weights = env.state.options.stage_weights or WEIGHTS[method]
-        if len(self.weights) != len(WEIGHTS[method]):
-            raise ValueError("stage_weights length does not match the strategy")
-        self.index = 0
+        self.pool_shares: dict[str, float] | None = None
+        self.pool_planned: dict[str, int] = {}
+        self.consumed = 0.0
+        if method == "hybrid_v2":
+            shares = env.state.options.hybrid_pool_weights or ROLE_POOLS["hybrid_v2"]
+            self.pool_shares = dict(shares)
+            self.pool_planned = dict(POOL_PLANNED)
+            self.pool_planned["orchestrate"] = env.state.options.hybrid_plan_fanout
+            self.pool_planned["critique"] = env.state.options.hybrid_plan_fanout + 2
+            self.index = 0
+        else:
+            self.weights = env.state.options.stage_weights or WEIGHTS[method]
+            if len(self.weights) != len(WEIGHTS[method]):
+                raise ValueError("stage_weights length does not match the strategy")
+            self.index = 0
         self.tool_calls = 0
         self.evidence_namespace: str | None = None
         self.reliable = env.state.options.team_policy in {"reliable-v2", "concurrent-v1"}
 
     async def __call__(self, instruction: str, role: PhaseName = "solve") -> Answer:
         state, usage, budget = self.env.state, self.usage, self.budget
-        if self.reliable:
-            if self.method == "hybrid_v1" and role in {"critique", "verify"}:
-                self.index = max(self.index, 2 if role == "critique" else 4)
-            elif self.method == "speculative" and role == "reconcile":
-                self.index = max(self.index, 2)
-        index = self.index
-        self.index += 1
-        # Unused allocation carries forward. A stage cannot borrow from future stages.
-        cumulative = 1.0 if index == len(self.weights) - 1 else sum(self.weights[: index + 1])
+        if self.pool_shares is not None:
+            key = role if role in self.pool_shares else "task"
+            planned = max(1, self.pool_planned.get(key, 1))
+            share = self.pool_shares[key] / planned
+            if key == "verify":
+                # The verifier is the final stage; unallocated budget carries forward to it.
+                share = max(share, 1.0 - self.consumed)
+            self.consumed = min(1.0, self.consumed + share)
+            cumulative = self.consumed
+            index = self.index
+            self.index += 1
+        else:
+            if self.reliable:
+                if self.method == "hybrid_v1" and role in {"critique", "verify"}:
+                    self.index = max(self.index, 2 if role == "critique" else 4)
+                elif self.method == "speculative" and role == "reconcile":
+                    self.index = max(self.index, 2)
+            index = self.index
+            self.index += 1
+            # Unused allocation carries forward. A stage cannot borrow from future stages.
+            cumulative = 1.0 if index == len(self.weights) - 1 else sum(self.weights[: index + 1])
         reserve = (
             min(state.options.return_reserve_seconds, budget.seconds / 10) if self.reliable else 0
         )
@@ -148,7 +196,11 @@ class TeamWorker:
                 else None
             )
         )
-        default_output_cap = 16384 if self.reliable or role not in CONTRACTS else 4096
+        default_output_cap = (
+            16384
+            if self.reliable or role in {"integrate", "orchestrate"} or role not in CONTRACTS
+            else 4096
+        )
         output_cap = budget.max_output_tokens or (
             profile.max_output_tokens if profile else default_output_cap
         )

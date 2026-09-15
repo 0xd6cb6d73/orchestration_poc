@@ -57,8 +57,21 @@ class ModelSpec(StrictModel):
 
 
 PhaseName: TypeAlias = Literal[
-    "solve", "draft", "review", "finalize", "plan", "proposal", "critique", "verify", "reconcile"
+    "solve",
+    "draft",
+    "review",
+    "finalize",
+    "plan",
+    "proposal",
+    "critique",
+    "verify",
+    "reconcile",
+    "orchestrate",
+    "task",
+    "integrate",
 ]
+
+HYBRID_V2_POOL_ROLES = frozenset({"orchestrate", "task", "critique", "integrate", "verify"})
 
 
 class RoleBudgetProfile(StrictModel):
@@ -89,6 +102,9 @@ class ArchitectureOptions(StrictModel):
     provider_retries: int = Field(default=0, ge=0, le=3)
     return_reserve_seconds: float = Field(default=0.05, ge=0)
     hybrid_proposal_quorum: int = Field(default=2, ge=1, le=2)
+    hybrid_plan_fanout: int = Field(default=2, ge=1, le=3)
+    hybrid_max_decision_rounds: int = Field(default=3, ge=1, le=8)
+    hybrid_pool_weights: dict[str, float] | None = None
     speculative_failure_policy: Literal["fail", "return_first_submitted"] = "fail"
     stage_weights: list[float] | None = None
 
@@ -100,6 +116,14 @@ class ArchitectureOptions(StrictModel):
             or abs(sum(self.stage_weights) - 1) > 1e-6
         ):
             raise ValueError("stage_weights must be positive and sum to one")
+        if self.hybrid_pool_weights is not None and (
+            set(self.hybrid_pool_weights) != set(HYBRID_V2_POOL_ROLES)
+            or any(not 0 < w <= 1 for w in self.hybrid_pool_weights.values())
+            or abs(sum(self.hybrid_pool_weights.values()) - 1) > 1e-6
+        ):
+            raise ValueError(
+                "hybrid_pool_weights must cover every hybrid_v2 role with positive values summing to one"
+            )
         return self
 
 
