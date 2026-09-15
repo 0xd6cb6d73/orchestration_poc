@@ -76,6 +76,10 @@ class SwarmStrategy(StrEnum):
 
     BOARD = "board"
     HYBRID_V1 = "hybrid_v1"
+    HYBRID_V2 = "hybrid_v2"
+
+
+HYBRID_STRATEGIES = frozenset({SwarmStrategy.HYBRID_V1, SwarmStrategy.HYBRID_V2})
 
 
 class DependencyRequirement(StrEnum):
@@ -186,11 +190,8 @@ class ExecutionPolicy(BaseModel):
             raise ValueError("speculative_fanout cannot exceed max_workers")
         if self.mode != ExecutionMode.SPECULATIVE and self.speculative_fanout != 1:
             raise ValueError("speculative_fanout is only valid in speculative mode")
-        if (
-            self.swarm_strategy == SwarmStrategy.HYBRID_V1
-            and self.mode != ExecutionMode.BOARD_CLAIM
-        ):
-            raise ValueError("hybrid_v1 is a strategy inside board_claim mode")
+        if self.swarm_strategy in HYBRID_STRATEGIES and self.mode != ExecutionMode.BOARD_CLAIM:
+            raise ValueError(f"{self.swarm_strategy.value} is a strategy inside board_claim mode")
         if self.policy_set.strategy != self.swarm_strategy:
             raise ValueError("policy_set strategy must match swarm_strategy")
         return self
@@ -311,10 +312,10 @@ class RunCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_swarm_strategy(self) -> RunCreate:
-        if self.swarm_strategy == SwarmStrategy.HYBRID_V1 and (
+        if self.swarm_strategy in HYBRID_STRATEGIES and (
             self.execution_mode != ExecutionMode.BOARD_CLAIM
         ):
-            raise ValueError("hybrid_v1 requires board_claim execution mode")
+            raise ValueError(f"{self.swarm_strategy.value} requires board_claim execution mode")
         return self
 
 

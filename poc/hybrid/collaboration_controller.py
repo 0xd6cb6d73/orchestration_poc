@@ -388,6 +388,66 @@ class CollaborationController:
         self.db.put_candidate(candidate, event_type="candidate.recombined")
         return candidate
 
+    def revise_candidate(
+        self,
+        *,
+        round_id: str,
+        author: AgentInstance,
+        hypothesis_key: str,
+        artifact_id: str,
+        evidence_refs: tuple[str, ...] = (),
+        parent_candidate_ids: tuple[str, ...] = (),
+    ) -> Candidate:
+        """Publish a revision (or an added task with no parents) during the decision loop."""
+        round_ = self._round(round_id, CollaborationPhase.TESTED)
+        normalized_parents = tuple(dict.fromkeys(parent_candidate_ids))
+        known = {
+            candidate.candidate_id
+            for candidate in self.db.list_candidates(round_.run_id)
+            if candidate.round_id == round_id
+        }
+        if not set(normalized_parents) <= known:
+            raise CollaborationError("revision references an unknown candidate")
+        team = self.db.get_team(round_.team_id)
+        if team is None or author.agent_instance_id not in team.member_agent_ids:
+            raise CollaborationError("revision author is not a member of this round")
+        self.artifacts.set_visibility(
+            artifact_id,
+            VisibilityPolicy.RELEASED_TO_TEAM,
+            visibility_ref=round_.team_id,
+        )
+        revision_index = sum(
+            1
+            for candidate in self.db.list_candidates(round_.run_id)
+            if candidate.round_id == round_id
+            and candidate.hypothesis_key == hypothesis_key
+            and candidate.candidate_id.startswith(f"candidate:{round_id}:revised:{hypothesis_key}")
+        )
+        candidate_id = f"candidate:{round_id}:revised:{hypothesis_key}:{revision_index + 1}"
+        blackboard = self.blackboard.publish(
+            actor=author,
+            domain_id=round_.domain_id,
+            record_type=RecordType.HYPOTHESIS,
+            statement=f"Revised hypothesis {candidate_id}",
+            supporting_artifacts=(artifact_id, *evidence_refs),
+            visibility=VisibilityPolicy.RELEASED_TO_TEAM,
+            visibility_ref=round_.team_id,
+            record_id=f"blackboard:{candidate_id}",
+        )
+        candidate = Candidate(
+            candidate_id=candidate_id,
+            round_id=round_id,
+            author_agent_id=author.agent_instance_id,
+            hypothesis_key=hypothesis_key,
+            artifact_id=artifact_id,
+            blackboard_record_id=blackboard.record_id,
+            evidence_refs=evidence_refs,
+            visibility=VisibilityPolicy.RELEASED_TO_TEAM,
+            parent_candidate_ids=normalized_parents,
+        )
+        self.db.put_candidate(candidate, event_type="candidate.revised")
+        return candidate
+
     def select(self, round_id: str) -> Candidate:
         round_ = self.db.get_collaboration_round(round_id)
         if round_ is None:

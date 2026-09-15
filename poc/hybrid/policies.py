@@ -14,6 +14,7 @@ class SwarmPolicyResolver:
         self._factories: dict[SwarmStrategy, PolicyFactory] = {
             SwarmStrategy.BOARD: _board_policies,
             SwarmStrategy.HYBRID_V1: _hybrid_v1_policies,
+            SwarmStrategy.HYBRID_V2: _hybrid_v2_policies,
         }
 
     def register(
@@ -54,6 +55,18 @@ def _hybrid_v1_policies() -> SwarmPolicySet:
         context_policy="artifact_manifest_v1",
         communication_policy="scoped_team_v1",
         collaboration_policy="diverge_test_select_v1",
+        acceptance_policy="independent_evidence_v1",
+        completion_policy="attested_delivery_v1",
+    )
+
+
+def _hybrid_v2_policies() -> SwarmPolicySet:
+    return SwarmPolicySet(
+        strategy=SwarmStrategy.HYBRID_V2,
+        allocation_policy="board_scoped_wave_v1",
+        context_policy="artifact_manifest_v1",
+        communication_policy="scoped_team_v1",
+        collaboration_policy="orchestrator_planned_v2",
         acceptance_policy="independent_evidence_v1",
         completion_policy="attested_delivery_v1",
     )
