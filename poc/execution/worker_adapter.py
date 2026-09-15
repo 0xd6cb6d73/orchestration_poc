@@ -12,12 +12,12 @@ from poc.execution.capacity import CapacityScheduler
 from poc.hybrid.context_assembler import ContextAssembler
 from poc.hybrid.contracts import ContextManifest, VisibilityPolicy
 from poc.models import (
+    HYBRID_STRATEGIES,
     AgentInstance,
     ExecutionHandle,
     ExecutionMode,
     ExecutionPolicy,
     Outcome,
-    SwarmStrategy,
     TaskSpec,
     utc_now,
 )
@@ -77,7 +77,7 @@ class WorkerAdapter:
         resumed_claim = False
         handle: ExecutionHandle | None = None
         attempt_id = f"attempt-{authority_task_id}-1"
-        if plan.swarm_strategy == SwarmStrategy.HYBRID_V1:
+        if plan.swarm_strategy in HYBRID_STRATEGIES:
             authority_task_id = f"{workflow_id}:r{workflow_revision}:{task.id}"
             handle = self._hybrid_execution(run_id, owner)
             self.capacity.activate_existing(handle, agent)
@@ -208,8 +208,8 @@ class WorkerAdapter:
         if row is None:
             raise RuntimeError("hybrid worker has no active board execution")
         policy = ExecutionPolicy.model_validate_json(row["policy"])
-        if policy.swarm_strategy != SwarmStrategy.HYBRID_V1:
-            raise RuntimeError("board execution is not pinned to hybrid_v1")
+        if policy.swarm_strategy not in HYBRID_STRATEGIES:
+            raise RuntimeError("board execution is not pinned to a hybrid strategy")
         return ExecutionHandle(
             execution_id=row["execution_id"],
             run_id=run_id,

@@ -394,6 +394,7 @@ class OODAHarness:
             }
         if role in {
             "metric_comparator",
+            "orchestrator_planner",
             "claim_drafter",
             "claim_checker",
             "evidence_verifier",
@@ -404,6 +405,41 @@ class OODAHarness:
         return latest
 
     def _synthesis_content(self, role: str, inputs: dict[str, Any]) -> Any:
+        if role == "orchestrator_planner":
+            decision_request = inputs.get("decision_request")
+            if decision_request is not None:
+                pending = decision_request["pending_task"]
+                revision = dict(cast(dict[str, Any], pending))
+                revision["local_scope"] = (
+                    f"{pending['local_scope']}; exclude derived and cross-table signals"
+                )
+                decision: dict[str, Any] = {
+                    "decision": "revise",
+                    "rationale": "the critique exposed scope creep; the revision tightens local_scope",
+                    "revision": revision,
+                }
+                return decision
+            return {
+                "parent_objective": inputs["objective"],
+                "tasks": [
+                    {
+                        "task_id": "t1",
+                        "objective": "Quantify the regression from the supplied metrics",
+                        "local_scope": "the metric comparison only",
+                        "definition_of_done": ["ratio and dominant log patterns cited"],
+                    },
+                    {
+                        "task_id": "t2",
+                        "objective": "Correlate the deployment record with the metric regression",
+                        "local_scope": "the deployment record plus the t1 output",
+                        "definition_of_done": [
+                            "deployment proximity stated with alternatives explicit"
+                        ],
+                        "dependencies": ["t1"],
+                    },
+                ],
+                "integration_definition_of_done": ["every task artifact is cited by the report"],
+            }
         if role == "metric_comparator":
             baseline = inputs["baseline"]["value"]
             incident = inputs["incident"]["value"]
@@ -415,6 +451,17 @@ class OODAHarness:
                 "claim": f"Checkout p95 rose from {baseline:.2f} ms to {incident:.2f} ms ({incident / baseline:.2f}x).",
             }
         if role == "claim_drafter":
+            scoped = inputs.get("task")
+            if isinstance(scoped, dict):
+                scoped_task = cast(dict[str, Any], scoped)
+                return {
+                    "task_id": scoped_task["task_id"],
+                    "summary": (
+                        f"Completed scoped task {scoped_task['task_id']}: "
+                        f"{scoped_task['objective']}"
+                    ),
+                    "attempt": scoped_task.get("attempt", 1),
+                }
             selected = inputs.get("selected_candidate")
             if isinstance(selected, dict):
                 return cast(dict[str, Any], selected)
@@ -450,7 +497,39 @@ class OODAHarness:
                 "alternatives": ["upstream payment latency"],
             }
         if role == "claim_checker":
-            draft = inputs["draft"]
+            task_contract = inputs.get("task")
+            if isinstance(task_contract, dict):
+                contract = cast(dict[str, Any], task_contract)
+                attempt = int(inputs.get("critique_attempt", 1))
+                supported = attempt > 1
+                checks: list[str] = (
+                    [f"definition of done satisfied on attempt {attempt}"]
+                    if supported
+                    else ["the first attempt did not satisfy the definition of done"]
+                )
+                return {
+                    "task_id": contract["task_id"],
+                    "supported": supported,
+                    "checks": checks,
+                    "caveat": "attempt-scoped critique of the planned task contract",
+                }
+            draft = cast(dict[str, Any], inputs["draft"])
+            if "tasks" in draft:
+                tasks = cast(list[dict[str, Any]], draft["tasks"])
+                complete = all(
+                    str(task.get("task_id", "")).strip()
+                    and task.get("local_scope", "").strip()
+                    and task.get("definition_of_done")
+                    for task in tasks
+                )
+                return {
+                    "supported": 2 <= len(tasks) <= 8 and complete,
+                    "checks": [
+                        "plan decomposition bounds hold",
+                        "every task carries scope and definition of done",
+                    ],
+                    "caveat": "plan-level judgment over the orchestrator draft",
+                }
             hypothesis_key = inputs.get("hypothesis_key")
             if hypothesis_key == "payment_timeout":
                 return {
@@ -480,6 +559,21 @@ class OODAHarness:
                 "caveat": "Temporal association is not proof of causation.",
             }
         if role == "evidence_verifier":
+            if inputs.get("integration"):
+                checks_map: dict[str, bool] = {
+                    "claim_matches_original_evidence": True,
+                    "misleading_signals_qualified": True,
+                    "constraints_preserved": True,
+                }
+                findings_list: list[str] = [
+                    "The integrated report cites every accepted scoped task artifact."
+                ]
+                return {
+                    "subject_artifact_id": inputs["subject_artifact_id"],
+                    "supported": True,
+                    "checks": checks_map,
+                    "findings": findings_list,
+                }
             candidate = inputs["candidate"]
             supported = candidate.get("hypothesis_key") == "cache_queueing"
             return {
@@ -508,6 +602,26 @@ class OODAHarness:
                 "3. Measure payment-provider latency separately; payment_timeout is not uniquely incident-correlated.\n"
             )
         if role == "report_assembler":
+            task_outputs = inputs.get("task_outputs")
+            if task_outputs is not None:
+                outputs = cast(list[dict[str, Any]], task_outputs)
+                lines = ["## Scoped task findings\n"]
+                for output in outputs:
+                    summary = output.get("summary", "")
+                    lines.append(f"- `{output.get('task_id')}`: {summary}")
+                report_body = (
+                    "\n".join(lines)
+                    + "\n## Evidence lineage\n"
+                    + "\n".join(
+                        f"- `{artifact}`" for artifact in inputs.get("evidence_artifacts", [])
+                    )
+                    + "\n"
+                )
+                return {
+                    "claim": "The orchestrated scoped tasks jointly support the incident report.",
+                    "caveat": "Task outputs are model observations; the integrated report cites every task artifact.",
+                    "report": report_body,
+                }
             return (
                 "# Checkout latency regression investigation\n\n"
                 "Scope: offline analysis of supplied synthetic fixtures. No live system was modified.\n\n"

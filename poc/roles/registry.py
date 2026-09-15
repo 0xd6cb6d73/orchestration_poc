@@ -44,6 +44,7 @@ class RoleRegistry:
                 tier=Tier.SUB,
                 system_prompt="Coordinate evidence-backed reporting; never write report content directly.",
                 allowed_child_roles=[
+                    "orchestrator_planner",
                     "claim_drafter",
                     "claim_checker",
                     "section_renderer",
@@ -85,6 +86,9 @@ class RoleRegistry:
             "claim_drafter": _worker(
                 "claim_drafter", ["write_artifact"], "DraftClaim", worker_limits
             ),
+            "orchestrator_planner": _worker(
+                "orchestrator_planner", ["write_artifact"], "OrchestratorPlan", worker_limits
+            ),
             "claim_checker": _worker(
                 "claim_checker", ["write_artifact"], "CheckedClaim", worker_limits
             ),
@@ -98,6 +102,9 @@ class RoleRegistry:
                 "evidence_verifier", ["write_artifact"], "VerificationResult", worker_limits
             ),
         }
+        self._roles["orchestrator_planner"].output_schemas.extend(
+            ["OrchestratorDecision", "PlannedRevision"]
+        )
 
     def get(self, role_id: str) -> RoleSpec:
         try:

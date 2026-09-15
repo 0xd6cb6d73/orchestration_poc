@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from poc.blackboard.models import EpistemicStatus, RecordType
 from poc.blackboard.service import BlackboardService
@@ -31,6 +31,7 @@ from poc.hybrid.contracts import Candidate, CollaborationPhase, EvaluationVector
 from poc.hybrid.policies import SwarmPolicyResolver
 from poc.hybrid.verification_service import VerificationService
 from poc.models import (
+    HYBRID_STRATEGIES,
     AgentInstance,
     ApprovalRequest,
     DependencyRequirement,
@@ -38,6 +39,7 @@ from poc.models import (
     ExecutionHandle,
     ExecutionMode,
     ExecutionPolicy,
+    HybridConfig,
     InputBinding,
     MissionPlan,
     PlanArea,
@@ -369,6 +371,19 @@ class Runtime:
                 source_artifacts.append(selected_candidate.artifact_id)
                 selected_candidate_artifact_id = selected_candidate.artifact_id
                 required_accepted_artifacts = (selected_candidate.artifact_id,)
+            elif plan.swarm_strategy == SwarmStrategy.HYBRID_V2:
+                selected_claim, selected_candidate = await self._run_orchestrated_plan(
+                    run_id=run_id,
+                    plan=plan,
+                    reporting_supervisor=supervisors["reporting"],
+                    assurance_supervisor=supervisors["assurance"],
+                    metrics=metrics["result"]["content"],
+                    evidence=evidence["result"],
+                    source_artifacts=source_artifacts,
+                )
+                source_artifacts.append(selected_candidate.artifact_id)
+                selected_candidate_artifact_id = selected_candidate.artifact_id
+                required_accepted_artifacts = (selected_candidate.artifact_id,)
             report_spec = self._report_workflow(
                 run_id,
                 plan,
@@ -386,7 +401,7 @@ class Runtime:
             self._ensure_success(report_result, report_spec)
             final = report_result["results"]["assemble"]
             report_artifact = final["result"]["published"]["artifact_id"]
-            if plan.swarm_strategy == SwarmStrategy.HYBRID_V1:
+            if plan.swarm_strategy in HYBRID_STRATEGIES:
                 delivery = self.completion_gate.evaluate(
                     plan=plan,
                     deliverable_artifact_id=report_artifact,
@@ -583,7 +598,7 @@ class Runtime:
                             ],
                         )
                     ]
-                    if request.swarm_strategy == SwarmStrategy.HYBRID_V1
+                    if request.swarm_strategy in HYBRID_STRATEGIES
                     else []
                 ),
             ],
@@ -1044,6 +1059,739 @@ class Runtime:
         self.collaboration.complete(round_.round_id)
         return selected_content, selected
 
+    async def _run_orchestrated_plan(
+        self,
+        *,
+        run_id: str,
+        plan: MissionPlan,
+        reporting_supervisor: AgentInstance,
+        assurance_supervisor: AgentInstance,
+        metrics: dict[str, Any],
+        evidence: dict[str, Any],
+        source_artifacts: list[str],
+    ) -> tuple[dict[str, Any], Candidate]:
+        """hybrid_v2: LLM-planned decomposition with scoped task waves and a decision loop."""
+        from poc.hybrid.planning import (
+            PlannedTask,
+            PlanValidationError,
+            apply_decision,
+            parse_decision,
+            parse_plan,
+            validate_decision,
+        )
+
+        fanout = plan.hybrid.proposals_per_round
+        planning_round_id = f"round:{run_id}:hybrid-v2:planning:r1"
+        planning_team_id = f"team:{run_id}:hybrid-v2:planning:r1"
+        planning_workflow_id = f"{run_id}-hybrid-v2-plans-r1"
+        planner_agents = [
+            self._pre_spawn_worker(
+                run_id=run_id,
+                plan=plan,
+                parent=reporting_supervisor,
+                role="orchestrator_planner",
+                workflow_id=planning_workflow_id,
+                task_id=f"plan_{index}",
+            )
+            for index in range(fanout)
+        ]
+        planning = self.collaboration.frame(
+            run_id=run_id,
+            domain_id="reporting",
+            steward=reporting_supervisor,
+            member_agent_ids=tuple(agent.agent_instance_id for agent in planner_agents),
+            config=plan.hybrid,
+            team_id=planning_team_id,
+            round_id=planning_round_id,
+        )
+        planning_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=planning_workflow_id,
+                run_id=run_id,
+                owner=reporting_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["orchestrator_planner"],
+                max_workers=fanout,
+                tasks=[
+                    TaskSpec(
+                        id=f"plan_{index}",
+                        role="orchestrator_planner",
+                        goal="Decompose the objective into small scoped tasks.",
+                        static_inputs={
+                            "objective": plan.objective,
+                            "candidate_index": index,
+                            "metrics": metrics,
+                            "evidence": evidence,
+                        },
+                        static_artifact_refs=source_artifacts,
+                        output_schema="OrchestratorPlan",
+                        acceptance_criteria=[
+                            "between two and eight scoped tasks",
+                            "every task states scope and definition of done",
+                        ],
+                        domain_id="reporting",
+                        team_id=planning.team_id,
+                        collaboration_round_id=planning.round_id,
+                        artifact_visibility="sealed_to_round",
+                    )
+                    for index in range(fanout)
+                ],
+            ),
+            plan,
+        )
+        await self._actor(reporting_supervisor).turn(
+            {"type": "orchestration.plans_requested"},
+            [self._submit_command(planning_spec)],
+        )
+        planning_result = await self.runner.start(planning_spec)
+        self._ensure_success(planning_result, planning_spec)
+        drafts: list[tuple[str, dict[str, Any], str]] = []
+        for index in range(fanout):
+            plan_result = planning_result["results"][f"plan_{index}"]
+            author = self._get_agent(plan_result["agent_instance_id"])
+            candidate = self.collaboration.submit_candidate(
+                round_id=planning.round_id,
+                author=author,
+                hypothesis_key=f"plan_{index}",
+                artifact_id=plan_result["output_artifact"],
+                evidence_refs=tuple(source_artifacts),
+            )
+            drafts.append(
+                (
+                    candidate.candidate_id,
+                    plan_result["result"]["content"],
+                    plan_result["output_artifact"],
+                )
+            )
+        self.collaboration.release(planning.round_id)
+        self.collaboration.cluster_candidates(planning.round_id)
+        self.collaboration.advance(planning.round_id, CollaborationPhase.CRITIQUED)
+
+        judge_workflow_id = f"{run_id}-hybrid-v2-plan-judges-r1"
+        for index in range(len(drafts)):
+            self._pre_spawn_worker(
+                run_id=run_id,
+                plan=plan,
+                parent=reporting_supervisor,
+                role="claim_checker",
+                workflow_id=judge_workflow_id,
+                task_id=f"judge_{index}",
+            )
+        round_ = self.db.get_collaboration_round(planning_round_id)
+        assert round_ is not None
+        judge_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=judge_workflow_id,
+                run_id=run_id,
+                owner=reporting_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["claim_checker"],
+                max_workers=len(drafts),
+                tasks=[
+                    TaskSpec(
+                        id=f"judge_{index}",
+                        role="claim_checker",
+                        goal="Judge one orchestration plan candidate against the objective.",
+                        static_inputs={"draft": draft, "hypothesis_key": candidate_id},
+                        static_artifact_refs=[artifact_id, *source_artifacts],
+                        artifact_requirements={
+                            artifact_id: DependencyRequirement.CANDIDATE_PUBLISHED
+                        },
+                        output_schema="CheckedClaim",
+                        acceptance_criteria=["plan coverage and scope sharpness judged"],
+                        domain_id="reporting",
+                        team_id=round_.team_id,
+                        collaboration_round_id=round_.round_id,
+                        artifact_visibility="domain",
+                    )
+                    for index, (candidate_id, draft, artifact_id) in enumerate(drafts)
+                ],
+            ),
+            plan,
+        )
+        await self._actor(reporting_supervisor).turn(
+            {"type": "orchestration.plans_released"},
+            [self._submit_command(judge_spec)],
+        )
+        judge_result = await self.runner.start(judge_spec)
+        self._ensure_success(judge_result, judge_spec)
+        judged: list[tuple[str, dict[str, Any], str, bool]] = []
+        for index, (candidate_id, draft, artifact_id) in enumerate(drafts):
+            judge = judge_result["results"][f"judge_{index}"]
+            content = judge["result"]["content"]
+            critic = self._get_agent(judge["agent_instance_id"])
+            supported = bool(content["supported"])
+            self.collaboration.record_evaluation(
+                candidate_id=candidate_id,
+                critic=critic,
+                critique_artifact_id=judge["output_artifact"],
+                passed=supported,
+                findings=tuple(str(item) for item in content.get("checks", [])),
+                evidence_refs=tuple(source_artifacts),
+                evaluation=EvaluationVector(
+                    validity=5 if supported else 1,
+                    evidence=5 if supported else 1,
+                    usefulness=5 if supported else 2,
+                    novelty=3,
+                    constraint_satisfaction=5,
+                ),
+            )
+            judged.append((candidate_id, draft, artifact_id, supported))
+        self.collaboration.advance(planning.round_id, CollaborationPhase.TESTED)
+        self.collaboration.advance(planning.round_id, CollaborationPhase.RECOMBINED)
+        selected_plan_candidate = self.collaboration.select(planning.round_id)
+        selected = next(
+            (item for item in judged if item[0] == selected_plan_candidate.candidate_id), None
+        )
+        if selected is None:
+            raise RuntimeError("selected orchestration plan candidate was not found")
+        _, selected_content, selected_artifact_id, _ = selected
+        try:
+            orchestrator_plan = parse_plan(selected_content)
+        except PlanValidationError:
+            repair_workflow_id = f"{run_id}-hybrid-v2-plan-repair-r1"
+            repair_spec = self._configured_workflow(
+                WorkflowSpec(
+                    workflow_id=repair_workflow_id,
+                    run_id=run_id,
+                    owner=reporting_supervisor.agent_instance_id,
+                    approved_plan_version=plan.version,
+                    authorized_worker_roles=["orchestrator_planner"],
+                    max_workers=1,
+                    tasks=[
+                        TaskSpec(
+                            id="plan_repair",
+                            role="orchestrator_planner",
+                            goal="Repair the rejected orchestration plan.",
+                            static_inputs={
+                                "objective": plan.objective,
+                                "metrics": metrics,
+                                "evidence": evidence,
+                            },
+                            static_artifact_refs=[selected_artifact_id, *source_artifacts],
+                            output_schema="OrchestratorPlan",
+                            acceptance_criteria=["the repaired plan passes hard validation"],
+                            domain_id="reporting",
+                        )
+                    ],
+                ),
+                plan,
+            )
+            await self._actor(reporting_supervisor).turn(
+                {"type": "orchestration.plan_repair_requested"},
+                [self._submit_command(repair_spec)],
+            )
+            repair_result = await self.runner.start(repair_spec)
+            self._ensure_success(repair_result, repair_spec)
+            repair = repair_result["results"]["plan_repair"]
+            try:
+                orchestrator_plan = parse_plan(repair["result"]["content"])
+            except PlanValidationError as failures:
+                raise RuntimeError(
+                    "orchestrator plan failed hard validation after the repair attempt: "
+                    + "; ".join(failures.problems)
+                ) from failures
+        self.db.record_event(
+            EventRecord(
+                run_id=run_id,
+                event_type="hybrid_v2.plan_selected",
+                actor_id=reporting_supervisor.agent_instance_id,
+                data={
+                    "plan": orchestrator_plan.model_dump(),
+                    "candidate_id": selected_plan_candidate.candidate_id,
+                },
+            )
+        )
+        self.collaboration.advance(planning.round_id, CollaborationPhase.VERIFIED_AND_SCORED)
+        self.collaboration.complete(planning.round_id)
+
+        execution_workflow_id = f"{run_id}-hybrid-v2-tasks-r1"
+        integration_workflow_id = f"{run_id}-hybrid-v2-integration-r1"
+        drafter_agents = [
+            self._pre_spawn_worker(
+                run_id=run_id,
+                plan=plan,
+                parent=reporting_supervisor,
+                role="claim_drafter",
+                workflow_id=execution_workflow_id,
+                task_id=f"task_{task.task_id}",
+            )
+            for task in orchestrator_plan.tasks
+        ]
+        assembler_agent = self._pre_spawn_worker(
+            run_id=run_id,
+            plan=plan,
+            parent=reporting_supervisor,
+            role="report_assembler",
+            workflow_id=integration_workflow_id,
+            task_id="integrate",
+        )
+        execution = self.collaboration.frame(
+            run_id=run_id,
+            domain_id="reporting",
+            steward=reporting_supervisor,
+            member_agent_ids=(
+                reporting_supervisor.agent_instance_id,
+                *(agent.agent_instance_id for agent in drafter_agents),
+                assembler_agent.agent_instance_id,
+            ),
+            config=HybridConfig(
+                proposals_per_round=max(2, len(orchestrator_plan.tasks)),
+                max_collaboration_rounds=plan.hybrid.max_collaboration_rounds,
+            ),
+            team_id=f"team:{run_id}:hybrid-v2:execution:r1",
+            round_id=f"round:{run_id}:hybrid-v2:execution:r1",
+        )
+        task_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=execution_workflow_id,
+                run_id=run_id,
+                owner=reporting_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["claim_drafter"],
+                max_workers=len(orchestrator_plan.tasks),
+                tasks=[
+                    TaskSpec(
+                        id=f"task_{task.task_id}",
+                        role="claim_drafter",
+                        goal=f"Execute scoped task {task.task_id} within its stated scope.",
+                        static_inputs={
+                            "task": {**task.model_dump(), "attempt": 1},
+                            "objective": orchestrator_plan.parent_objective,
+                            "metrics": metrics,
+                            "evidence": evidence,
+                        },
+                        static_artifact_refs=source_artifacts,
+                        depends_on=[f"task_{dependency}" for dependency in task.dependencies],
+                        output_schema="DraftClaim",
+                        acceptance_criteria=list(task.definition_of_done),
+                        domain_id="reporting",
+                        team_id=execution.team_id,
+                        collaboration_round_id=execution.round_id,
+                        artifact_visibility="sealed_to_round",
+                    )
+                    for task in orchestrator_plan.tasks
+                ],
+            ),
+            plan,
+        )
+        await self._actor(reporting_supervisor).turn(
+            {"type": "orchestration.tasks_requested"},
+            [self._submit_command(task_spec)],
+        )
+        task_result = await self.runner.start(task_spec)
+        self._ensure_success(task_result, task_spec)
+        task_outputs: dict[str, dict[str, Any]] = {}
+        for task in orchestrator_plan.tasks:
+            produced = task_result["results"][f"task_{task.task_id}"]
+            author = self._get_agent(produced["agent_instance_id"])
+            candidate = self.collaboration.submit_candidate(
+                round_id=execution.round_id,
+                author=author,
+                hypothesis_key=task.task_id,
+                artifact_id=produced["output_artifact"],
+                evidence_refs=tuple(source_artifacts),
+            )
+            task_outputs[task.task_id] = {
+                "candidate_id": candidate.candidate_id,
+                "content": produced["result"]["content"],
+                "artifact_id": produced["output_artifact"],
+            }
+        self.collaboration.release(execution.round_id, minimum_proposals=1)
+        self.collaboration.cluster_candidates(execution.round_id)
+        self.collaboration.advance(execution.round_id, CollaborationPhase.CRITIQUED)
+        task_states: dict[str, str] = {}
+        task_findings: dict[str, dict[str, Any]] = {}
+
+        async def critique_task(task: PlannedTask, attempt: int, artifact: dict[str, Any]) -> bool:
+            round_ = self.db.get_collaboration_round(execution.round_id)
+            assert round_ is not None
+            workflow_id = f"{run_id}-hybrid-v2-critique-{attempt}-{task.task_id}"
+            spec = self._configured_workflow(
+                WorkflowSpec(
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    owner=reporting_supervisor.agent_instance_id,
+                    approved_plan_version=plan.version,
+                    authorized_worker_roles=["claim_checker"],
+                    max_workers=1,
+                    tasks=[
+                        TaskSpec(
+                            id=f"critique_{task.task_id}",
+                            role="claim_checker",
+                            goal="Critique one scoped task output against its task contract.",
+                            static_inputs={
+                                "task": {**task.model_dump(), "attempt": attempt},
+                                "draft": artifact["content"],
+                                "hypothesis_key": task.task_id,
+                                "critique_attempt": attempt,
+                            },
+                            static_artifact_refs=[artifact["artifact_id"], *source_artifacts],
+                            artifact_requirements={
+                                artifact["artifact_id"]: DependencyRequirement.CANDIDATE_PUBLISHED
+                            },
+                            output_schema="CheckedClaim",
+                            acceptance_criteria=["scope creep and unmet criteria are explicit"],
+                            domain_id="reporting",
+                            team_id=round_.team_id,
+                            collaboration_round_id=round_.round_id,
+                            artifact_visibility="domain",
+                        )
+                    ],
+                ),
+                plan,
+            )
+            await self._actor(reporting_supervisor).turn(
+                {"type": "orchestration.task_critique_requested"},
+                [self._submit_command(spec)],
+            )
+            result = await self.runner.start(spec)
+            self._ensure_success(result, spec)
+            critique = result["results"][f"critique_{task.task_id}"]
+            content = critique["result"]["content"]
+            critic = self._get_agent(critique["agent_instance_id"])
+            supported = bool(content["supported"])
+            self.collaboration.record_evaluation(
+                candidate_id=artifact["candidate_id"],
+                critic=critic,
+                critique_artifact_id=critique["output_artifact"],
+                passed=supported,
+                findings=tuple(str(item) for item in content.get("checks", [])),
+                evidence_refs=tuple(source_artifacts),
+                evaluation=EvaluationVector(
+                    validity=5 if supported else 1,
+                    evidence=5 if supported else 1,
+                    usefulness=5 if supported else 2,
+                    novelty=3,
+                    constraint_satisfaction=5,
+                ),
+            )
+            task_states[task.task_id] = "viable" if supported else "refuted"
+            task_findings[task.task_id] = {
+                "checks": list(content.get("checks", [])),
+                "caveat": str(content.get("caveat", "")),
+                "missing": False,
+            }
+            return supported
+
+        for task in orchestrator_plan.tasks:
+            await critique_task(task, 1, task_outputs[task.task_id])
+        self.collaboration.advance(execution.round_id, CollaborationPhase.TESTED)
+
+        decision_rounds = 0
+        while decision_rounds < plan.hybrid.max_collaboration_rounds:
+            pending = [
+                task
+                for task in orchestrator_plan.tasks
+                if task_states.get(task.task_id) != "viable"
+            ]
+            if not pending:
+                break
+            decision_rounds += 1
+            decision_workflow_id = f"{run_id}-hybrid-v2-decisions-r{decision_rounds}"
+            decision_spec = self._configured_workflow(
+                WorkflowSpec(
+                    workflow_id=decision_workflow_id,
+                    run_id=run_id,
+                    owner=reporting_supervisor.agent_instance_id,
+                    approved_plan_version=plan.version,
+                    authorized_worker_roles=["orchestrator_planner"],
+                    max_workers=len(pending),
+                    tasks=[
+                        TaskSpec(
+                            id=f"decision_{task.task_id}",
+                            role="orchestrator_planner",
+                            goal="Decide the next action for one critiqued scoped task.",
+                            static_inputs={
+                                "decision_request": {
+                                    "pending_task": task.model_dump(),
+                                    "findings": task_findings.get(task.task_id, {}),
+                                    "accepted_task_ids": [
+                                        task_id
+                                        for task_id, state in task_states.items()
+                                        if state == "viable"
+                                    ],
+                                },
+                                "objective": orchestrator_plan.parent_objective,
+                                "metrics": metrics,
+                                "evidence": evidence,
+                            },
+                            static_artifact_refs=source_artifacts,
+                            output_schema="OrchestratorDecision",
+                            acceptance_criteria=["decision is revise, add_task, or escalate"],
+                            domain_id="reporting",
+                        )
+                        for task in pending
+                    ],
+                ),
+                plan,
+            )
+            await self._actor(reporting_supervisor).turn(
+                {"type": "orchestration.decisions_requested"},
+                [self._submit_command(decision_spec)],
+            )
+            decision_result = await self.runner.start(decision_spec)
+            self._ensure_success(decision_result, decision_spec)
+            for task in pending:
+                decision = parse_decision(
+                    decision_result["results"][f"decision_{task.task_id}"]["result"]["content"]
+                )
+                validate_decision(decision, orchestrator_plan)
+                if decision.decision == "escalate":
+                    self.db.record_event(
+                        EventRecord(
+                            run_id=run_id,
+                            event_type="hybrid_v2.escalated",
+                            actor_id=reporting_supervisor.agent_instance_id,
+                            data={"task": task.task_id, "rationale": decision.rationale},
+                        )
+                    )
+                    raise RuntimeError(
+                        f"orchestrator escalated task {task.task_id!r}: {decision.rationale}"
+                    )
+                revised = (
+                    decision.revision if decision.decision == "revise" else decision.added_task
+                )
+                assert revised is not None
+                orchestrator_plan = apply_decision(orchestrator_plan, decision)
+                revision_workflow_id = (
+                    f"{run_id}-hybrid-v2-revision-{decision_rounds}-{revised.task_id}"
+                )
+                revision_agent = self._pre_spawn_worker(
+                    run_id=run_id,
+                    plan=plan,
+                    parent=reporting_supervisor,
+                    role="claim_drafter",
+                    workflow_id=revision_workflow_id,
+                    task_id=f"task_{revised.task_id}",
+                )
+                del revision_agent
+                revision_spec = self._configured_workflow(
+                    WorkflowSpec(
+                        workflow_id=revision_workflow_id,
+                        run_id=run_id,
+                        owner=reporting_supervisor.agent_instance_id,
+                        approved_plan_version=plan.version,
+                        authorized_worker_roles=["claim_drafter"],
+                        max_workers=1,
+                        tasks=[
+                            TaskSpec(
+                                id=f"task_{revised.task_id}",
+                                role="claim_drafter",
+                                goal=f"Re-execute scoped task {revised.task_id} after the decision.",
+                                static_inputs={
+                                    "task": {
+                                        **revised.model_dump(),
+                                        "attempt": decision_rounds + 1,
+                                    },
+                                    "objective": orchestrator_plan.parent_objective,
+                                    "metrics": metrics,
+                                    "evidence": evidence,
+                                },
+                                static_artifact_refs=source_artifacts,
+                                output_schema="DraftClaim",
+                                acceptance_criteria=list(revised.definition_of_done),
+                                domain_id="reporting",
+                                team_id=execution.team_id,
+                                collaboration_round_id=execution.round_id,
+                                artifact_visibility="sealed_to_round",
+                            )
+                        ],
+                    ),
+                    plan,
+                )
+                await self._actor(reporting_supervisor).turn(
+                    {"type": "orchestration.revision_requested"},
+                    [self._submit_command(revision_spec)],
+                )
+                revision_result = await self.runner.start(revision_spec)
+                self._ensure_success(revision_result, revision_spec)
+                revision = revision_result["results"][f"task_{revised.task_id}"]
+                parent_candidate_id = task_outputs.get(revised.task_id, {}).get("candidate_id")
+                revision_candidate = self.collaboration.revise_candidate(
+                    round_id=execution.round_id,
+                    author=reporting_supervisor,
+                    hypothesis_key=revised.task_id,
+                    artifact_id=revision["output_artifact"],
+                    parent_candidate_ids=(
+                        (parent_candidate_id,) if parent_candidate_id is not None else ()
+                    ),
+                )
+                task_outputs[revised.task_id] = {
+                    "candidate_id": revision_candidate.candidate_id,
+                    "content": revision["result"]["content"],
+                    "artifact_id": revision["output_artifact"],
+                }
+                await critique_task(revised, decision_rounds + 1, task_outputs[revised.task_id])
+        if any(task_states.get(task.task_id) != "viable" for task in orchestrator_plan.tasks):
+            raise RuntimeError("hybrid_v2 decision rounds exhausted before integration")
+
+        integration_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=integration_workflow_id,
+                run_id=run_id,
+                owner=reporting_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["report_assembler"],
+                max_workers=1,
+                tasks=[
+                    TaskSpec(
+                        id="integrate",
+                        role="report_assembler",
+                        goal="Integrate accepted scoped task outputs into the final report.",
+                        static_inputs={
+                            "task_outputs": [
+                                task_outputs[task.task_id]["content"]
+                                for task in orchestrator_plan.tasks
+                            ],
+                            "integration_definition_of_done": list(
+                                orchestrator_plan.integration_definition_of_done
+                            ),
+                            "metrics": metrics,
+                            "evidence": evidence,
+                        },
+                        static_artifact_refs=[
+                            task_outputs[task.task_id]["artifact_id"]
+                            for task in orchestrator_plan.tasks
+                        ],
+                        output_schema="FinalReport",
+                        acceptance_criteria=list(orchestrator_plan.integration_definition_of_done),
+                        domain_id="reporting",
+                        team_id=execution.team_id,
+                        collaboration_round_id=execution.round_id,
+                        artifact_visibility="released_to_team",
+                    )
+                ],
+            ),
+            plan,
+        )
+        await self._actor(reporting_supervisor).turn(
+            {"type": "orchestration.integration_requested"},
+            [self._submit_command(integration_spec)],
+        )
+        integration_result = await self.runner.start(integration_spec)
+        self._ensure_success(integration_result, integration_spec)
+        integrated = integration_result["results"]["integrate"]
+        integration_author = self._get_agent(integrated["agent_instance_id"])
+        integration_candidate = self.collaboration.revise_candidate(
+            round_id=execution.round_id,
+            author=integration_author,
+            hypothesis_key="integration",
+            artifact_id=integrated["output_artifact"],
+        )
+        self.collaboration.advance(execution.round_id, CollaborationPhase.RECOMBINED)
+
+        required_checks = (
+            "claim_matches_original_evidence",
+            "misleading_signals_qualified",
+            "constraints_preserved",
+        )
+        verification_request = self.verification.request(
+            run_id=run_id,
+            subject_artifact_id=integration_candidate.artifact_id,
+            producer_agent_id=integration_author.agent_instance_id,
+            schema="FinalReport",
+            required_checks=required_checks,
+            evidence_refs=tuple(source_artifacts),
+        )
+        _verifier = self._pre_spawn_worker(
+            run_id=run_id,
+            plan=plan,
+            parent=assurance_supervisor,
+            role="evidence_verifier",
+            workflow_id=f"{run_id}-hybrid-v2-verification-r1",
+            task_id="verify_integration",
+        )
+        verification_spec = self._configured_workflow(
+            WorkflowSpec(
+                workflow_id=f"{run_id}-hybrid-v2-verification-r1",
+                run_id=run_id,
+                owner=assurance_supervisor.agent_instance_id,
+                approved_plan_version=plan.version,
+                authorized_worker_roles=["evidence_verifier"],
+                max_workers=1,
+                tasks=[
+                    TaskSpec(
+                        id="verify_integration",
+                        role="evidence_verifier",
+                        goal="Independently verify the integrated report against original evidence.",
+                        static_inputs={
+                            "integration": True,
+                            "candidate": integrated["result"]["content"],
+                            "subject_artifact_id": integration_candidate.artifact_id,
+                        },
+                        static_artifact_refs=[
+                            integration_candidate.artifact_id,
+                            *source_artifacts,
+                        ],
+                        artifact_requirements={
+                            integration_candidate.artifact_id: (
+                                DependencyRequirement.CANDIDATE_PUBLISHED
+                            )
+                        },
+                        output_schema="VerificationResult",
+                        acceptance_criteria=list(required_checks),
+                        domain_id="reporting",
+                    )
+                ],
+            ),
+            plan,
+        )
+        await self._actor(assurance_supervisor).turn(
+            {"type": "verification.requested"},
+            [self._submit_command(verification_spec)],
+        )
+        verification_result = await self.runner.start(verification_spec)
+        self._ensure_success(verification_result, verification_spec)
+        verified = verification_result["results"]["verify_integration"]
+        verification_content = verified["result"]["content"]
+        checks = {str(key): bool(value) for key, value in verification_content["checks"].items()}
+        verdict = self.verification.complete(
+            verification_id=verification_request.verification_id,
+            verifier=self._get_agent(verified["agent_instance_id"]),
+            checks=checks,
+            findings=tuple(str(item) for item in verification_content["findings"]),
+            evidence_refs=tuple(source_artifacts),
+        )
+        acceptance = self.verification.accept(
+            request=verification_request,
+            verdict=verdict,
+            policy_version=plan.policy_set.acceptance_policy,
+            downstream_uses=("report_synthesis", "final_delivery"),
+        )
+        if not acceptance.accepted:
+            raise RuntimeError("integrated hybrid_v2 report did not pass independent verification")
+        verifier_agent = self._get_agent(verified["agent_instance_id"])
+        self.collaboration.record_evaluation(
+            candidate_id=integration_candidate.candidate_id,
+            critic=verifier_agent,
+            critique_artifact_id=verified["output_artifact"],
+            passed=True,
+            findings=tuple(str(item) for item in verification_content["findings"]),
+            evidence_refs=tuple(source_artifacts),
+            evaluation=EvaluationVector(
+                validity=5,
+                evidence=5,
+                usefulness=5,
+                novelty=3,
+                constraint_satisfaction=5,
+            ),
+        )
+        self.blackboard.publish(
+            actor=verifier_agent,
+            domain_id="reporting",
+            record_type=RecordType.DECISION,
+            statement="Integrated orchestrated report independently verified",
+            supporting_artifacts=(integration_candidate.artifact_id, *source_artifacts),
+            status=EpistemicStatus.SUPPORTED,
+            visibility_ref="reporting",
+        )
+        self.collaboration.advance(execution.round_id, CollaborationPhase.VERIFIED_AND_SCORED)
+        self.collaboration.complete(execution.round_id)
+        content = integrated["result"]["content"]
+        claim = cast(dict[str, Any], content if isinstance(content, dict) else {"report": content})
+        return claim, integration_candidate
+
     def _pre_spawn_worker(
         self,
         *,
@@ -1178,7 +1926,7 @@ class Runtime:
                 "tasks": tasks,
             }
         )
-        if plan.swarm_strategy == SwarmStrategy.HYBRID_V1:
+        if plan.swarm_strategy in HYBRID_STRATEGIES:
             profiles = [
                 self.capabilities.profile_for_role(
                     self.roles.get(role_id),

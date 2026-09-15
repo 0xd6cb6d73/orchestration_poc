@@ -64,7 +64,12 @@ class BlackboardService:
         authorized = actor.tier == Tier.MAIN or (
             actor.tier == Tier.SUB
             and author is not None
-            and author.parent_agent_id == actor.agent_instance_id
+            and (
+                author.parent_agent_id == actor.agent_instance_id
+                # A SUB steward may govern records it published itself, e.g. candidate
+                # revisions it records inside its own collaboration round.
+                or author.agent_instance_id == actor.agent_instance_id
+            )
         )
         if not authorized:
             self._deny(actor, "only the governing orchestrator can change epistemic status")

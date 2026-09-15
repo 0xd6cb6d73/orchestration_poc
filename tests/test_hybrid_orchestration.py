@@ -59,6 +59,48 @@ async def test_hybrid_run_preserves_minority_and_gates_delivery(runtime: Runtime
 
 
 @pytest.mark.asyncio
+async def test_hybrid_v2_orchestrated_plan_revises_scoped_tasks(runtime: Runtime) -> None:
+    run, proposed = runtime.create_run(
+        RunCreate(
+            execution_mode=ExecutionMode.BOARD_CLAIM,
+            swarm_strategy=SwarmStrategy.HYBRID_V2,
+        )
+    )
+    assert proposed.policy_set.strategy == SwarmStrategy.HYBRID_V2
+    assert proposed.policy_set.collaboration_policy == "orchestrator_planned_v2"
+
+    await runtime.approve(run["run_id"], ApprovalRequest(plan_version=1))
+    await runtime.wait(run["run_id"])
+    status = runtime.status(run["run_id"])
+
+    assert status["run"]["status"] == "completed", status["run"]["error"]
+    rounds = status["hybrid"]["collaboration_rounds"]
+    assert {round_["phase"] for round_ in rounds} == {"complete"}
+    assert len(rounds) == 2
+    candidates = status["hybrid"]["candidates"]
+    plan_candidates = [c for c in candidates if c["hypothesis_key"].startswith("plan_")]
+    assert len(plan_candidates) == 3
+    assert sum(c["state"] == "selected" for c in plan_candidates) == 1
+    assert (
+        sum(c["hypothesis_key"] == "integration" and c["state"] == "viable" for c in candidates)
+        == 1
+    )
+    assert any(c["hypothesis_key"] == "t1" and c["parent_candidate_ids"] for c in candidates)
+    assert any(
+        c["hypothesis_key"] == "integration" and not c["parent_candidate_ids"] for c in candidates
+    )
+    event_types = {event["event_type"] for event in status["events"]}
+    assert {
+        "hybrid_v2.plan_selected",
+        "candidate.revised",
+        "verification.completed",
+        "delivery.gated",
+    } <= event_types
+    assert status["hybrid"]["verifications"][0]["verdict"] == "pass"
+    assert status["hybrid"]["delivery_decisions"][0]["permitted"] is True
+
+
+@pytest.mark.asyncio
 async def test_hybrid_visibility_communication_and_verification_boundaries(
     runtime: Runtime,
 ) -> None:
