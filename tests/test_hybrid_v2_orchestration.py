@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from pydantic_ai import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RunUsage
 
@@ -183,6 +184,70 @@ async def test_hybrid_v2_planning_repair_is_bounded() -> None:
                 RunUsage(),
             )
         assert "candidate.revised" in orchestration_events(events)
+    finally:
+        env.close()
+
+
+async def test_hybrid_v2_stage_retry_survives_transient_stall() -> None:
+    """One recoverable stage failure is retried under reliable policies."""
+    state = {"orchestrate_calls": 0}
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = str(messages)
+        payload_values: dict[str, Any]
+        if "decompose it into between 2 and 8" in prompt:
+            state["orchestrate_calls"] += 1
+            if state["orchestrate_calls"] == 1:
+                raise UnexpectedModelBehavior("injected provider stall")
+            payload_values = PLAN
+        elif "Your role is critic" in prompt or "Your role is verifier" in prompt:
+            refs = re.findall(r"query:(?:critique|verify):\d+:\d+", prompt)
+            if not refs:
+                if info.function_tools:
+                    return ModelResponse(
+                        parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                    )
+                return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+            if "Your role is critic" in prompt:
+                payload_values = {
+                    "structural_validity": True,
+                    "feasibility": "supported",
+                    "evidence_refs": [refs[-1]],
+                    "reason": "Checked the referenced tables",
+                    "evaluation": dict(EVALUATION),
+                }
+            else:
+                own = [ref for ref in refs if ref.startswith("query:verify:")]
+                if not own:
+                    if info.function_tools:
+                        return ModelResponse(
+                            parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                        )
+                    return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+                payload_values = {
+                    "answer_supported": True,
+                    "evidence_refs": [own[-1]],
+                    "reason": "Checked the integrated answer",
+                }
+        elif "Combine these scoped task outputs" in prompt:
+            payload_values = {"x": 7}
+        else:
+            payload_values = {"x": 7}
+        answer = {"values": payload_values}
+        if info.output_tools:
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
+        return ModelResponse(parts=[TextPart(json.dumps(answer))])
+
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="reliable-v2")
+    env.state.emit = events.append
+    try:
+        answer = await ADAPTERS["hybrid_v2"](
+            TASK, env, FunctionModel(respond), {}, Budget(), RunUsage()
+        )
+        assert answer.values == {"x": 7}
+        assert "sql.stage_retried" in orchestration_events(events)
     finally:
         env.close()
 

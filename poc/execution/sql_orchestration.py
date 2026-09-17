@@ -717,6 +717,25 @@ class SQLTeam:
         controller.complete(round_.round_id)
         return answers[selected.candidate_id].model_copy(deep=True)
 
+    async def resilient_stage(self, stage: str, call: Callable[[int], Awaitable[Any]]) -> Any:
+        """One bounded retry of a recoverable stage failure (transient provider stall).
+
+        The retry posts a fresh board task (attempt 2) so claim identity stays unique.
+        """
+        try:
+            return await call(1)
+        except RECOVERABLE as exc:
+            if not self.reliable:
+                raise
+            self.db.record_event(
+                EventRecord(
+                    run_id="sql-run",
+                    event_type="sql.stage_retried",
+                    data={"stage": stage, "error": type(exc).__name__},
+                )
+            )
+            return await call(2)
+
     async def hybrid_v2(self, solve: Solve) -> Answer:
         """LLM-orchestrated decomposition: plan fan-out, scoped tasks, decision loop."""
         controller = CollaborationController(
@@ -768,8 +787,15 @@ class SQLTeam:
             worker = workers[index % len(workers)]
             instruction = plan_prompt + f" You are sealed plan candidate {index + 1}."
             try:
-                answer = await self.board_work(
-                    index % 2, f"plan-draft-{index}", solve, instruction, role="orchestrate"
+                answer = await self.resilient_stage(
+                    f"plan-draft-{index}",
+                    lambda attempt: self.board_work(
+                        index % 2,
+                        f"plan-draft-{index}" if attempt == 1 else f"plan-draft-{index}-retry",
+                        solve,
+                        instruction,
+                        role="orchestrate",
+                    ),
                 )
                 try:
                     plan = parse_plan(answer.values)
@@ -829,32 +855,35 @@ class SQLTeam:
         ) -> tuple[bool, EvaluationVector, dict[str, Any]]:
             refs: tuple[str, ...] = ()
             try:
-                critique = await self.board_work(
-                    2,
+                critique = await self.resilient_stage(
                     board_task_id,
-                    solve,
-                    "Judge this proposed decomposition of the original task. Review the "
-                    "PLAN, never perform it: verify that every referenced table and column "
-                    "exists, that each task has one narrow scope with no overlapping work, "
-                    "that dependencies form a sound acyclic order, and that every "
-                    "definition_of_done criterion is objectively checkable by the task that "
-                    "owns it. Do not investigate the incident yourself and do not run the "
-                    "plan's queries end-to-end; schema and row-existence checks are enough "
-                    "to ground feasibility, and you should stop as soon as every task has a "
-                    "justified verdict. If a query fails or returns nothing useful, adjust "
-                    "it once using the SQL schema summary above and never repeat a statement "
-                    "that already failed; if a few checks cannot ground feasibility, return "
-                    "feasibility='abstain' with your reason instead of investigating further. "
-                    + (
-                        "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
-                        "evidence_refs copied exactly from the evidence_ref values your query results returned, "
-                        "reason, and evaluation with five 0..5 scores. "
-                        if self.reliable
-                        else 'Return {"values":{"validity":0,"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} with integer scores 0..5. '
-                    )
-                    + "Candidate plan: "
-                    + plans[candidate.candidate_id].model_dump_json(),
-                    role="critique",
+                    lambda attempt: self.board_work(
+                        2,
+                        board_task_id if attempt == 1 else f"{board_task_id}-retry",
+                        solve,
+                        "Judge this proposed decomposition of the original task. Review the "
+                        "PLAN, never perform it: verify that every referenced table and column "
+                        "exists, that each task has one narrow scope with no overlapping work, "
+                        "that dependencies form a sound acyclic order, and that every "
+                        "definition_of_done criterion is objectively checkable by the task that "
+                        "owns it. Do not investigate the incident yourself and do not run the "
+                        "plan's queries end-to-end; schema and row-existence checks are enough "
+                        "to ground feasibility, and you should stop as soon as every task has a "
+                        "justified verdict. If a query fails or returns nothing useful, adjust "
+                        "it once using the SQL schema summary above and never repeat a statement "
+                        "that already failed; if a few checks cannot ground feasibility, return "
+                        "feasibility='abstain' with your reason instead of investigating further. "
+                        + (
+                            "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
+                            "evidence_refs copied exactly from the evidence_ref values your query results returned, "
+                            "reason, and evaluation with five 0..5 scores. "
+                            if self.reliable
+                            else 'Return {"values":{"validity":0,"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} with integer scores 0..5. '
+                        )
+                        + "Candidate plan: "
+                        + plans[candidate.candidate_id].model_dump_json(),
+                        role="critique",
+                    ),
                 )
                 if self.reliable:
                     judge = SupportedCritiqueValues.model_validate(critique.values)
@@ -999,8 +1028,16 @@ class SQLTeam:
             )
             dependencies = tuple(f"task-{dep}" for dep in task.dependencies)
             try:
-                answer = await self.board_work(
-                    index % 2, task_id, solve, task_prompt(task), dependencies, role="task"
+                answer = await self.resilient_stage(
+                    task_id,
+                    lambda attempt: self.board_work(
+                        index % 2,
+                        task_id if attempt == 1 else f"{task_id}-retry",
+                        solve,
+                        task_prompt(task),
+                        dependencies,
+                        role="task",
+                    ),
                 )
             except RECOVERABLE as exc:
                 if not self.reliable:
@@ -1126,14 +1163,23 @@ class SQLTeam:
             for task in plan.tasks:
                 if task.task_id in critiqued or task.task_id not in task_candidates:
                     continue
-                refs = ()
+                critique_task_id = (
+                    f"critique-task-{task.task_id}-{task_attempts.get(task.task_id, 1)}"
+                )
+                critique_instruction = critique_prompt(task)
+                refs: tuple[str, ...] = ()
                 try:
-                    critique = await self.board_work(
-                        2,
-                        f"critique-task-{task.task_id}-{task_attempts.get(task.task_id, 1)}",
-                        solve,
-                        critique_prompt(task),
-                        role="critique",
+                    critique = await self.resilient_stage(
+                        critique_task_id,
+                        lambda attempt, _i=critique_task_id, _instr=critique_instruction: (
+                            self.board_work(
+                                2,
+                                _i if attempt == 1 else f"{_i}-retry",
+                                solve,
+                                _instr,
+                                role="critique",
+                            )
+                        ),
                     )
                     if self.reliable:
                         decision = SupportedCritiqueValues.model_validate(critique.values)
@@ -1228,16 +1274,21 @@ class SQLTeam:
                 findings = task_findings.get(
                     task.task_id, {"missing": task.task_id not in task_candidates}
                 )
-                decision_answer = await self.board_work(
-                    2,
-                    f"decision-{task.task_id}-{decision_rounds}",
-                    solve,
-                    decision_prompt(
-                        task,
-                        findings,
-                        f" Decision round {decision_rounds}.",
+                decision_instruction = decision_prompt(
+                    task, findings, f" Decision round {decision_rounds}."
+                )
+                decision_task_id = f"decision-{task.task_id}-{decision_rounds}"
+                decision_answer = await self.resilient_stage(
+                    decision_task_id,
+                    lambda attempt, _i=decision_task_id, _instr=decision_instruction: (
+                        self.board_work(
+                            2,
+                            _i if attempt == 1 else f"{_i}-retry",
+                            solve,
+                            _instr,
+                            role="orchestrate",
+                        )
                     ),
-                    role="orchestrate",
                 )
                 try:
                     decision = parse_decision(decision_answer.values)
@@ -1310,13 +1361,16 @@ class SQLTeam:
                 ]
             )
         )
-        integrated = await self.board_work(
-            0,
+        integrated = await self.resilient_stage(
             "integrate",
-            solve,
-            integration_prompt,
-            tuple(f"task-{task.task_id}" for task in plan.tasks),
-            role="integrate",
+            lambda attempt: self.board_work(
+                0,
+                "integrate" if attempt == 1 else "integrate-retry",
+                solve,
+                integration_prompt,
+                tuple(f"task-{task.task_id}" for task in plan.tasks),
+                role="integrate",
+            ),
         )
         self.commit_candidate(integrated, "integrate")
         integration_artifact = self.artifacts.write(
@@ -1375,22 +1429,25 @@ class SQLTeam:
             required_checks=("answer_supported",),
             evidence_refs=(),
         )
-        check = await self.board_work(
-            2,
+        check = await self.resilient_stage(
             "verify",
-            solve,
-            "Independently verify this integrated answer against the SQL data and all task "
-            "constraints. "
-            + (
-                "Use supported-v1: answer_supported, evidence_refs from your own SQL queries, and reason. "
-                if self.reliable
-                else 'Return {"values":{"answer_supported":true}} if supported, or false otherwise. '
-            )
-            + "Scoped task critique records: "
-            + json.dumps({task.task_id: task_states.get(task.task_id) for task in plan.tasks})
-            + " This is your judgment, not a benchmark score. Answer: "
-            + integrated.model_dump_json(),
-            role="verify",
+            lambda attempt: self.board_work(
+                2,
+                "verify" if attempt == 1 else "verify-retry",
+                solve,
+                "Independently verify this integrated answer against the SQL data and all task "
+                "constraints. "
+                + (
+                    "Use supported-v1: answer_supported, evidence_refs from your own SQL queries, and reason. "
+                    if self.reliable
+                    else 'Return {"values":{"answer_supported":true}} if supported, or false otherwise. '
+                )
+                + "Scoped task critique records: "
+                + json.dumps({task.task_id: task_states.get(task.task_id) for task in plan.tasks})
+                + " This is your judgment, not a benchmark score. Answer: "
+                + integrated.model_dump_json(),
+                role="verify",
+            ),
         )
         if (not self.reliable and set(check.values) != {"answer_supported"}) or type(
             check.values["answer_supported"]
