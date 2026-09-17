@@ -44,6 +44,7 @@ from poc.hybrid.collaboration_controller import CollaborationController, Collabo
 from poc.hybrid.communication import CommunicationService
 from poc.hybrid.completion_gate import CompletionGate, DeliveryBlocked
 from poc.hybrid.contracts import (
+    Candidate,
     CollaborationPhase,
     ContextManifest,
     EvaluationVector,
@@ -749,9 +750,7 @@ class SQLTeam:
             "run SQL: the schema summary in this prompt is authoritative for what tables "
             "and columns exist; the executing workers and the plan judges verify claims "
             "later. Respond with the plan directly. Return your plan as "
-            '{"values":'
-            + plan_schema
-            + "}. This is an orchestration task, not the final answer."
+            '{"values":' + plan_schema + "}. This is an orchestration task, not the final answer."
         )
         plans: dict[str, OrchestratorPlan] = {}
 
@@ -824,12 +823,15 @@ class SQLTeam:
         )
         controller.cluster_candidates(planning.round_id)
         controller.advance(planning.round_id, CollaborationPhase.CRITIQUED)
-        for index, candidate in enumerate(plan_candidates):
+
+        async def judge_plan(
+            candidate: Candidate, board_task_id: str
+        ) -> tuple[bool, EvaluationVector, dict[str, Any]]:
             refs: tuple[str, ...] = ()
             try:
                 critique = await self.board_work(
                     2,
-                    f"plan-judge-{index}",
+                    board_task_id,
                     solve,
                     "Judge this proposed decomposition of the original task. Review the "
                     "PLAN, never perform it: verify that every referenced table and column "
@@ -839,10 +841,14 @@ class SQLTeam:
                     "owns it. Do not investigate the incident yourself and do not run the "
                     "plan's queries end-to-end; schema and row-existence checks are enough "
                     "to ground feasibility, and you should stop as soon as every task has a "
-                    "justified verdict. "
+                    "justified verdict. If a query fails or returns nothing useful, adjust "
+                    "it once using the SQL schema summary above and never repeat a statement "
+                    "that already failed; if a few checks cannot ground feasibility, return "
+                    "feasibility='abstain' with your reason instead of investigating further. "
                     + (
                         "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
-                        "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "
+                        "evidence_refs copied exactly from the evidence_ref values your query results returned, "
+                        "reason, and evaluation with five 0..5 scores. "
                         if self.reliable
                         else 'Return {"values":{"validity":0,"evidence":0,"usefulness":0,"novelty":0,"constraint_satisfaction":0}} with integer scores 0..5. '
                     )
@@ -877,7 +883,7 @@ class SQLTeam:
             judge_artifact = self.artifacts.write(
                 "sql-run",
                 {"candidate": candidate.candidate_id, "decision": critique_data},
-                producer_task_id=f"plan-judge-{index}",
+                producer_task_id=board_task_id,
             )
             controller.record_evaluation(
                 candidate_id=candidate.candidate_id,
@@ -892,7 +898,60 @@ class SQLTeam:
                 evidence_refs=(judge_artifact.artifact_id,) if refs else (),
                 evaluation=evaluation,
             )
+            return passed, evaluation, critique_data
+
+        plan_findings: dict[str, dict[str, Any]] = {}
+        for index, candidate in enumerate(plan_candidates):
+            _, _, decision = await judge_plan(candidate, f"plan-judge-{index}")
+            plan_findings[candidate.candidate_id] = decision
         controller.advance(planning.round_id, CollaborationPhase.TESTED)
+
+        def viable_plans() -> list[str]:
+            return [
+                candidate.candidate_id
+                for candidate in controller.release(planning.round_id)
+                if candidate.state == "viable"
+            ]
+
+        if not viable_plans():
+            # One bounded re-plan when every sealed plan candidate was rejected: the
+            # orchestrator sees the recorded findings and rebuilds once, judged like
+            # any other plan candidate.
+            findings = json.dumps(
+                {
+                    "rejected": [
+                        {
+                            "candidate": candidate.candidate_id,
+                            "decision": plan_findings.get(candidate.candidate_id, {}),
+                        }
+                        for candidate in plan_candidates
+                    ]
+                }
+            )
+            repair_answer = await self.board_work(
+                0,
+                "plan-repair",
+                solve,
+                plan_prompt + " Both sealed plan candidates were rejected by the judge with these "
+                "findings: "
+                + findings
+                + " Rebuild one corrected decomposition that addresses the findings. "
+                "This is your only repair attempt.",
+                role="orchestrate",
+            )
+            repair_plan = parse_plan(repair_answer.values)
+            repair_artifact = self.artifacts.write(
+                "sql-run", {"plan": repair_plan.model_dump()}, producer_task_id="plan-repair"
+            )
+            repair_candidate = controller.revise_candidate(
+                round_id=planning.round_id,
+                author=workers[0],
+                hypothesis_key="plan-repair",
+                artifact_id=repair_artifact.artifact_id,
+            )
+            plans[repair_candidate.candidate_id] = repair_plan
+            plan_candidates = (*plan_candidates, repair_candidate)
+            await judge_plan(repair_candidate, "plan-repair-judge")
         controller.advance(planning.round_id, CollaborationPhase.RECOMBINED)
         selected_plan = controller.select(planning.round_id)
         plan = plans[selected_plan.candidate_id]
@@ -1033,7 +1092,10 @@ class SQLTeam:
                 "task: verify each definition_of_done criterion and look for work beyond "
                 "local_scope. Do not re-derive, extend, or improve the task's result; a "
                 "few targeted checks that show whether the stated criteria are met are "
-                "enough. "
+                "enough. If a query fails or returns nothing useful, adjust it once using "
+                "the SQL schema summary above and never repeat a statement that already "
+                "failed; if you cannot ground the audit, record the unmet criteria and "
+                "reason instead of investigating further. "
                 + (
                     "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
                     "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "

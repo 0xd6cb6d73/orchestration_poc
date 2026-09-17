@@ -43,7 +43,7 @@ def model() -> FunctionModel:
                 ],
                 "integration_definition_of_done": ["values cover the data table row"],
             }
-        elif "Judge this proposed" in prompt or "Critique this scoped task output" in prompt:
+        elif "Judge this proposed" in prompt or "Audit this scoped task output" in prompt:
             values = dict.fromkeys(
                 ("validity", "evidence", "usefulness", "novelty", "constraint_satisfaction"), 4
             )

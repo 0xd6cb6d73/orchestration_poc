@@ -56,12 +56,14 @@ def hybrid_v2_model(
     invalid_first_plan: bool = False,
     fail_first_task_critique: bool = False,
     fail_all_task_critiques: bool = False,
+    plan_judge_failures: int = 0,
     decision: str = "revise",
 ) -> FunctionModel:
     state = {
         "plan_repaired": False,
         "task_critiques": 0,
         "decisions": 0,
+        "plan_judges": 0,
     }
 
     def payload(values: dict[str, Any], info: AgentInfo) -> ModelResponse:
@@ -78,10 +80,13 @@ def hybrid_v2_model(
                 return payload({"parent_objective": "only one task"}, info)
             return payload(PLAN, info)
         if "Judge this proposed" in prompt:
+            state["plan_judges"] += 1
+            if state["plan_judges"] <= plan_judge_failures:
+                return payload(dict.fromkeys(EVALUATION, 0), info)
             return payload(dict(EVALUATION), info)
         if "Execute ONLY this scoped task" in prompt:
             return payload({"x": 7}, info)
-        if "Critique this scoped task output" in prompt:
+        if "Audit this scoped task output" in prompt:
             state["task_critiques"] += 1
             if fail_all_task_critiques or (
                 fail_first_task_critique and state["task_critiques"] == 1
@@ -152,6 +157,34 @@ async def test_hybrid_v2_repairs_rejected_plan_once() -> None:
     answer, events, _ = await run_v2(lambda: hybrid_v2_model(invalid_first_plan=True))
     assert answer.values == {"x": 7}
     assert "hybrid_v2.plan_selected" in orchestration_events(events)
+
+
+async def test_hybrid_v2_planning_repair_recovers_rejected_plans() -> None:
+    answer, events, _ = await run_v2(lambda: hybrid_v2_model(plan_judge_failures=2))
+    assert answer.values == {"x": 7}
+    kinds = orchestration_events(events)
+    assert "candidate.revised" in kinds
+    assert "hybrid_v2.plan_selected" in kinds
+
+
+async def test_hybrid_v2_planning_repair_is_bounded() -> None:
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
+    env.state.emit = events.append
+    try:
+        with pytest.raises(CollaborationError, match="no candidate survived"):
+            await ADAPTERS["hybrid_v2"](
+                TASK,
+                env,
+                hybrid_v2_model(plan_judge_failures=99),
+                {},
+                Budget(),
+                RunUsage(),
+            )
+        assert "candidate.revised" in orchestration_events(events)
+    finally:
+        env.close()
 
 
 async def test_hybrid_v2_revision_loop_recovers_refuted_task() -> None:
