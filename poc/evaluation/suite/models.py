@@ -69,6 +69,7 @@ class Matrix(StrictModel):
                 "managed_pool": {"plan", "solve"},
                 "speculative": {"proposal", "reconcile"},
                 "hybrid_v1": {"proposal", "critique", "verify"},
+                "hybrid_v2": {"orchestrate", "task", "critique", "integrate", "verify"},
             }
             allowed_phases = (
                 {"draft", "review", "finalize"}

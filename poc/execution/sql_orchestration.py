@@ -745,8 +745,13 @@ class SQLTeam:
             "verifiable tasks over the public SQL tables. Each task must have a narrow "
             "local scope, explicit out_of_scope exclusions, verifiable definition_of_done "
             "criteria, and dependencies only on earlier task ids. Prefer tasks that can be "
-            "critiqued against SQL evidence. Return your plan as "
-            '{"values":' + plan_schema + "}. This is an orchestration task, not the final answer."
+            "critiqued against SQL evidence. Do not investigate the data now and do not "
+            "run SQL: the schema summary in this prompt is authoritative for what tables "
+            "and columns exist; the executing workers and the plan judges verify claims "
+            "later. Respond with the plan directly. Return your plan as "
+            '{"values":'
+            + plan_schema
+            + "}. This is an orchestration task, not the final answer."
         )
         plans: dict[str, OrchestratorPlan] = {}
 
@@ -826,9 +831,15 @@ class SQLTeam:
                     2,
                     f"plan-judge-{index}",
                     solve,
-                    "Judge this proposed decomposition of the original task using SQL to "
-                    "check feasibility claims. Cover: objective coverage, scope sharpness of "
-                    "every task, dependency soundness, and verifiable definition_of_done. "
+                    "Judge this proposed decomposition of the original task. Review the "
+                    "PLAN, never perform it: verify that every referenced table and column "
+                    "exists, that each task has one narrow scope with no overlapping work, "
+                    "that dependencies form a sound acyclic order, and that every "
+                    "definition_of_done criterion is objectively checkable by the task that "
+                    "owns it. Do not investigate the incident yourself and do not run the "
+                    "plan's queries end-to-end; schema and row-existence checks are enough "
+                    "to ground feasibility, and you should stop as soon as every task has a "
+                    "justified verdict. "
                     + (
                         "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
                         "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "
@@ -1018,9 +1029,11 @@ class SQLTeam:
         def critique_prompt(task: PlannedTask) -> str:
             output = task_answers.get(task.task_id)
             return (
-                "Critique this scoped task output against the task's own scope and "
-                "definition of done. Flag scope creep (work beyond local_scope) and "
-                "unmet definition_of_done criteria. "
+                "Audit this scoped task output against its OWN contract, not the whole "
+                "task: verify each definition_of_done criterion and look for work beyond "
+                "local_scope. Do not re-derive, extend, or improve the task's result; a "
+                "few targeted checks that show whether the stated criteria are met are "
+                "enough. "
                 + (
                     "Use supported-v1: structural_validity, feasibility (supported/unsupported/abstain), "
                     "evidence_refs from your SQL queries, reason, and evaluation with five 0..5 scores. "
