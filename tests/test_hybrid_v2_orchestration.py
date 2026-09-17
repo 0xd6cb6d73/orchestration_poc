@@ -74,6 +74,7 @@ def hybrid_v2_model(
     fail_all_task_critiques: bool = False,
     plan_judge_failures: int = 0,
     wide_plan: bool = False,
+    fail_task_t1_twice: bool = False,
     decision: str = "revise",
 ) -> FunctionModel:
     state = {
@@ -81,6 +82,7 @@ def hybrid_v2_model(
         "task_critiques": 0,
         "decisions": 0,
         "plan_judges": 0,
+        "t1_task_calls": 0,
     }
 
     def payload(values: dict[str, Any], info: AgentInfo) -> ModelResponse:
@@ -102,6 +104,10 @@ def hybrid_v2_model(
                 return payload(dict.fromkeys(EVALUATION, 0), info)
             return payload(dict(EVALUATION), info)
         if "Execute ONLY this scoped task" in prompt:
+            if fail_task_t1_twice and "Task id: t1" in prompt:
+                state["t1_task_calls"] += 1
+                if state["t1_task_calls"] == 1:
+                    raise UnexpectedModelBehavior("injected task failure")
             return payload({"x": 7}, info)
         if "Audit this scoped task output" in prompt:
             state["task_critiques"] += 1
@@ -210,6 +216,92 @@ async def test_hybrid_v2_wide_plan_scales_round_membership() -> None:
     kinds = orchestration_events(events)
     assert "hybrid_v2.plan_selected" in kinds
     assert "delivery.gated" in kinds
+
+
+async def test_hybrid_v2_blocked_dependency_recovers_through_decisions() -> None:
+    """A task whose dependency failed is re-planned by the decision loop, not fatal."""
+    state = {"t1_calls": 0, "task_critiques": 0, "decisions": 0}
+
+    def payload(values: dict[str, Any], info: AgentInfo) -> ModelResponse:
+        answer = {"values": values}
+        if info.output_tools:
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
+        return ModelResponse(parts=[TextPart(json.dumps(answer))])
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = str(messages)
+        if "decompose it into between 2 and 8" in prompt:
+            return payload(WIDE_PLAN, info)
+        if "Your role is critic" in prompt or "Your role is verifier" in prompt:
+            refs = re.findall(r"query:(?:critique|verify):\d+:\d+", prompt)
+            if not refs:
+                if info.function_tools:
+                    return ModelResponse(
+                        parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                    )
+                return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+            if "Your role is critic" in prompt:
+                state["task_critiques"] += 1
+                if state["task_critiques"] == 1:
+                    return payload(dict.fromkeys(EVALUATION, 0), info)
+                return payload(
+                    {
+                        "structural_validity": True,
+                        "feasibility": "supported",
+                        "evidence_refs": [refs[-1]],
+                        "reason": "Audited the task contract",
+                        "evaluation": dict(EVALUATION),
+                    },
+                    info,
+                )
+            own = [ref for ref in refs if ref.startswith("query:verify:")]
+            if not own:
+                if info.function_tools:
+                    return ModelResponse(
+                        parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                    )
+                return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+            return payload(
+                {"answer_supported": True, "evidence_refs": [own[-1]], "reason": "Checked"},
+                info,
+            )
+        if "Execute ONLY this scoped task" in prompt:
+            if "Task id: t1" in prompt:
+                state["t1_calls"] += 1
+                if state["t1_calls"] <= 2:
+                    raise UnexpectedModelBehavior("injected task failure")
+            return payload({"x": 7}, info)
+        if "One scoped task failed its critique" in prompt:
+            state["decisions"] += 1
+            match = TASK_ID_PATTERN.search(prompt)
+            target = match.group(1) if match else "t1"
+            original = next(task for task in WIDE_PLAN["tasks"] if task["task_id"] == target)
+            revision = dict(original)
+            revision["local_scope"] = f"{original['local_scope']}; sample queries only"
+            return payload(
+                {"decision": "revise", "rationale": "tighten scope", "revision": revision},
+                info,
+            )
+        if "Combine these scoped task outputs" in prompt:
+            return payload({"x": 7}, info)
+        return payload({"x": 7}, info)
+
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="reliable-v2")
+    env.state.emit = events.append
+    try:
+        answer = await ADAPTERS["hybrid_v2"](
+            TASK, env, FunctionModel(respond), {}, Budget(), RunUsage()
+        )
+        assert answer.values == {"x": 7}
+        kinds = orchestration_events(events)
+        assert "sql.branch_failed" in kinds
+        assert "sql.task_blocked" in kinds
+        assert "candidate.revised" in kinds
+        assert "delivery.gated" in kinds
+    finally:
+        env.close()
 
 
 async def test_hybrid_v2_stage_retry_survives_transient_stall() -> None:

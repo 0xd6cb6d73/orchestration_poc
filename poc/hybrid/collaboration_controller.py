@@ -169,8 +169,8 @@ class CollaborationController:
                 return candidates
             raise CollaborationError(f"round cannot release from phase {round_.phase.value!r}")
         minimum = round_.expected_proposals if minimum_proposals is None else minimum_proposals
-        if not 1 <= minimum <= round_.expected_proposals:
-            raise ValueError("proposal quorum must be between one and the expected population")
+        if not 0 <= minimum <= round_.expected_proposals:
+            raise ValueError("proposal quorum must be between zero and the expected population")
         if len(candidates) < minimum:
             raise CollaborationError(
                 "sealed proposals cannot release before the submission condition"
