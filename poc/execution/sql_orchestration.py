@@ -999,11 +999,22 @@ class SQLTeam:
         task_findings: dict[str, dict[str, Any]] = {}
         task_attempts: dict[str, int] = {}
 
+        # The execution round's proposal population equals the task count, so its member
+        # roster must scale with the selected plan instead of the fixed worker pool.
+        execution_members = list(workers)
+        while len(execution_members) < max(2, len(plan.tasks)):
+            execution_members.append(
+                self.agent(
+                    f"sql-worker-{len(execution_members)}",
+                    Tier.WORKER,
+                    self.owner.agent_instance_id,
+                )
+            )
         execution = controller.frame(
             run_id="sql-run",
             domain_id="sql",
             steward=self.owner,
-            member_agent_ids=tuple(w.agent_instance_id for w in workers),
+            member_agent_ids=tuple(m.agent_instance_id for m in execution_members),
             config=HybridConfig(proposals_per_round=max(2, len(plan.tasks))),
             team_id="team:sql-run:execution",
             round_id="round:sql-run:execution",

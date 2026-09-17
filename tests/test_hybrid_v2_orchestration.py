@@ -51,6 +51,21 @@ def revised_task() -> dict[str, Any]:
 
 TASK_ID_PATTERN = re.compile(r'"task_id":\s*"(t\d+)"')
 
+WIDE_PLAN: dict[str, Any] = {
+    "parent_objective": "Return the value of x.",
+    "tasks": [
+        {
+            "task_id": f"t{index}",
+            "objective": f"Scoped step {index}",
+            "local_scope": f"step {index} data only",
+            "definition_of_done": [f"step {index} result recorded"],
+            "dependencies": [f"t{index - 1}"] if index > 1 else [],
+        }
+        for index in range(1, 6)
+    ],
+    "integration_definition_of_done": ["values cover the data table row"],
+}
+
 
 def hybrid_v2_model(
     *,
@@ -58,6 +73,7 @@ def hybrid_v2_model(
     fail_first_task_critique: bool = False,
     fail_all_task_critiques: bool = False,
     plan_judge_failures: int = 0,
+    wide_plan: bool = False,
     decision: str = "revise",
 ) -> FunctionModel:
     state = {
@@ -79,7 +95,7 @@ def hybrid_v2_model(
             if invalid_first_plan and not state["plan_repaired"]:
                 state["plan_repaired"] = True
                 return payload({"parent_objective": "only one task"}, info)
-            return payload(PLAN, info)
+            return payload(WIDE_PLAN if wide_plan else PLAN, info)
         if "Judge this proposed" in prompt:
             state["plan_judges"] += 1
             if state["plan_judges"] <= plan_judge_failures:
@@ -186,6 +202,14 @@ async def test_hybrid_v2_planning_repair_is_bounded() -> None:
         assert "candidate.revised" in orchestration_events(events)
     finally:
         env.close()
+
+
+async def test_hybrid_v2_wide_plan_scales_round_membership() -> None:
+    answer, events, _ = await run_v2(lambda: hybrid_v2_model(wide_plan=True))
+    assert answer.values == {"x": 7}
+    kinds = orchestration_events(events)
+    assert "hybrid_v2.plan_selected" in kinds
+    assert "delivery.gated" in kinds
 
 
 async def test_hybrid_v2_stage_retry_survives_transient_stall() -> None:
