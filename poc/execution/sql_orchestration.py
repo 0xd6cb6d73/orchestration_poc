@@ -993,7 +993,7 @@ class SQLTeam:
                     ]
                 }
             )
-            repair_answer = await self.board_work(
+            repair_answer = await self.bounded_board_work(
                 0,
                 "plan-repair",
                 solve,
@@ -1360,7 +1360,7 @@ class SQLTeam:
                             ["revision dependencies must reference accepted tasks"]
                         )
                 except PlanValidationError as exc:
-                    decision_answer = await self.board_work(
+                    decision_answer = await self.bounded_board_work(
                         2,
                         f"decision-{task.task_id}-{decision_rounds}-repair",
                         solve,
