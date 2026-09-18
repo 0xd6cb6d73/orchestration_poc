@@ -1331,16 +1331,34 @@ class SQLTeam:
                     task, findings, f" Decision round {decision_rounds}."
                 )
                 decision_task_id = f"decision-{task.task_id}-{decision_rounds}"
-                decision_answer = await self.bounded_board_work(
-                    2,
-                    decision_task_id,
-                    solve,
-                    decision_instruction,
-                    role="orchestrate",
-                )
                 try:
+                    decision_answer = await self.bounded_board_work(
+                        2,
+                        decision_task_id,
+                        solve,
+                        decision_instruction,
+                        role="orchestrate",
+                    )
                     decision = parse_decision(decision_answer.values)
                     validate_decision(decision, plan)
+                except (PlanValidationError, RECOVERABLE) as acquisition_exc:
+                    # A failed or unusable decision consumes the round for this task;
+                    # the next decision round re-plans it.
+                    if isinstance(acquisition_exc, RECOVERABLE) and not self.reliable:
+                        raise
+                    self.db.record_event(
+                        EventRecord(
+                            run_id="sql-run",
+                            event_type="hybrid_v2.decision_unusable",
+                            data={
+                                "task": task.task_id,
+                                "attempted": decision_rounds,
+                                "error": type(acquisition_exc).__name__,
+                            },
+                        )
+                    )
+                    continue
+                try:
                     if decision.added_task is not None and any(
                         dep not in task_states or task_states[dep] != "viable"
                         for dep in decision.added_task.dependencies
