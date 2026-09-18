@@ -1341,10 +1341,10 @@ class SQLTeam:
                     )
                     decision = parse_decision(decision_answer.values)
                     validate_decision(decision, plan)
-                except (PlanValidationError, RECOVERABLE) as acquisition_exc:
-                    # A failed or unusable decision consumes the round for this task;
-                    # the next decision round re-plans it.
-                    if isinstance(acquisition_exc, RECOVERABLE) and not self.reliable:
+                except RECOVERABLE as acquisition_exc:
+                    # A failed decision consumes the round for this task; the next
+                    # decision round re-plans it.
+                    if not self.reliable:
                         raise
                     self.db.record_event(
                         EventRecord(
@@ -1354,6 +1354,19 @@ class SQLTeam:
                                 "task": task.task_id,
                                 "attempted": decision_rounds,
                                 "error": type(acquisition_exc).__name__,
+                            },
+                        )
+                    )
+                    continue
+                except PlanValidationError:
+                    self.db.record_event(
+                        EventRecord(
+                            run_id="sql-run",
+                            event_type="hybrid_v2.decision_unusable",
+                            data={
+                                "task": task.task_id,
+                                "attempted": decision_rounds,
+                                "error": "PlanValidationError",
                             },
                         )
                     )
