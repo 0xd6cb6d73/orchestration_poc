@@ -839,7 +839,7 @@ class SQLTeam:
                 try:
                     plan = parse_plan(answer.values)
                 except PlanValidationError as exc:
-                    answer = await self.board_work(
+                    answer = await self.bounded_board_work(
                         index % 2,
                         f"plan-draft-{index}-repair",
                         solve,
@@ -861,6 +861,24 @@ class SQLTeam:
                             "stage": "plan_draft",
                             "index": index,
                             "error": type(exc).__name__,
+                        },
+                    )
+                )
+                return
+            except PlanValidationError as exc:
+                # An unparseable plan submission fails that branch only; the quorum
+                # or the bounded planning repair absorbs it.
+                if not self.reliable:
+                    raise
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run",
+                        event_type="sql.branch_failed",
+                        data={
+                            "stage": "plan_draft",
+                            "index": index,
+                            "error": type(exc).__name__,
+                            "detail": "; ".join(exc.problems)[:200],
                         },
                     )
                 )
