@@ -329,7 +329,15 @@ class TeamWorker:
             "using the requested IDs and value format, not a plan, "
             "example, SQL string, or evaluation scores.",
         )
-        instructions += " Use read-only SQLite to inspect the public data as needed."
+        if role == "orchestrate":
+            # The orchestrator is physically tool-less: it plans and decides from the
+            # task and the schema summary; it never queries and never investigates.
+            instructions += (
+                " You have no SQL access. The schema summary in this prompt is "
+                "authoritative for what tables and columns exist."
+            )
+        else:
+            instructions += " Use read-only SQLite to inspect the public data as needed."
         if self.reliable and role in {"critique", "verify"}:
             instructions += (
                 " Decision protocol supported-v1: distinguish structural validity, supported "
@@ -403,7 +411,7 @@ class TeamWorker:
             agent: Agent[None, Any] = Agent(
                 observed,
                 output_type=cast(Any, contract),
-                tools=[query],
+                tools=[] if role == "orchestrate" else [query],
                 model_settings=settings,
                 retries={"output": self.env.state.options.output_retries},
                 instructions=instructions,
@@ -420,14 +428,24 @@ class TeamWorker:
 
             result = await agent.run(prompt, usage=self.usage, usage_limits=limits)
             return check_output(result.output)
+        if role == "orchestrate":
+            turn_protocol = (
+                " On each turn return exactly one JSON object matching this schema: "
+                + json.dumps(contract.model_json_schema())
+                + " No markdown."
+            )
+        else:
+            turn_protocol = (
+                " On each turn return exactly one JSON object: "
+                '{"sql":"SELECT ..."} for a query, or an output matching this schema: '
+                + json.dumps(contract.model_json_schema())
+                + " No markdown."
+            )
         json_agent = Agent(
             observed,
             output_type=str,
             model_settings=settings,
-            instructions=instructions + " On each turn return exactly one JSON object: "
-            '{"sql":"SELECT ..."} for a query, or an output matching this schema: '
-            + json.dumps(contract.model_json_schema())
-            + " No markdown.",
+            instructions=instructions + turn_protocol,
             capabilities=[Instrumentation()],
         )
         history = None
@@ -440,6 +458,8 @@ class TeamWorker:
             try:
                 action = parse_action(result.output, self.env.state.options.transport_policy)
                 if set(action) == {"sql"} and isinstance(action["sql"], str):
+                    if role == "orchestrate":
+                        raise ProtocolError("the orchestrator has no SQL access")
                     sql = action["sql"]
                 else:
                     return check_output(contract.model_validate(action))
@@ -456,9 +476,15 @@ class TeamWorker:
                 invalid += 1
                 if invalid > self.env.state.options.output_retries:
                     raise UnexpectedModelBehavior("SQL role output retries exhausted") from None
-                prompt = (
-                    'Invalid JSON or role output. Return {"sql":"..."} or this schema: '
-                    + json.dumps(contract.model_json_schema())
-                )
+                if role == "orchestrate":
+                    prompt = (
+                        "Invalid JSON or role output. Return one JSON object matching "
+                        "this schema: " + json.dumps(contract.model_json_schema())
+                    )
+                else:
+                    prompt = (
+                        'Invalid JSON or role output. Return {"sql":"..."} or this schema: '
+                        + json.dumps(contract.model_json_schema())
+                    )
                 continue
             prompt = "SQL result: " + json.dumps(execute_query(sql))

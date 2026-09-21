@@ -186,11 +186,50 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
     from poc.execution.sql_ports import ToolBudgetExceeded
 
     async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        if "SQL result:" not in str(messages):
+        prompt = str(messages)
+        if "Your role is orchestrator" in (info.instructions or ""):
+            # The tool-less orchestrator cannot query; it plans directly.
+            return ModelResponse(
+                parts=[
+                    TextPart(
+                        json.dumps(
+                            {
+                                "values": {
+                                    "parent_objective": "Return the value of x.",
+                                    "tasks": [
+                                        {
+                                            "task_id": "t1",
+                                            "objective": "Look up x",
+                                            "local_scope": "data table",
+                                            "definition_of_done": ["return the row"],
+                                        },
+                                        {
+                                            "task_id": "t2",
+                                            "objective": "Package the answer",
+                                            "local_scope": "the t1 output only",
+                                            "definition_of_done": ["values equal the row"],
+                                            "dependencies": ["t1"],
+                                        },
+                                    ],
+                                    "integration_definition_of_done": ["values cover the row"],
+                                }
+                            }
+                        )
+                    )
+                ]
+            )
+        if "SQL result:" not in prompt:
             return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
-        if "Develop a solution plan" in str(messages):
+        if "Develop a solution plan" in prompt:
             return ModelResponse(parts=[TextPart('{"values":{"plan":"SELECT x FROM data"}}')])
-        return ModelResponse(parts=[TextPart('{"values":{"x":7}}')])
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    '{"values":{"validity":4,"evidence":4,"usefulness":4,'
+                    '"novelty":4,"constraint_satisfaction":4}}'
+                )
+            ]
+        )
 
     env = TaskEnvironment(TASK, 1)
     env.state.options = ArchitectureOptions(team_policy="bounded-v1")
@@ -201,7 +240,8 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
                 TASK, env, FunctionModel(respond), {}, Budget(tool_calls=1), usage
             )
         assert env.tool_calls == 1
-        assert usage.requests == 3
+        expected_requests = 5 if method == "hybrid_v2" else 3
+        assert usage.requests == expected_requests
     finally:
         env.close()
 

@@ -153,6 +153,33 @@ class ScriptedProvider:
             if len(self.initial_workers) == 2:
                 self.both_started.set()
             await self.both_started.wait()
+        if role == "orchestrate":
+            # The orchestrator is tool-less; it never queries and plans directly.
+            if "decompose it into between 2 and 8" not in str(messages[0]):
+                self.injected += 1
+                return self.response(
+                    {"decision": "escalate", "rationale": "fixture escalation"}, info
+                )
+            plan = {
+                "parent_objective": TASK.prompt,
+                "tasks": [
+                    {
+                        "task_id": "t1",
+                        "objective": "Read the schedule_jobs start times",
+                        "local_scope": "schedule_jobs table only",
+                        "definition_of_done": ["return every job's start time from its release"],
+                    },
+                    {
+                        "task_id": "t2",
+                        "objective": "Package the complete values mapping",
+                        "local_scope": "the t1 output only",
+                        "definition_of_done": ["values cover every job ID exactly once"],
+                        "dependencies": ["t1"],
+                    },
+                ],
+                "integration_definition_of_done": ["values cover every job ID exactly once"],
+            }
+            return self.response({"values": plan}, info)
         result = query_result(messages)
         if result is None or scenario == "sql_no_progress":
             if scenario == "sql_no_progress":
@@ -183,32 +210,6 @@ class ScriptedProvider:
         }:
             self.injected += 1
             return self.response({"values": {"0": 0}}, info)
-        if role == "orchestrate":
-            if "decompose it into between 2 and 8" not in str(messages[0]):
-                self.injected += 1
-                return self.response(
-                    {"decision": "escalate", "rationale": "fixture escalation"}, info
-                )
-            plan = {
-                "parent_objective": TASK.prompt,
-                "tasks": [
-                    {
-                        "task_id": "t1",
-                        "objective": "Read the schedule_jobs start times",
-                        "local_scope": "schedule_jobs table only",
-                        "definition_of_done": ["return every job's start time from its release"],
-                    },
-                    {
-                        "task_id": "t2",
-                        "objective": "Package the complete values mapping",
-                        "local_scope": "the t1 output only",
-                        "definition_of_done": ["values cover every job ID exactly once"],
-                        "dependencies": ["t1"],
-                    },
-                ],
-                "integration_definition_of_done": ["values cover every job ID exactly once"],
-            }
-            return self.response({"values": plan}, info)
         if role == "task":
             values = {str(row[0]): row[1] for row in result["rows"]}
         elif role == "plan":
