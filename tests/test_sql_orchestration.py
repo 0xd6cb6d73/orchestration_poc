@@ -13,8 +13,21 @@ from pydantic_ai.usage import RunUsage
 
 from poc.evaluation.suite.adapters import ADAPTERS
 from poc.evaluation.suite.environment import TaskEnvironment
-from poc.execution.sql_contracts import ArchitectureOptions, Budget, TaskInput
-from poc.execution.sql_orchestration import METHODS
+from poc.execution.sql_contracts import (
+    Answer,
+    ArchitectureOptions,
+    Budget,
+    PhaseName,
+    TaskInput,
+)
+from poc.execution.sql_orchestration import (
+    METHODS,
+    DecisionRoundsExhausted,
+    OrchestratorEscalated,
+    StageBudgetExhausted,
+    TaskContextInfeasible,
+)
+from poc.hybrid.collaboration_controller import CollaborationError
 from poc.models import ExecutionMode
 
 TASK = TaskInput(prompt="Return the value of x.", tables={"data": [{"x": 7}]})
@@ -137,7 +150,10 @@ async def test_workers_share_request_ceiling(method: str) -> None:
     env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     usage = RunUsage()
     try:
-        with pytest.raises(UsageLimitExceeded):
+        # hybrid_v2 terminates budget-aware before re-claiming a spent budget; the
+        # other strategies still hit the provider-side usage limit.
+        expected = StageBudgetExhausted if method == "hybrid_v2" else UsageLimitExceeded
+        with pytest.raises(expected):
             await ADAPTERS[method](TASK, env, model(), {}, Budget(requests=1), usage)
         assert usage.requests == 1
     finally:
@@ -307,12 +323,155 @@ async def test_hybrid_rejected_verification_does_not_submit_selected_candidate()
             values = {"x": 7}
         return ModelResponse(parts=[TextPart(json.dumps({"values": values}))])
 
+    events: list[dict[str, Any]] = []
     env = TaskEnvironment(TASK, 20)
     env.state.options = ArchitectureOptions(team_policy="bounded-v1")
+    env.state.emit = events.append
     try:
         with pytest.raises(DeliveryBlocked):
             await ADAPTERS["hybrid_v1-json"](
                 TASK, env, FunctionModel(respond), {}, Budget(), RunUsage()
             )
+        blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+        assert blocked["code"] == "verification_rejected"
     finally:
         env.close()
+
+
+@pytest.mark.parametrize(
+    "error,code",
+    [
+        (
+            OrchestratorEscalated("t1", "cannot proceed"),
+            "orchestrator_escalated",
+        ),
+        (
+            TaskContextInfeasible(
+                prompt_chars=9000,
+                estimated_tokens=2250,
+                context_window=2048,
+                model="fixture-small",
+                reserve_tokens=1024,
+            ),
+            "task_context_infeasible",
+        ),
+        (
+            StageBudgetExhausted(
+                stage="task-t1",
+                tokens=100000,
+                requests=40,
+                token_limit=100000,
+                request_limit=40,
+            ),
+            "stage_budget_exhausted",
+        ),
+        (
+            DecisionRoundsExhausted(
+                "hybrid_v2 decision rounds exhausted before integration",
+                {"t1": {"reason": "escalated"}},
+            ),
+            "decision_rounds_exhausted",
+        ),
+        (
+            CollaborationError("team is smaller than the pinned proposal population"),
+            "proposal_quorum_not_met",
+        ),
+    ],
+)
+async def test_typed_collaboration_errors_map_to_failure_codes(
+    error: CollaborationError, code: str
+) -> None:
+    """The adapter attributes failures by exception type, not a quorum catch-all."""
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise error
+
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
+    env.state.emit = events.append
+    try:
+        with pytest.raises(type(error)):
+            await ADAPTERS["hybrid_v2"](TASK, env, FunctionModel(respond), {}, Budget(), RunUsage())
+        blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+        assert blocked["code"] == code
+        assert blocked["type"] == type(error).__name__
+    finally:
+        env.close()
+
+
+async def test_bounded_board_work_refuses_claim_when_run_budget_spent() -> None:
+    from tempfile import TemporaryDirectory
+
+    from poc.execution.sql_orchestration import SQLTeam
+
+    usage = RunUsage()
+    usage.requests = Budget().requests
+    calls = 0
+
+    async def solve(prompt: str, role: PhaseName) -> Answer:
+        nonlocal calls
+        calls += 1
+        return Answer(values={})
+
+    with TemporaryDirectory(prefix="sql-budget-") as directory:
+        team = SQLTeam(
+            Path(directory),
+            "hybrid_v2",
+            TASK,
+            Budget(),
+            backend="sql-native",
+            model_name="fixture",
+            options=ArchitectureOptions(),
+            usage=usage,
+        )
+        try:
+            await team.start()
+            with pytest.raises(StageBudgetExhausted):
+                await team.bounded_board_work(0, "task-t1", solve, "prompt")
+            assert calls == 0
+            kinds = {e["event_type"] for e in team.db.events("sql-run")}
+            assert "claim.acquired" not in kinds
+        finally:
+            team.db.close()
+
+
+async def test_bounded_board_work_abandons_retry_when_run_budget_spent() -> None:
+    from tempfile import TemporaryDirectory
+
+    from pydantic_ai.exceptions import UnexpectedModelBehavior
+
+    from poc.execution.sql_orchestration import SQLTeam
+
+    usage = RunUsage()
+    calls = 0
+
+    async def solve(prompt: str, role: PhaseName) -> Answer:
+        nonlocal calls
+        calls += 1
+        usage.requests += 1
+        raise UnexpectedModelBehavior("injected stage failure")
+
+    with TemporaryDirectory(prefix="sql-retry-") as directory:
+        # One request budget: the failed solve consumes it, so the retry re-claim
+        # must be refused instead of spinning through zero-token attempts.
+        team = SQLTeam(
+            Path(directory),
+            "hybrid_v2",
+            TASK,
+            Budget(requests=1),
+            backend="sql-native",
+            model_name="fixture",
+            options=ArchitectureOptions(),
+            usage=usage,
+        )
+        try:
+            await team.start()
+            with pytest.raises(StageBudgetExhausted):
+                await team.bounded_board_work(0, "task-t1", solve, "prompt", role="task")
+            assert calls == 1
+            assert usage.requests == 1
+            kinds = {e["event_type"] for e in team.db.events("sql-run")}
+            assert "sql.stage_retried" not in kinds
+        finally:
+            team.db.close()

@@ -69,9 +69,13 @@ flowchart TB
 2. **Execution level.** Task fails or is dependency-blocked → orchestrator decision →
    **revise** (fresh context, tightened scope, re-executed under `task-X-rev{n}`,
    re-audited, new derived candidate wired into downstream dependencies) or
-   **add_task** (gap coverage) or **escalate** (terminal, recorded). An unusable
-   decision consumes the round instead of failing the run. A globally unbounded
-   budget widens retries, never scope.
+   **add_task** (gap coverage) or **escalate** (the task is blocked and the loop
+   continues; dependents are blocked with it). An unusable decision consumes the
+   round instead of failing the run. A run where no task stays viable ends before
+   integration with the typed block reasons (`decision_rounds_exhausted`,
+   `task_context_infeasible`) instead of the quorum catch-all; a run with viable
+   tasks still integrates them. A globally unbounded budget widens retries, never
+   scope.
 
 ## Anti-scope-creep enforcement
 

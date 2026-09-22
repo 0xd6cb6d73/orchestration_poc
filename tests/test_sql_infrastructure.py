@@ -686,3 +686,138 @@ async def test_concurrent_cancellation_drains_workers_and_closes_connections(
         assert drained == 2 and list(tmp_path.iterdir()) == []
     finally:
         env.close()
+
+
+@pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("role", ["orchestrate", "critique", "task"])
+async def test_judge_roles_carry_provider_reasoning_limits(role: str, native: bool) -> None:
+    seen: list[dict[str, Any]] = []
+    base = fixture_model()
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append(dict(info.model_settings or {}))
+        assert base.function is not None
+        return await cast(Awaitable[ModelResponse], base.function(messages, info))
+
+    env = TaskEnvironment(TASK, 100)
+    env.state.options = ArchitectureOptions(team_policy="reliable-v2")
+    try:
+        await TeamWorker(
+            "hierarchical_dag",
+            TASK,
+            env,
+            FunctionModel(respond),
+            {},
+            Budget(requests=100),
+            RunUsage(),
+            json_protocol=not native,
+        )("Judge", cast(Any, role))
+        assert seen
+        for settings in seen:
+            if role in {"orchestrate", "critique"}:
+                assert settings["openrouter_reasoning"] == {"effort": "low", "exclude": True}
+            else:
+                assert "openrouter_reasoning" not in settings
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("role,expected", [("orchestrate", 180), ("critique", 180), ("task", 600)])
+async def test_judge_stage_budget_clamps_request_timeout(role: str, expected: float) -> None:
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 100)
+    env.state.options = ArchitectureOptions(team_policy="reliable-v2")
+    env.state.emit = events.append
+    try:
+        await TeamWorker(
+            "hierarchical_dag",
+            TASK,
+            env,
+            fixture_model(),
+            {},
+            Budget(requests=100, seconds=900, request_timeout_seconds=600),
+            RunUsage(),
+            json_protocol=True,
+        )("Judge", cast(Any, role))
+        observed = {
+            e["request_settings"]["stage"]: e["request_settings"]["request_timeout_seconds"]
+            for e in events
+            if "request_settings" in e
+        }
+        assert observed[role] == expected
+    finally:
+        env.close()
+
+
+async def test_invalid_turn_retry_drops_invalid_response_keeps_prompts() -> None:
+    calls: list[list[ModelMessage]] = []
+    events: list[dict[str, Any]] = []
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls.append(list(messages))
+        if len(calls) == 1:
+            return ModelResponse(parts=[TextPart("not an action")])
+        return ModelResponse(parts=[TextPart('{"values":{"x":7}}')])
+
+    env = TaskEnvironment(TASK, 10)
+    env.state.emit = events.append
+    try:
+        answer = await TeamWorker(
+            "hierarchical_dag",
+            TASK,
+            env,
+            FunctionModel(respond),
+            {},
+            Budget(requests=10),
+            RunUsage(),
+            json_protocol=True,
+        )("Solve", "solve")
+        assert answer.values == {"x": 7}
+        assert any("protocol_error" in e for e in events)
+        assert len(calls) == 2
+        assert len(calls[0]) == 1
+        # The retry keeps legitimate prompts and drops the invalid model response:
+        # the original task prompt is preserved and the retry instruction is appended.
+        assert len(calls[1]) == 1
+        assert not isinstance(calls[1][0], ModelResponse)
+        assert "Return x from data" in str(calls[1][0])
+        assert "Invalid JSON" in str(calls[1][0])
+    finally:
+        env.close()
+
+
+async def test_invalid_turn_retry_keeps_query_evidence() -> None:
+    calls: list[list[ModelMessage]] = []
+    events: list[dict[str, Any]] = []
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls.append(list(messages))
+        if len(calls) == 1:
+            return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+        if len(calls) == 2:
+            return ModelResponse(parts=[TextPart("not an action")])
+        return ModelResponse(parts=[TextPart('{"values":{"x":7}}')])
+
+    env = TaskEnvironment(TASK, 10)
+    env.state.emit = events.append
+    try:
+        answer = await TeamWorker(
+            "hierarchical_dag",
+            TASK,
+            env,
+            FunctionModel(respond),
+            {},
+            Budget(requests=100),
+            RunUsage(),
+            json_protocol=True,
+        )("Solve", "solve")
+        assert answer.values == {"x": 7}
+        # The retry after an invalid output still carries the SQL evidence, so the
+        # model can answer instead of re-querying from a blank conversation.
+        assert len(calls) == 3
+        assert "SQL result:" in str(calls[2][0])
+        assert all(not isinstance(m, ModelResponse) for m in calls[2])
+    finally:
+        env.close()

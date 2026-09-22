@@ -12,7 +12,9 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent, ModelRetry, UsageLimits
 from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
+from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import Model
+from pydantic_ai.models.openrouter import OpenRouterReasoning
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
 
@@ -101,6 +103,12 @@ WEIGHTS = {
     "speculative": [0.35, 0.35, 0.3],
     "hybrid_v1": [0.3, 0.3, 0.12, 0.12, 0.16],
 }
+# Judge roles turn on reasoning in JSON turn loops and burn the whole request
+# timeout on hidden reasoning tokens without ever emitting an answer.
+JUDGE_ROLES = frozenset({"orchestrate", "critique"})
+# OpenRouter's settings contract merges model-agnostic keys (`openrouter_` prefix).
+JUDGE_REASONING_LIMIT: OpenRouterReasoning = {"effort": "low", "exclude": True}
+JUDGE_REQUEST_TIMEOUT_SECONDS = 180.0
 ROLE_POOLS: dict[str, dict[str, float]] = {
     "hybrid_v2": {
         "orchestrate": 0.24,
@@ -117,6 +125,17 @@ POOL_PLANNED: dict[str, int] = {
     "integrate": 1,
     "verify": 1,
 }
+
+
+def merge_reasoning_limit(settings: ModelSettings, role: str) -> ModelSettings:
+    """Cap provider reasoning for judge roles via the OpenRouter reasoning parameter.
+
+    This is a mechanical capability boundary, not prompt content. Non-judge roles
+    keep the incoming settings untouched.
+    """
+    if role not in JUDGE_ROLES:
+        return settings
+    return cast(ModelSettings, {**settings, "openrouter_reasoning": JUDGE_REASONING_LIMIT})
 
 
 class TeamWorker:
@@ -206,6 +225,10 @@ class TeamWorker:
         )
         if profile:
             output_cap = min(output_cap, profile.max_output_tokens)
+        # A judge turn that hangs must be retried in minutes, not after the 600s default.
+        timeout_caps: tuple[float, ...] = (
+            (JUDGE_REQUEST_TIMEOUT_SECONDS,) if role in JUDGE_ROLES else ()
+        )
         stage_budget = budget.model_copy(
             update={
                 "total_tokens": token_limit,
@@ -216,6 +239,7 @@ class TeamWorker:
                     profile.request_timeout_seconds
                     if profile
                     else (budget.seconds if self.reliable else 60),
+                    *timeout_caps,
                 ),
                 "max_output_tokens": output_cap,
             }
@@ -400,6 +424,7 @@ class TeamWorker:
             tool_calls_limit=budget.tool_calls,
         )
         observed = ObservedModel(model, self.env.state, budget, self.usage)
+        settings = merge_reasoning_limit(settings, role)
         if not self.json_protocol:
 
             async def query(sql: str) -> dict[str, Any]:
@@ -486,5 +511,11 @@ class TeamWorker:
                         'Invalid JSON or role output. Return {"sql":"..."} or this schema: '
                         + json.dumps(contract.model_json_schema())
                     )
+                # Drop the invalid attempts' model responses but keep the gathered
+                # evidence: the retry prompt plus prior "SQL result" user messages
+                # must survive, or the model loses the data it needs and re-queries.
+                history = [
+                    message for message in (history or []) if not isinstance(message, ModelResponse)
+                ]
                 continue
             prompt = "SQL result: " + json.dumps(execute_query(sql))

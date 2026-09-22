@@ -14,6 +14,7 @@ from pydantic_ai.usage import RunUsage
 from poc.evaluation.suite.adapters import ADAPTERS
 from poc.evaluation.suite.environment import TaskEnvironment
 from poc.execution.sql_contracts import ArchitectureOptions, Budget, TaskInput
+from poc.execution.sql_orchestration import DecisionRoundsExhausted
 from poc.hybrid.collaboration_controller import CollaborationError
 
 TASK = TaskInput(prompt="Return the value of x.", tables={"data": [{"x": 7}]})
@@ -376,22 +377,130 @@ async def test_hybrid_v2_revision_loop_recovers_refuted_task() -> None:
     assert "hybrid_v2.plan_selected" in kinds
 
 
-async def test_hybrid_v2_escalation_blocks_delivery() -> None:
+async def test_hybrid_v2_escalation_defers_and_integrates_viable_tasks() -> None:
+    """An escalation blocks only its own task; viable siblings still integrate."""
+    prompts: list[str] = []
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = str(messages)
+        prompts.append(prompt)
+        values: dict[str, Any]
+        if "decompose it into between 2 and 8" in prompt:
+            values = PLAN
+        elif "Judge this proposed" in prompt:
+            values = dict(EVALUATION)
+        elif "Execute ONLY this scoped task" in prompt:
+            values = {"x": 1} if "Task id: t1" in prompt else {"x": 7}
+        elif "Audit this scoped task output" in prompt:
+            state["task_critiques"] += 1
+            values = (
+                dict.fromkeys(EVALUATION, 0) if state["task_critiques"] == 1 else dict(EVALUATION)
+            )
+        elif "One scoped task failed its critique" in prompt:
+            values = {"decision": "escalate", "rationale": "cannot be fixed"}
+        elif "Combine these scoped task outputs" in prompt:
+            values = {"x": 7}
+        elif "Independently verify this integrated answer" in prompt:
+            values = {"answer_supported": True}
+        else:
+            values = {"x": 7}
+        answer = {"values": values}
+        if info.output_tools:
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
+        return ModelResponse(parts=[TextPart(json.dumps(answer))])
+
+    state = {"task_critiques": 0}
     events: list[dict[str, Any]] = []
     env = TaskEnvironment(TASK, 20)
     env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     env.state.emit = events.append
     try:
-        with pytest.raises(CollaborationError, match="escalated"):
+        answer = await ADAPTERS["hybrid_v2"](
+            TASK, env, FunctionModel(respond), {}, Budget(), RunUsage()
+        )
+        assert answer.values == {"x": 7}
+        assert "hybrid_v2.escalated" in orchestration_events(events)
+        verify_prompt = next(p for p in prompts if "Independently verify this integrated" in p)
+        assert '"t1": "blocked"' in verify_prompt
+        assert '"t2": "viable"' in verify_prompt
+    finally:
+        env.close()
+
+
+async def test_hybrid_v2_all_blocked_tasks_end_in_decision_rounds_exhausted() -> None:
+    """When every task ends blocked the run fails typed, not via the quorum catch-all."""
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
+    env.state.emit = events.append
+    try:
+        with pytest.raises(CollaborationError) as excinfo:
             await ADAPTERS["hybrid_v2"](
                 TASK,
                 env,
-                hybrid_v2_model(fail_first_task_critique=True, decision="escalate"),
+                hybrid_v2_model(fail_all_task_critiques=True, decision="escalate"),
                 {},
                 Budget(),
                 RunUsage(),
             )
-        assert "hybrid_v2.escalated" in orchestration_events(events)
+        assert isinstance(excinfo.value, DecisionRoundsExhausted)
+        escalations = [
+            e["orchestration"]["data"]
+            for e in events
+            if e.get("orchestration", {}).get("event_type") == "hybrid_v2.escalated"
+        ]
+        assert {e["task"] for e in escalations} == {"t1", "t2"}
+        blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+        assert blocked["code"] == "decision_rounds_exhausted"
+        assert blocked["blocked"] == {"t1": "escalated", "t2": "escalated"}
+    finally:
+        env.close()
+
+
+async def test_hybrid_v2_context_infeasible_prompt_defers_without_a_model_call() -> None:
+    """A scoped prompt that cannot fit the bound window is blocked before any request."""
+    from poc.execution.sql_contracts import ModelSpec
+    from poc.execution.sql_orchestration import TaskContextInfeasible
+
+    calls = {"task": 0}
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = str(messages)
+        if "Execute ONLY this scoped task" in prompt:
+            calls["task"] += 1
+        values: dict[str, Any]
+        if "decompose it into between 2 and 8" in prompt:
+            values = PLAN
+        elif "Judge this proposed" in prompt:
+            values = dict(EVALUATION)
+        else:
+            values = {"x": 7}
+        answer = {"values": values}
+        if info.output_tools:
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
+        return ModelResponse(parts=[TextPart(json.dumps(answer))])
+
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(
+        team_policy="bounded-v1",
+        phase_models={
+            "task": ModelSpec(
+                name="small", model_class="7B", model="fixture-small", context_window=64
+            )
+        },
+    )
+    env.state.emit = events.append
+    try:
+        with pytest.raises(TaskContextInfeasible):
+            await ADAPTERS["hybrid_v2"](TASK, env, FunctionModel(respond), {}, Budget(), RunUsage())
+        assert calls["task"] == 0
+        assert "sql.task_context_infeasible" in orchestration_events(events)
+        blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+        assert blocked["code"] == "task_context_infeasible"
+        assert blocked["consumption"]["estimated_tokens"] > 0
+        assert blocked["threshold"]["context_window"] == 64
+        assert blocked["consumption"]["model"] == "fixture-small"
     finally:
         env.close()
 

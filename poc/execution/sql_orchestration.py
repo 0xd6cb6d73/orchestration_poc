@@ -90,6 +90,126 @@ RECOVERABLE = (
 )
 
 
+class OrchestratorEscalated(CollaborationError):
+    """Typed attribution: the orchestrator escalated a task instead of revising it.
+
+    hybrid_v2 defers escalations (the task is blocked, the run continues), so the
+    decision loop no longer raises this; it stays part of the typed attribution
+    surface so any escalation that must fail fast still maps to
+    "orchestrator_escalated" instead of the quorum catch-all.
+    """
+
+    def __init__(self, task_id: str, rationale: str):
+        self.task_id = task_id
+        self.rationale = rationale
+        super().__init__(f"orchestrator escalated task {task_id!r}: {rationale}")
+        self.failure_details: dict[str, Any] = {
+            "type": type(self).__name__,
+            "scope": "phase",
+            "stage": "orchestrate",
+            "stage_index": None,
+            "threshold": {},
+            "consumption": {},
+            "task_id": task_id,
+            "rationale": rationale,
+        }
+
+
+class DecisionRoundsExhausted(CollaborationError):
+    """Typed attribution: decision rounds ended with no viable task to integrate."""
+
+    def __init__(
+        self,
+        message: str = "hybrid_v2 decision rounds exhausted before integration",
+        blocked: dict[str, dict[str, Any]] | None = None,
+    ):
+        self.blocked = dict(blocked or {})
+        super().__init__(message)
+        self.failure_details: dict[str, Any] = {
+            "type": type(self).__name__,
+            "scope": "phase",
+            "stage": "orchestrate",
+            "stage_index": None,
+            "threshold": {},
+            "consumption": {},
+            "blocked": {task_id: record.get("reason") for task_id, record in self.blocked.items()},
+        }
+
+
+class TaskContextInfeasible(CollaborationError):
+    """Typed attribution: a scoped prompt cannot fit the model's context window.
+
+    Raised by the pre-flight check before any model request is made, so an
+    infeasible task costs nothing; the decision loop defers it like an escalation.
+    """
+
+    def __init__(
+        self,
+        *,
+        prompt_chars: int,
+        estimated_tokens: int,
+        context_window: int,
+        model: str,
+        reserve_tokens: int,
+    ):
+        self.prompt_chars = prompt_chars
+        self.estimated_tokens = estimated_tokens
+        self.context_window = context_window
+        self.model = model
+        self.reserve_tokens = reserve_tokens
+        super().__init__(
+            f"scoped prompt of {prompt_chars} characters (~{estimated_tokens} estimated tokens) "
+            f"plus a {reserve_tokens}-token output reserve exceeds the {context_window}-token "
+            f"context window of {model}"
+        )
+        self.failure_details: dict[str, Any] = {
+            "type": type(self).__name__,
+            "scope": "phase",
+            "stage": "task",
+            "stage_index": None,
+            "threshold": {
+                "context_window": context_window,
+                "max_output_tokens": reserve_tokens,
+            },
+            "consumption": {
+                "prompt_chars": prompt_chars,
+                "estimated_tokens": estimated_tokens,
+                "model": model,
+            },
+        }
+
+
+class StageBudgetExhausted(CollaborationError):
+    """Typed attribution: the run-level budget is spent; no further stage may claim."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        tokens: int,
+        requests: int,
+        token_limit: int,
+        request_limit: int,
+    ):
+        self.stage = stage
+        self.tokens = tokens
+        self.requests = requests
+        self.token_limit = token_limit
+        self.request_limit = request_limit
+        super().__init__(
+            f"run budget exhausted before stage {stage!r}: {tokens}/{token_limit} tokens, "
+            f"{requests}/{request_limit} requests"
+        )
+        self.failure_details: dict[str, Any] = {
+            "type": type(self).__name__,
+            "scope": "phase",
+            "stage": stage,
+            "stage_index": None,
+            "threshold": {"tokens": token_limit, "requests": request_limit},
+            "consumption": {"tokens": tokens, "requests": requests},
+        }
+
+
 class SQLTeam:
     """Trial-local authority and durable scheduler state, containing only public inputs."""
 
@@ -103,6 +223,8 @@ class SQLTeam:
         backend: str,
         model_name: str,
         options: ArchitectureOptions | None = None,
+        env_schema: dict[str, list[str]] | None = None,
+        usage: RunUsage | None = None,
     ):
         self.options = options or ArchitectureOptions()
         self.policy_version = self.options.team_policy
@@ -111,6 +233,10 @@ class SQLTeam:
         self.task = task
         self.backend = backend
         self.model_name = model_name
+        self.budget = budget
+        # Shared run-level usage reference; budget-aware stage checks read it live.
+        self.usage = usage
+        self.env_schema = env_schema or {}
         self.db = Database(root / "scheduler.sqlite")
         self.emitted = 0
         self.submitted = CommittedCandidates()
@@ -221,6 +347,53 @@ class SQLTeam:
             policy=self.policy,
         )
 
+    def stage_budget_error(self, stage: str) -> StageBudgetExhausted | None:
+        """Typed exhaustion signal when the run-level budget is already spent.
+
+        Checked before a stage attempts or refreshes a board claim: re-claiming
+        with no token or request headroom only produces zero-token phase records.
+        """
+        if self.usage is None:
+            return None
+        tokens, requests = self.usage.total_tokens, self.usage.requests
+        if tokens >= self.budget.total_tokens or requests >= self.budget.requests:
+            return StageBudgetExhausted(
+                stage=stage,
+                tokens=tokens,
+                requests=requests,
+                token_limit=self.budget.total_tokens,
+                request_limit=self.budget.requests,
+            )
+        return None
+
+    def require_context_feasible(self, prompt: str, role: PhaseName) -> None:
+        """Pre-flight admission for scoped prompts; raises before any model request.
+
+        Estimated from the assembled prompt text (chars // 4, the codebase's
+        conservative char-to-token ratio) against the bound model's declared
+        context window minus the output reserve the stage would use. Runs only
+        when a window is known; an unknown window still fails at request time.
+        """
+        binding = self.options.phase_models.get(role) or self.options.phase_models.get("solve")
+        window = (binding.endpoint_context_window or binding.context_window) if binding else None
+        if window is None:
+            return
+        profile = self.options.role_profiles.get(role) or (
+            binding.role_profiles.get(role) if binding else None
+        )
+        reserve = self.budget.max_output_tokens or (profile.max_output_tokens if profile else 16384)
+        if profile:
+            reserve = min(reserve, profile.max_output_tokens)
+        estimated_tokens = len(prompt) // 4
+        if estimated_tokens + reserve > window:
+            raise TaskContextInfeasible(
+                prompt_chars=len(prompt),
+                estimated_tokens=estimated_tokens,
+                context_window=window,
+                model=self.model_for(role),
+                reserve_tokens=reserve,
+            )
+
     async def bounded_board_work(
         self,
         index: int,
@@ -233,6 +406,9 @@ class SQLTeam:
         """Board work with one same-task retry: a recoverable failure releases the task
         back to ready and the retry re-claims the SAME id, so downstream dependencies
         observe a single completed task per stage."""
+        exhausted = self.stage_budget_error(task_id)
+        if exhausted is not None:
+            raise exhausted
         board = cast(BoardClaimStrategy, self.strategy)
         worker = self.workers[index].model_copy(update={"agent_model": self.model_for(role)})
         self.db.put_agent(worker)
@@ -260,6 +436,12 @@ class SQLTeam:
             if not self.reliable:
                 board.release(claim, reason="SQL worker interrupted", abandon=False)
                 raise
+            exhausted = self.stage_budget_error(task_id)
+            if exhausted is not None:
+                # No headroom for the retry solve: abandon the claim instead of
+                # spinning through zero-token re-claim/solve cycles.
+                board.release(claim, reason="run budget exhausted", abandon=True)
+                raise exhausted from exc
             self.db.record_event(
                 EventRecord(
                     run_id="sql-run",
@@ -1053,6 +1235,17 @@ class SQLTeam:
         task_states: dict[str, str] = {}
         task_findings: dict[str, dict[str, Any]] = {}
         task_attempts: dict[str, int] = {}
+        task_block_reasons: dict[str, dict[str, Any]] = {}
+
+        def block_task(task_id: str, reason: str, details: dict[str, Any] | None = None) -> None:
+            """Mark a task blocked: it cannot run this run, and dependents inherit it.
+
+            Escalations and context-infeasible prompts defer here instead of killing
+            the run; viable tasks still reach integration, and a run where nothing
+            stays viable fails via the post-loop check carrying these reasons.
+            """
+            task_states[task_id] = "blocked"
+            task_block_reasons[task_id] = {"reason": reason, **(details or {})}
 
         # The execution round's proposal population equals the task count, so its member
         # roster must scale with the selected plan instead of the fixed worker pool.
@@ -1101,6 +1294,38 @@ class SQLTeam:
                         event_type="sql.task_blocked",
                         data={"task": task.task_id, "missing_dependencies": missing},
                     )
+                )
+                return
+            # The worker embeds the whole task input and schema in the scoped prompt;
+            # pre-flight the exact assembled text so an over-window prompt fails here,
+            # before any claim or request, instead of grinding through decision rounds.
+            scoped_prompt = (
+                self.task.prompt
+                + "\nRole task: "
+                + task_prompt(task)
+                + "\nSQL schema: "
+                + json.dumps(self.env_schema)
+            )
+            try:
+                self.require_context_feasible(scoped_prompt, "task")
+            except TaskContextInfeasible as exc:
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run",
+                        event_type="sql.task_context_infeasible",
+                        data={"task": task.task_id, **exc.failure_details["consumption"]},
+                    )
+                )
+                block_task(
+                    task.task_id,
+                    "context_infeasible",
+                    {
+                        "prompt_chars": exc.prompt_chars,
+                        "estimated_tokens": exc.estimated_tokens,
+                        "context_window": exc.context_window,
+                        "model": exc.model,
+                        "reserve_tokens": exc.reserve_tokens,
+                    },
                 )
                 return
             dependencies = tuple(task_board_ids[dep] for dep in task.dependencies)
@@ -1337,7 +1562,46 @@ class SQLTeam:
 
         decision_rounds = 0
         while decision_rounds < self.options.hybrid_max_decision_rounds:
-            pending = [task for task in plan.tasks if task_states.get(task.task_id) != "viable"]
+            # Blocked tasks poison their dependents: a task whose dependency is
+            # blocked can never run, so it is blocked explicitly (skipped without a
+            # decision request) instead of re-entering the decision loop forever.
+            # Transitive closure runs each round; it terminates because only tasks
+            # that are neither viable nor blocked are ever marked.
+            while True:
+                newly_blocked = [
+                    task
+                    for task in plan.tasks
+                    if task_states.get(task.task_id) not in {"viable", "blocked"}
+                    and any(task_states.get(dep) == "blocked" for dep in task.dependencies)
+                ]
+                if not newly_blocked:
+                    break
+                for task in newly_blocked:
+                    dependency = next(
+                        dep for dep in task.dependencies if task_states.get(dep) == "blocked"
+                    )
+                    self.db.record_event(
+                        EventRecord(
+                            run_id="sql-run",
+                            event_type="sql.task_blocked",
+                            data={"task": task.task_id, "blocked_dependency": dependency},
+                        )
+                    )
+                    block_task(
+                        task.task_id,
+                        "blocked_dependency",
+                        {
+                            "dependency": dependency,
+                            "dependency_reason": task_block_reasons.get(dependency, {}).get(
+                                "reason"
+                            ),
+                        },
+                    )
+            pending = [
+                task
+                for task in plan.tasks
+                if task_states.get(task.task_id) not in {"viable", "blocked"}
+            ]
             if not pending:
                 break
             decision_rounds += 1
@@ -1449,9 +1713,12 @@ class SQLTeam:
                             data={"task": task.task_id, "rationale": decision.rationale},
                         )
                     )
-                    raise CollaborationError(
-                        f"orchestrator escalated task {task.task_id!r}: {decision.rationale}"
-                    )
+                    # Deferred, not fatal: an escalation blocks its own task and the
+                    # decision loop continues, so other viable tasks still reach
+                    # integration. Dependents are blocked by the propagation above;
+                    # a run with nothing left viable fails at the post-loop check.
+                    block_task(task.task_id, "escalated", {"rationale": decision.rationale})
+                    continue
                 if decision.decision == "revise" and decision.revision is not None:
                     plan = apply_decision(plan, decision)
                     await execute_task(decision.revision, 0, decision_rounds + 1)
@@ -1459,10 +1726,38 @@ class SQLTeam:
                     plan = apply_decision(plan, decision)
                     await execute_task(decision.added_task, 1, decision_rounds + 1)
             await critique_pass()
-        if any(task_states.get(task.task_id) != "viable" for task in plan.tasks):
-            raise CollaborationError("hybrid_v2 decision rounds exhausted before integration")
+        if not any(task_states.get(task.task_id) == "viable" for task in plan.tasks):
+            # Nothing executed and survived critique: no integration is possible.
+            # The typed cause is the recorded block reasons, so the failure code says
+            # why (escalations, context-infeasible prompts) instead of the quorum
+            # catch-all. A context-infeasible prompt is a hard, permanent condition,
+            # so it takes precedence over other block reasons.
+            infeasible = [
+                record
+                for record in task_block_reasons.values()
+                if record["reason"] == "context_infeasible"
+            ]
+            if infeasible:
+                raise TaskContextInfeasible(
+                    prompt_chars=infeasible[0]["prompt_chars"],
+                    estimated_tokens=infeasible[0]["estimated_tokens"],
+                    context_window=infeasible[0]["context_window"],
+                    model=infeasible[0]["model"],
+                    reserve_tokens=infeasible[0]["reserve_tokens"],
+                )
+            raise DecisionRoundsExhausted(
+                "hybrid_v2 decision rounds exhausted before integration", task_block_reasons
+            )
 
         controller.advance(execution.round_id, CollaborationPhase.RECOMBINED)
+        # Only accepted (viable) tasks reach integration; blocked tasks contributed
+        # no output and their dependents were blocked with them. The verifier still
+        # sees every task's state below, so uncovered scope stays visible.
+        accepted_tasks = [
+            task
+            for task in plan.tasks
+            if task_states.get(task.task_id) == "viable" and task.task_id in task_answers
+        ]
         integration_prompt = (
             "Combine these scoped task outputs into the complete final answer for the "
             "original task: "
@@ -1474,7 +1769,7 @@ class SQLTeam:
             + json.dumps(
                 [
                     {"task": task.task_id, "answer": task_answers[task.task_id].model_dump()}
-                    for task in plan.tasks
+                    for task in accepted_tasks
                 ]
             )
         )
@@ -1485,7 +1780,7 @@ class SQLTeam:
             integration_prompt,
             tuple(
                 task_board_ids[task.task_id]
-                for task in plan.tasks
+                for task in accepted_tasks
                 if task.task_id in task_board_ids
             ),
             role="integrate",
@@ -1502,7 +1797,7 @@ class SQLTeam:
             global_invariants=("read-only SQL",),
             input_artifact_refs=tuple(
                 task_artifacts[task.task_id]
-                for task in plan.tasks
+                for task in accepted_tasks
                 if task.task_id in task_artifacts
             ),
             output_schema="Answer",
@@ -1660,6 +1955,8 @@ def adapter(method: str, *, json_protocol: bool = False):
                 backend="sql-json" if json_protocol else "sql-native",
                 model_name=model_name,
                 options=env.state.options,
+                env_schema=env.schema,
+                usage=usage,
             )
             try:
                 await team.start()
@@ -1676,13 +1973,25 @@ def adapter(method: str, *, json_protocol: bool = False):
                         },
                         consumption={"committed_candidates": len(team.submitted)},
                     )
-                    details["code"] = (
-                        "verification_rejected"
-                        if isinstance(exc, DeliveryBlocked)
-                        else "proposal_quorum_not_met"
-                        if len(team.submitted) < env.state.options.hybrid_proposal_quorum
-                        else "no_admissible_candidate"
-                    )
+                    # Typed attribution in precedence order; only genuinely
+                    # untyped CollaborationErrors (quorum, validator, controller
+                    # conditions) fall through to the quorum heuristic.
+                    if isinstance(exc, DeliveryBlocked):
+                        details["code"] = "verification_rejected"
+                    elif isinstance(exc, OrchestratorEscalated):
+                        details["code"] = "orchestrator_escalated"
+                    elif isinstance(exc, TaskContextInfeasible):
+                        details["code"] = "task_context_infeasible"
+                    elif isinstance(exc, StageBudgetExhausted):
+                        details["code"] = "stage_budget_exhausted"
+                    elif isinstance(exc, DecisionRoundsExhausted):
+                        details["code"] = "decision_rounds_exhausted"
+                    else:
+                        details["code"] = (
+                            "proposal_quorum_not_met"
+                            if len(team.submitted) < env.state.options.hybrid_proposal_quorum
+                            else "no_admissible_candidate"
+                        )
                     env.state.emit({"delivery_blocked": details})
                     raise
                 except (
