@@ -24,6 +24,7 @@ from poc.execution.sql_orchestration import (
     METHODS,
     DecisionRoundsExhausted,
     OrchestratorEscalated,
+    PlanningRejected,
     StageBudgetExhausted,
     TaskContextInfeasible,
 )
@@ -344,6 +345,10 @@ async def test_hybrid_rejected_verification_does_not_submit_selected_candidate()
         (
             OrchestratorEscalated("t1", "cannot proceed"),
             "orchestrator_escalated",
+        ),
+        (
+            PlanningRejected(["every plan candidate was refuted by the plan judges"]),
+            "planning_rejected",
         ),
         (
             TaskContextInfeasible(

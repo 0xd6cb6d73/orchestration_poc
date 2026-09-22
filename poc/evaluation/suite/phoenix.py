@@ -6,9 +6,20 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+import httpx
+
 from poc.evaluation.suite.models import ArchitectureOptions, Budget, Matrix, ModelSpec
 from poc.evaluation.suite.reports import atomic_json, coverage, digest, locked, trial_key
 from poc.evaluation.suite.runner import make_cases
+
+# Dataset uploads reach ~125MB of JSON in one create_dataset POST; the server
+# needs longer than the SDK default read timeout (30s) to ingest and respond.
+_PUBLISH_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=600.0, pool=10.0)
+
+
+def publish_http_client() -> httpx.Client:
+    """Build the HTTP client used by publish(); sized for large dataset uploads."""
+    return httpx.Client(timeout=_PUBLISH_TIMEOUT)
 
 
 def _runs(client: Any, experiment_id: str) -> list[dict[str, Any]]:
@@ -69,7 +80,7 @@ def publish(
     if client is None:
         from phoenix.client import Client
 
-        client = Client()
+        client = Client(http_client=publish_http_client())
     if receipt_path is not None:
         with locked(receipt_path):
             return _publish(report, client, receipt_path)

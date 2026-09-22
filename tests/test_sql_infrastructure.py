@@ -715,7 +715,7 @@ async def test_judge_roles_carry_provider_reasoning_limits(role: str, native: bo
         assert seen
         for settings in seen:
             if role in {"orchestrate", "critique"}:
-                assert settings["openrouter_reasoning"] == {"effort": "low", "exclude": True}
+                assert settings["openrouter_reasoning"] == {"effort": "low"}
             else:
                 assert "openrouter_reasoning" not in settings
     finally:

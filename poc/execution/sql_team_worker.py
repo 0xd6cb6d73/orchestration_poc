@@ -107,7 +107,7 @@ WEIGHTS = {
 # timeout on hidden reasoning tokens without ever emitting an answer.
 JUDGE_ROLES = frozenset({"orchestrate", "critique"})
 # OpenRouter's settings contract merges model-agnostic keys (`openrouter_` prefix).
-JUDGE_REASONING_LIMIT: OpenRouterReasoning = {"effort": "low", "exclude": True}
+JUDGE_REASONING_LIMIT: OpenRouterReasoning = {"effort": "low"}
 JUDGE_REQUEST_TIMEOUT_SECONDS = 180.0
 ROLE_POOLS: dict[str, dict[str, float]] = {
     "hybrid_v2": {

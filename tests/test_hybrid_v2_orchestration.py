@@ -71,6 +71,7 @@ WIDE_PLAN: dict[str, Any] = {
 def hybrid_v2_model(
     *,
     invalid_first_plan: bool = False,
+    invalid_plan_repair: bool = False,
     fail_first_task_critique: bool = False,
     fail_all_task_critiques: bool = False,
     plan_judge_failures: int = 0,
@@ -94,6 +95,14 @@ def hybrid_v2_model(
 
     async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         prompt = str(messages)
+        if "Rebuild one corrected decomposition" in prompt:
+            # The bounded planning repair draft after every sealed plan candidate
+            # was refuted by the judge. Must be matched before the planning prompt
+            # it embeds.
+            state["plan_repairs"] = state.get("plan_repairs", 0) + 1
+            if invalid_plan_repair:
+                return payload({"parent_objective": "still not a plan"}, info)
+            return payload(PLAN, info)
         if "decompose it into between 2 and 8" in prompt:
             if invalid_first_plan and not state["plan_repaired"]:
                 state["plan_repaired"] = True
@@ -192,12 +201,15 @@ async def test_hybrid_v2_planning_repair_recovers_rejected_plans() -> None:
 
 
 async def test_hybrid_v2_planning_repair_is_bounded() -> None:
+    """All plan candidates refuted and the repair candidate refuted rejects typed."""
+    from poc.execution.sql_orchestration import PlanningRejected
+
     events: list[dict[str, Any]] = []
     env = TaskEnvironment(TASK, 20)
     env.state.options = ArchitectureOptions(team_policy="bounded-v1")
     env.state.emit = events.append
     try:
-        with pytest.raises(CollaborationError, match="no candidate survived"):
+        with pytest.raises(PlanningRejected):
             await ADAPTERS["hybrid_v2"](
                 TASK,
                 env,
@@ -207,6 +219,50 @@ async def test_hybrid_v2_planning_repair_is_bounded() -> None:
                 RunUsage(),
             )
         assert "candidate.revised" in orchestration_events(events)
+        rejected = [
+            e["orchestration"]["data"]
+            for e in events
+            if e.get("orchestration", {}).get("event_type") == "hybrid_v2.planning_rejected"
+        ]
+        assert rejected and all("refuted" in r["problems"] for r in rejected)
+        blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+        assert blocked["code"] == "planning_rejected"
+        assert blocked["code"] != "proposal_quorum_not_met"
+        assert blocked["type"] == "PlanningRejected"
+    finally:
+        env.close()
+
+
+async def test_hybrid_v2_unparseable_plan_repair_rejects_planning() -> None:
+    """A completed repair draft that still fails parse_plan rejects typed, not untyped."""
+    from poc.execution.sql_orchestration import PlanningRejected
+    from poc.hybrid.planning import PlanValidationError
+
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="bounded-v1")
+    env.state.emit = events.append
+    try:
+        with pytest.raises(CollaborationError) as excinfo:
+            await ADAPTERS["hybrid_v2"](
+                TASK,
+                env,
+                hybrid_v2_model(plan_judge_failures=99, invalid_plan_repair=True),
+                {},
+                Budget(),
+                RunUsage(),
+            )
+        assert isinstance(excinfo.value, PlanningRejected)
+        assert not isinstance(excinfo.value, PlanValidationError)
+        rejected = [
+            e["orchestration"]["data"]
+            for e in events
+            if e.get("orchestration", {}).get("event_type") == "hybrid_v2.planning_rejected"
+        ]
+        assert rejected and "tasks must be a list" in rejected[-1]["problems"]
+        assert rejected[-1]["stage"] == "plan_repair"
+        blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+        assert blocked["code"] == "planning_rejected"
     finally:
         env.close()
 
@@ -375,6 +431,138 @@ async def test_hybrid_v2_revision_loop_recovers_refuted_task() -> None:
     kinds = orchestration_events(events)
     assert "candidate.revised" in kinds
     assert "hybrid_v2.plan_selected" in kinds
+
+
+def reliable_v2_model(
+    *,
+    fail_t1_calls: int = 0,
+    counter: dict[str, int] | None = None,
+    prompts: list[str] | None = None,
+) -> FunctionModel:
+    """Reliable-policy stub: supported-v1 judges pass; t1's task role fails its first
+    `fail_t1_calls` model calls (2 calls = one failed execution pair)."""
+    state = {"t1_task_calls": 0}
+
+    def payload(values: dict[str, Any], info: AgentInfo) -> ModelResponse:
+        answer = {"values": values}
+        if info.output_tools:
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
+        return ModelResponse(parts=[TextPart(json.dumps(answer))])
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        prompt = str(messages)
+        if prompts is not None:
+            prompts.append(prompt)
+        if "decompose it into between 2 and 8" in prompt:
+            return payload(PLAN, info)
+        if "Your role is critic" in prompt or "Your role is verifier" in prompt:
+            refs = re.findall(r"query:(?:critique|verify):\d+:\d+", prompt)
+            if not refs:
+                if info.function_tools:
+                    return ModelResponse(
+                        parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                    )
+                return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+            if "Your role is critic" in prompt:
+                return payload(
+                    {
+                        "structural_validity": True,
+                        "feasibility": "supported",
+                        "evidence_refs": [refs[-1]],
+                        "reason": "Audited the plan and task contracts",
+                        "evaluation": dict(EVALUATION),
+                    },
+                    info,
+                )
+            own = [ref for ref in refs if ref.startswith("query:verify:")]
+            if not own:
+                if info.function_tools:
+                    return ModelResponse(
+                        parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                    )
+                return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+            return payload(
+                {"answer_supported": True, "evidence_refs": [own[-1]], "reason": "Checked"},
+                info,
+            )
+        if "Execute ONLY this scoped task" in prompt:
+            if "Task id: t1" in prompt:
+                state["t1_task_calls"] += 1
+                if counter is not None:
+                    counter["t1_task_calls"] = state["t1_task_calls"]
+                if state["t1_task_calls"] <= fail_t1_calls:
+                    raise UnexpectedModelBehavior("injected task failure")
+            return payload({"x": 7}, info)
+        if "One scoped task failed its critique" in prompt:
+            match = TASK_ID_PATTERN.search(prompt)
+            target = match.group(1) if match else "t1"
+            original = next(task for task in PLAN["tasks"] if task["task_id"] == target)
+            revision = dict(original)
+            revision["local_scope"] = f"{original['local_scope']}; exclude derived columns"
+            return payload(
+                {"decision": "revise", "rationale": "tighten scope", "revision": revision},
+                info,
+            )
+        return payload({"x": 7}, info)
+
+    return FunctionModel(respond)
+
+
+async def run_reliable_v2_expecting_failure(stub: FunctionModel) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="reliable-v2")
+    env.state.emit = events.append
+    try:
+        with pytest.raises(CollaborationError):
+            await ADAPTERS["hybrid_v2"](TASK, env, stub, {}, Budget(), RunUsage())
+    finally:
+        env.close()
+    return events
+
+
+async def test_hybrid_v2_task_failure_budget_blocks_after_two_failed_pairs() -> None:
+    """Two failed execution pairs defer the logical task; no third re-execution."""
+    calls: dict[str, int] = {}
+    events = await run_reliable_v2_expecting_failure(
+        reliable_v2_model(fail_t1_calls=99, counter=calls)
+    )
+    kinds = orchestration_events(events)
+    # Two failed pairs = four model attempts for t1; the budget stops a third pair.
+    assert calls["t1_task_calls"] == 4
+    blocked = next(e["delivery_blocked"] for e in events if "delivery_blocked" in e)
+    assert blocked["code"] == "decision_rounds_exhausted"
+    assert blocked["code"] != "proposal_quorum_not_met"
+    assert blocked["blocked"]["t1"] == "task_failures_exhausted"
+    assert blocked["blocked"]["t2"] == "blocked_dependency"
+    assert "sql.branch_failed" in kinds
+
+
+async def test_hybrid_v2_task_failure_budget_allows_recovery_in_a_later_round() -> None:
+    """One failed pair that converges on re-execution is never blocked."""
+    calls: dict[str, int] = {}
+    prompts: list[str] = []
+    stub = reliable_v2_model(fail_t1_calls=2, counter=calls, prompts=prompts)
+
+    events: list[dict[str, Any]] = []
+    env = TaskEnvironment(TASK, 20)
+    env.state.options = ArchitectureOptions(team_policy="reliable-v2")
+    env.state.emit = events.append
+    try:
+        answer = await ADAPTERS["hybrid_v2"](TASK, env, stub, {}, Budget(), RunUsage())
+    finally:
+        env.close()
+    assert answer.values == {"x": 7}
+    kinds = orchestration_events(events)
+    # One failed pair (initial + retry = 2 attempts) plus one successful
+    # re-execution (a converging attempt needs no retry = 1 attempt).
+    assert calls["t1_task_calls"] == 3
+    assert "sql.branch_failed" in kinds
+    assert "hybrid_v2.plan_selected" in kinds
+    assert "delivery.gated" in kinds
+    verify_prompt = next(p for p in prompts if "Independently verify this integrated" in p)
+    assert '"t1": "viable"' in verify_prompt
+    assert '"t2": "viable"' in verify_prompt
 
 
 async def test_hybrid_v2_escalation_defers_and_integrates_viable_tasks() -> None:

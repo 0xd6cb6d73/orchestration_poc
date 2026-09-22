@@ -119,6 +119,31 @@ class OrchestratorEscalated(CollaborationError):
         }
 
 
+class PlanningRejected(CollaborationError):
+    """Typed attribution: hybrid_v2 planning ended without a selectable plan candidate.
+
+    Raised when the bounded planning repair still fails plan validation, or when
+    every sealed plan candidate and the bounded repair candidate was refuted by
+    the plan judges. Select would otherwise raise a generic CollaborationError
+    that the adapter mislabels as "proposal_quorum_not_met".
+    """
+
+    def __init__(self, problems: list[str]):
+        self.problems = list(problems)
+        super().__init__(
+            "hybrid_v2 planning rejected: "
+            + ("; ".join(self.problems) or "no viable plan candidate")
+        )
+        self.failure_details: dict[str, Any] = {
+            "type": type(self).__name__,
+            "scope": "phase",
+            "stage": "orchestrate",
+            "stage_index": None,
+            "threshold": {},
+            "consumption": {"problems": "; ".join(self.problems)},
+        }
+
+
 class DecisionRoundsExhausted(CollaborationError):
     """Typed attribution: decision rounds ended with no viable task to integrate."""
 
@@ -1226,7 +1251,23 @@ class SQLTeam:
                 "This is your only repair attempt.",
                 role="orchestrate",
             )
-            repair_plan = parse_plan(repair_answer.values)
+            try:
+                repair_plan = parse_plan(repair_answer.values)
+            except PlanValidationError as exc:
+                # A completed repair draft whose answer still fails plan validation
+                # must not escape untyped: reject the planning round typed.
+                self.db.record_event(
+                    EventRecord(
+                        run_id="sql-run",
+                        event_type="hybrid_v2.planning_rejected",
+                        data={
+                            "stage": "plan_repair",
+                            "error": type(exc).__name__,
+                            "problems": "; ".join(exc.problems),
+                        },
+                    )
+                )
+                raise PlanningRejected(list(exc.problems)) from exc
             repair_artifact = self.artifacts.write(
                 "sql-run", {"plan": repair_plan.model_dump()}, producer_task_id="plan-repair"
             )
@@ -1239,6 +1280,31 @@ class SQLTeam:
             plans[repair_candidate.candidate_id] = repair_plan
             plan_candidates = (*plan_candidates, repair_candidate)
             await judge_plan(repair_candidate, "plan-repair-judge")
+        if not viable_plans():
+            # Every sealed plan candidate and the bounded repair (when it ran) was
+            # refuted: reject planning typed instead of letting select raise a
+            # generic CollaborationError the adapter mislabels as a quorum failure.
+            # The round phase here is TESTED, from which release is legal: release
+            # only transitions out of COLLECTING_SEALED_PROPOSALS and returns the
+            # recorded candidates from any later phase, so re-reading viability
+            # neither changes the phase nor re-releases anything.
+            self.db.record_event(
+                EventRecord(
+                    run_id="sql-run",
+                    event_type="hybrid_v2.planning_rejected",
+                    data={
+                        "stage": "plan_select",
+                        "problems": (
+                            f"all {len(plan_candidates)} plan candidates were refuted by the judges"
+                        ),
+                        "findings": {
+                            candidate.candidate_id: plan_findings.get(candidate.candidate_id, {})
+                            for candidate in plan_candidates
+                        },
+                    },
+                )
+            )
+            raise PlanningRejected(["every plan candidate was refuted by the plan judges"])
         controller.advance(planning.round_id, CollaborationPhase.RECOMBINED)
         selected_plan = controller.select(planning.round_id)
         plan = plans[selected_plan.candidate_id]
@@ -1258,6 +1324,15 @@ class SQLTeam:
         task_findings: dict[str, dict[str, Any]] = {}
         task_attempts: dict[str, int] = {}
         task_block_reasons: dict[str, dict[str, Any]] = {}
+        # Per-task failure budget keyed by the plan's LOGICAL task id (e.g. "t3").
+        # Derivation: execute_task receives PlannedTask objects whose task_id is the
+        # logical plan id; board ids are per attempt ("task-t3" for the first
+        # execution, "task-t3-rev4" for decision revisions) because apply_decision
+        # replaces a revised task in place under the SAME task_id. Keying on
+        # task.task_id therefore groups every revision of one logical task into a
+        # single budget. One counter entry equals one failed bounded_board_work
+        # pair (initial attempt + its one same-task retry).
+        task_failure_pairs: dict[str, int] = {}
 
         def block_task(task_id: str, reason: str, details: dict[str, Any] | None = None) -> None:
             """Mark a task blocked: it cannot run this run, and dependents inherit it.
@@ -1374,7 +1449,9 @@ class SQLTeam:
                     # Admission is a deterministic property of this task's prompt and
                     # gathered evidence on this model: retrying cannot shrink it.
                     # Defer the task like an infeasible pre-flight instead of letting
-                    # the decision loop re-execute it round after round.
+                    # the decision loop re-execute it round after round. Excluded
+                    # from the failure budget: it blocks immediately and cannot
+                    # converge through revisions.
                     block_task(
                         task.task_id,
                         "context_infeasible",
@@ -1382,6 +1459,22 @@ class SQLTeam:
                             "stage": "task",
                             "error": type(exc).__name__,
                             "detail": str(exc)[:200],
+                        },
+                    )
+                    return
+                failed_pairs = task_failure_pairs.get(task.task_id, 0) + 1
+                task_failure_pairs[task.task_id] = failed_pairs
+                if failed_pairs >= 2:
+                    # Two failed execution pairs for the same logical task: defer it
+                    # instead of re-executing revised versions of a task that never
+                    # converges across the remaining decision rounds.
+                    block_task(
+                        task.task_id,
+                        "task_failures_exhausted",
+                        {
+                            "failed_pairs": failed_pairs,
+                            "attempts": failed_pairs * 2,
+                            "error": type(exc).__name__,
                         },
                     )
                 return
@@ -2035,6 +2128,8 @@ def adapter(method: str, *, json_protocol: bool = False):
                         details["code"] = "verification_rejected"
                     elif isinstance(exc, OrchestratorEscalated):
                         details["code"] = "orchestrator_escalated"
+                    elif isinstance(exc, PlanningRejected):
+                        details["code"] = "planning_rejected"
                     elif isinstance(exc, TaskContextInfeasible):
                         details["code"] = "task_context_infeasible"
                     elif isinstance(exc, StageBudgetExhausted):
