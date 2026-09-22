@@ -505,6 +505,48 @@ async def test_hybrid_v2_context_infeasible_prompt_defers_without_a_model_call()
         env.close()
 
 
+async def test_hybrid_v2_context_preflight_falls_back_to_the_resolved_model_window() -> None:
+    """Without phase-model bindings, the resolved model's own window bounds admission."""
+    import tempfile
+    from pathlib import Path
+
+    from poc.execution.sql_contracts import Budget, TaskInput
+    from poc.execution.sql_orchestration import SQLTeam, TaskContextInfeasible
+
+    task = TaskInput(prompt="Infrastructure canary", tables={"data": [{"x": 7}]})
+    with (
+        tempfile.TemporaryDirectory() as directory,
+        tempfile.TemporaryDirectory() as unbound_directory,
+    ):
+        team = SQLTeam(
+            Path(directory),
+            "hybrid_v2",
+            task,
+            Budget(max_output_tokens=32),
+            backend="sql-json",
+            model_name="fixture",
+            context_window=64,
+        )
+        with pytest.raises(TaskContextInfeasible):
+            team.require_context_feasible("x" * 8000, "task")
+        # A prompt that fits the declared window is admitted without a binding.
+        team.require_context_feasible("x" * 64, "task")
+        # An unknown window leaves admission to request time.
+        unbound = SQLTeam(
+            Path(unbound_directory),
+            "hybrid_v2",
+            task,
+            Budget(max_output_tokens=32),
+            backend="sql-json",
+            model_name="fixture",
+        )
+        try:
+            unbound.require_context_feasible("x" * 8000, "task")
+        finally:
+            unbound.db.close()
+        team.db.close()
+
+
 async def test_hybrid_v2_decision_rounds_are_bounded() -> None:
     events: list[dict[str, Any]] = []
     env = TaskEnvironment(TASK, 20)

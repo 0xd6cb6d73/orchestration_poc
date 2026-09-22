@@ -38,7 +38,11 @@ from poc.execution.sql_ports import (
     ToolBudgetExceeded,
     failure_details,
 )
-from poc.execution.sql_strategy import single, single_json
+from poc.execution.sql_strategy import (
+    ContextAdmissionExceeded,
+    single,
+    single_json,
+)
 from poc.execution.sql_team_worker import SupportedCritiqueValues, TeamWorker
 from poc.hybrid.collaboration_controller import CollaborationController, CollaborationError
 from poc.hybrid.communication import CommunicationService
@@ -141,6 +145,8 @@ class TaskContextInfeasible(CollaborationError):
 
     Raised by the pre-flight check before any model request is made, so an
     infeasible task costs nothing; the decision loop defers it like an escalation.
+    A task whose request-time admission also failed deterministically maps here
+    with the observed error instead of prompt/window numbers.
     """
 
     def __init__(
@@ -151,17 +157,25 @@ class TaskContextInfeasible(CollaborationError):
         context_window: int,
         model: str,
         reserve_tokens: int,
+        runtime_detail: str | None = None,
     ):
         self.prompt_chars = prompt_chars
         self.estimated_tokens = estimated_tokens
         self.context_window = context_window
         self.model = model
         self.reserve_tokens = reserve_tokens
-        super().__init__(
-            f"scoped prompt of {prompt_chars} characters (~{estimated_tokens} estimated tokens) "
-            f"plus a {reserve_tokens}-token output reserve exceeds the {context_window}-token "
-            f"context window of {model}"
-        )
+        self.runtime_detail = runtime_detail
+        if runtime_detail is not None:
+            message = (
+                f"a task on {model} failed request admission deterministically: {runtime_detail}"
+            )
+        else:
+            message = (
+                f"scoped prompt of {prompt_chars} characters (~{estimated_tokens} estimated tokens) "
+                f"plus a {reserve_tokens}-token output reserve exceeds the {context_window}-token "
+                f"context window of {model}"
+            )
+        super().__init__(message)
         self.failure_details: dict[str, Any] = {
             "type": type(self).__name__,
             "scope": "phase",
@@ -225,6 +239,7 @@ class SQLTeam:
         options: ArchitectureOptions | None = None,
         env_schema: dict[str, list[str]] | None = None,
         usage: RunUsage | None = None,
+        context_window: int | None = None,
     ):
         self.options = options or ArchitectureOptions()
         self.policy_version = self.options.team_policy
@@ -236,6 +251,9 @@ class SQLTeam:
         self.budget = budget
         # Shared run-level usage reference; budget-aware stage checks read it live.
         self.usage = usage
+        # Declared context window of the resolved model; scoped-prompt pre-flight
+        # admission uses it when no phase-model binding carries one.
+        self.context_window = context_window
         self.env_schema = env_schema or {}
         self.db = Database(root / "scheduler.sqlite")
         self.emitted = 0
@@ -371,11 +389,15 @@ class SQLTeam:
 
         Estimated from the assembled prompt text (chars // 4, the codebase's
         conservative char-to-token ratio) against the bound model's declared
-        context window minus the output reserve the stage would use. Runs only
-        when a window is known; an unknown window still fails at request time.
+        context window minus the output reserve the stage would use. The window
+        comes from a phase-model binding when one is wired, else from the
+        ContextBoundModel the adapter resolved; with neither, an unknown window
+        still fails at request time.
         """
         binding = self.options.phase_models.get(role) or self.options.phase_models.get("solve")
         window = (binding.endpoint_context_window or binding.context_window) if binding else None
+        if window is None:
+            window = self.context_window
         if window is None:
             return
         profile = self.options.role_profiles.get(role) or (
@@ -1348,6 +1370,20 @@ class SQLTeam:
                         data={"stage": "task", "index": task.task_id, "error": type(exc).__name__},
                     )
                 )
+                if isinstance(exc, ContextAdmissionExceeded):
+                    # Admission is a deterministic property of this task's prompt and
+                    # gathered evidence on this model: retrying cannot shrink it.
+                    # Defer the task like an infeasible pre-flight instead of letting
+                    # the decision loop re-execute it round after round.
+                    block_task(
+                        task.task_id,
+                        "context_infeasible",
+                        {
+                            "stage": "task",
+                            "error": type(exc).__name__,
+                            "detail": str(exc)[:200],
+                        },
+                    )
                 return
             artifact = self.artifacts.write(
                 "sql-run",
@@ -1730,20 +1766,38 @@ class SQLTeam:
             # Nothing executed and survived critique: no integration is possible.
             # The typed cause is the recorded block reasons, so the failure code says
             # why (escalations, context-infeasible prompts) instead of the quorum
-            # catch-all. A context-infeasible prompt is a hard, permanent condition,
-            # so it takes precedence over other block reasons.
-            infeasible = [
+            # catch-all. A context-infeasible task is a hard, permanent condition,
+            # so it takes precedence over other block reasons; a pre-flight block
+            # carries the prompt/window numbers, a runtime admission block only the
+            # observed error, and both map to the same typed surface.
+            preflight = [
                 record
                 for record in task_block_reasons.values()
-                if record["reason"] == "context_infeasible"
+                if record["reason"] == "context_infeasible" and "context_window" in record
             ]
-            if infeasible:
+            if preflight:
                 raise TaskContextInfeasible(
-                    prompt_chars=infeasible[0]["prompt_chars"],
-                    estimated_tokens=infeasible[0]["estimated_tokens"],
-                    context_window=infeasible[0]["context_window"],
-                    model=infeasible[0]["model"],
-                    reserve_tokens=infeasible[0]["reserve_tokens"],
+                    prompt_chars=preflight[0]["prompt_chars"],
+                    estimated_tokens=preflight[0]["estimated_tokens"],
+                    context_window=preflight[0]["context_window"],
+                    model=preflight[0]["model"],
+                    reserve_tokens=preflight[0]["reserve_tokens"],
+                )
+            if any(
+                record["reason"] == "context_infeasible" for record in task_block_reasons.values()
+            ):
+                runtime = next(
+                    record
+                    for record in task_block_reasons.values()
+                    if record["reason"] == "context_infeasible" and "context_window" not in record
+                )
+                raise TaskContextInfeasible(
+                    prompt_chars=0,
+                    estimated_tokens=0,
+                    context_window=0,
+                    model=self.model_for("task"),
+                    reserve_tokens=0,
+                    runtime_detail=str(runtime.get("detail") or runtime.get("error")),
                 )
             raise DecisionRoundsExhausted(
                 "hybrid_v2 decision rounds exhausted before integration", task_block_reasons
@@ -1957,6 +2011,7 @@ def adapter(method: str, *, json_protocol: bool = False):
                 options=env.state.options,
                 env_schema=env.schema,
                 usage=usage,
+                context_window=getattr(model, "context_window", None),
             )
             try:
                 await team.start()
