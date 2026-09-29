@@ -146,6 +146,16 @@ def test_public_contract_rejects_id_drift_empty_and_types(family: str) -> None:
     for values in ({}, {"0": 0}, {**case.expected, next(iter(case.expected)): True}):
         with pytest.raises(ArtifactContractError):
             validate_artifact(case.input, Answer(values=values))
+    subset = Answer(values=dict(list(case.expected.items())[:1]))
+    assert validate_artifact(case.input, subset, allow_partial=True) is subset
+    with pytest.raises(ArtifactContractError):
+        validate_artifact(
+            case.input, Answer(values={**subset.values, "unlisted-id": 0}), allow_partial=True
+        )
+    with pytest.raises(ArtifactContractError):
+        validate_artifact(
+            case.input, Answer(values={next(iter(subset.values)): True}), allow_partial=True
+        )
     if family == "scheduling":
         # Shape-valid but known infeasible answers still reach grading.
         wrong = Answer(values=dict.fromkeys(case.expected, 0))

@@ -62,7 +62,7 @@ class ConcurrentTeamWorker:
         self.pool_planned: dict[str, int] = {}
         self.consumed = 0.0
         self.reserved = {"requests": 0, "tool_calls": 0, "total_tokens": 0}
-        if method == "hybrid_v2":
+        if method in {"hybrid_v2", "hybrid_v2_1"}:
             shares = env.state.options.hybrid_pool_weights or ROLE_POOLS["hybrid_v2"]
             self.pool_shares = dict(shares)
             self.pool_planned = dict(POOL_PLANNED)
@@ -150,7 +150,7 @@ class ConcurrentTeamWorker:
             json_protocol=self.json_protocol,
         )
         worker.weights = [1.0]
-        worker.method = "reserved-branch"
+        worker.method = self.method
         worker.pool_shares = None
         worker.pool_planned = {}
         worker.consumed = 0.0

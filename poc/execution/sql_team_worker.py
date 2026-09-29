@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any, Literal, cast
 
@@ -30,7 +34,65 @@ from poc.execution.sql_ports import (
 from poc.execution.sql_protocol import ProtocolError, parse_action
 from poc.execution.sql_strategy import ContextBoundModel, ObservedModel, resolve_model
 from poc.hybrid.contracts import EvaluationVector
-from poc.hybrid.planning import MAX_PLAN_TASKS
+from poc.hybrid.planning import MAX_PLAN_TASKS, PlannedTask
+
+
+@dataclass
+class ScopedTaskState:
+    task: PlannedTask
+    started_at: float
+    consumed_requests: int = 0
+    consumed_tokens: int = 0
+    consumed_tools: int = 0
+
+
+_scoped_task: ContextVar[ScopedTaskState | None] = ContextVar(
+    "hybrid_v2_1_scoped_task", default=None
+)
+
+
+@contextmanager
+def scoped_task(task: PlannedTask) -> Generator[None]:
+    token = _scoped_task.set(ScopedTaskState(task=task, started_at=perf_counter()))
+    try:
+        yield
+    finally:
+        _scoped_task.reset(token)
+
+
+class EvidenceClaim(StrictModel):
+    claim: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(min_length=1)
+
+
+class TaskEvidenceValues(StrictModel):
+    proposed_values: dict[str, Any]
+    findings: list[EvidenceClaim]
+    assumptions: list[str]
+    unresolved_questions: list[str]
+
+
+class TaskEvidenceOutput(StrictModel):
+    values: TaskEvidenceValues
+
+
+class V21Answer(Answer):
+    status: Literal["supported", "partial", "inconclusive"]
+    claims: list[EvidenceClaim]
+    assumptions: list[str]
+    unresolved_questions: list[str]
+
+
+class V21VerificationValues(StrictModel):
+    status: Literal["supported", "partial", "inconclusive"]
+    claims_supported: bool = Field(strict=True)
+    gaps_disclosed: bool = Field(strict=True)
+    evidence_refs: list[str]
+    reason: str = Field(min_length=1)
+
+
+class V21VerificationOutput(StrictModel):
+    values: V21VerificationValues
 
 
 class PlanValues(StrictModel):
@@ -158,7 +220,7 @@ class TeamWorker:
         self.pool_shares: dict[str, float] | None = None
         self.pool_planned: dict[str, int] = {}
         self.consumed = 0.0
-        if method == "hybrid_v2":
+        if method in {"hybrid_v2", "hybrid_v2_1"}:
             shares = env.state.options.hybrid_pool_weights or ROLE_POOLS["hybrid_v2"]
             self.pool_shares = dict(shares)
             self.pool_planned = dict(POOL_PLANNED)
@@ -201,6 +263,11 @@ class TeamWorker:
             min(state.options.return_reserve_seconds, budget.seconds / 10) if self.reliable else 0
         )
         deadline = state.started + (budget.seconds - reserve) * cumulative
+        scope_state = (
+            _scoped_task.get() if self.method == "hybrid_v2_1" and role == "task" else None
+        )
+        if scope_state is not None and "seconds" in scope_state.task.budgets:
+            deadline = min(deadline, scope_state.started_at + scope_state.task.budgets["seconds"])
         token_limit = max(1, int(budget.total_tokens * cumulative))
         request_limit = max(1, int(budget.requests * cumulative))
         binding = state.options.phase_models.get(role) or state.options.phase_models.get("solve")
@@ -244,7 +311,30 @@ class TeamWorker:
                 "max_output_tokens": output_cap,
             }
         )
+        if scope_state is not None:
+            limits = scope_state.task.budgets
+            stage_budget = stage_budget.model_copy(
+                update={
+                    "requests": min(
+                        stage_budget.requests,
+                        usage.requests + max(0, limits["requests"] - scope_state.consumed_requests),
+                    ),
+                    "total_tokens": min(
+                        stage_budget.total_tokens,
+                        usage.total_tokens
+                        + max(0, limits["total_tokens"] - scope_state.consumed_tokens),
+                    ),
+                    "tool_calls": min(
+                        stage_budget.tool_calls,
+                        self.tool_calls + max(0, limits["tool_calls"] - scope_state.consumed_tools),
+                    ),
+                }
+            )
+            token_limit = stage_budget.total_tokens
+            request_limit = stage_budget.requests
         state.phase = role
+        task_tools_start = self.tool_calls
+        task_requests_start = usage.requests
         started, input_tokens, output_tokens = (
             perf_counter(),
             usage.input_tokens,
@@ -300,7 +390,9 @@ class TeamWorker:
                 if perf_counter() >= deadline:
                     raise PhaseTimeout("stage completed after its return deadline")
                 record["status"] = "completed"
-                if role not in CONTRACTS:
+                if role not in CONTRACTS and not (
+                    self.method == "hybrid_v2_1" and role == "integrate"
+                ):
                     validate_artifact(self.task, answer, state.options.artifact_contract)
                     state.candidate(answer, "output")
                 return answer
@@ -322,6 +414,12 @@ class TeamWorker:
                 record["status"] = "interrupted"
                 raise
             finally:
+                if scope_state is not None:
+                    scope_state.consumed_requests += usage.requests - task_requests_start
+                    scope_state.consumed_tokens += (usage.input_tokens - input_tokens) + (
+                        usage.output_tokens - output_tokens
+                    )
+                    scope_state.consumed_tools += self.tool_calls - task_tools_start
                 if record["status"] != "completed":
                     state.exhausted_phase = role
                 record.update(
@@ -342,8 +440,16 @@ class TeamWorker:
         settings: ModelSettings,
         budget: Budget,
     ) -> Answer:
-        contract = CONTRACTS.get(role, Answer)
-        if self.reliable and role in {"critique", "verify"}:
+        scope_state = (
+            _scoped_task.get() if self.method == "hybrid_v2_1" and role == "task" else None
+        )
+        scope = scope_state.task if scope_state is not None else None
+        contract = TaskEvidenceOutput if scope is not None else CONTRACTS.get(role, Answer)
+        if self.method == "hybrid_v2_1" and role == "integrate":
+            contract = V21Answer
+        if self.method == "hybrid_v2_1" and role == "verify":
+            contract = V21VerificationOutput
+        elif self.reliable and role in {"critique", "verify"}:
             contract = (
                 SupportedCritiqueOutput if role == "critique" else SupportedVerificationOutput
             )
@@ -353,6 +459,26 @@ class TeamWorker:
             "using the requested IDs and value format, not a plan, "
             "example, SQL string, or evaluation scores.",
         )
+        if scope is not None:
+            instructions += (
+                " Return proposed_values only for this task, evidence-backed findings, "
+                "explicit assumptions, and unresolved questions. A finding must cite "
+                "SQL evidence_ref values from your own queries. If evidence is absent, "
+                "leave findings empty and explain the gap in unresolved_questions."
+            )
+        if self.method == "hybrid_v2_1" and role == "integrate":
+            instructions += (
+                " Return final values plus status supported, partial, or inconclusive; "
+                "list evidence-backed claims, assumptions, and unresolved questions. "
+                "Cite your own SQL evidence_ref for each asserted claim. If coverage "
+                "is incomplete, disclose the gap rather than assert a full answer."
+            )
+        if self.method == "hybrid_v2_1" and role == "verify":
+            instructions += (
+                " Independently check each claim and coverage. Distinguish disproved "
+                "claims from claims not yet checked. Return claims_supported, "
+                "gaps_disclosed, status, reason, and your own SQL evidence_refs."
+            )
         if role == "orchestrate":
             # The orchestrator is physically tool-less: it plans and decides from the
             # task and the schema summary; it never queries and never investigates.
@@ -362,19 +488,26 @@ class TeamWorker:
             )
         else:
             instructions += " Use read-only SQLite to inspect the public data as needed."
-        if self.reliable and role in {"critique", "verify"}:
+        if self.reliable and (
+            role == "critique" or (role == "verify" and self.method != "hybrid_v2_1")
+        ):
             instructions += (
                 " Decision protocol supported-v1: distinguish structural validity, supported "
                 "feasibility and abstention. Cite SQL evidence_refs returned by your query tool. "
                 "Evidence references prove observation provenance, not correctness. Output schema: "
                 + json.dumps(contract.model_json_schema())
             )
+        visible_schema = (
+            {table: self.env.schema[table] for table in scope.allowed_tables}
+            if scope is not None
+            else self.env.schema
+        )
         prompt = (
             self.task.prompt
             + "\nRole task: "
             + instruction
             + "\nSQL schema: "
-            + json.dumps(self.env.schema)
+            + json.dumps(visible_schema)
         )
         errors: dict[str, int] = {}
         evidence: set[str] = set()
@@ -384,7 +517,9 @@ class TeamWorker:
             if self.tool_calls >= budget.tool_calls:
                 raise ToolBudgetExceeded("stage tool allocation exhausted")
             self.tool_calls += 1
-            result = self.env.query(sql)
+            result = self.env.query(
+                sql, allowed_tables=frozenset(scope.allowed_tables) if scope is not None else None
+            )
             if "error" in result:
                 key = str(result["error"])
                 errors[key] = errors.get(key, 0) + 1
@@ -392,7 +527,11 @@ class TeamWorker:
                     raise UnexpectedModelBehavior("repeated SQL error without progress")
             else:
                 errors.clear()
-                if self.reliable and role in {"critique", "verify"}:
+                if (
+                    (self.reliable and role in {"critique", "verify"})
+                    or scope is not None
+                    or (self.method == "hybrid_v2_1" and role in {"integrate", "verify"})
+                ):
                     ref = f"query:{role}:{self.evidence_namespace or self.index}:{self.tool_calls}"
                     evidence.add(ref)
                     result = {**result, "evidence_ref": ref}
@@ -402,9 +541,59 @@ class TeamWorker:
             return result
 
         def check_output(output: BaseModel) -> Answer:
-            answer = Answer.model_validate(output.model_dump())
-            if role not in CONTRACTS:
+            answer = (
+                V21Answer.model_validate(output.model_dump())
+                if self.method == "hybrid_v2_1" and role == "integrate"
+                else Answer.model_validate(output.model_dump())
+            )
+            if self.method == "hybrid_v2_1" and role == "integrate":
+                integrated = V21Answer.model_validate(answer)
+                refs = {ref for claim in integrated.claims for ref in claim.evidence_refs}
+                if not refs <= evidence or (
+                    integrated.status == "supported" and not integrated.claims
+                ):
+                    raise ArtifactContractError("v2.1 integration claims require own SQL evidence")
+                if integrated.status != "supported" and not integrated.unresolved_questions:
+                    raise ArtifactContractError(
+                        "partial or inconclusive answer requires explicit gaps"
+                    )
+                if integrated.status == "supported" and integrated.unresolved_questions:
+                    raise ArtifactContractError(
+                        "supported answer cannot retain unresolved questions"
+                    )
+                if integrated.status == "partial" and (
+                    not integrated.values or not integrated.claims
+                ):
+                    raise ArtifactContractError(
+                        "partial answer requires values and supported claims"
+                    )
+                if integrated.status == "inconclusive" and integrated.values:
+                    raise ArtifactContractError("inconclusive answer cannot assert final values")
+                if integrated.status in {"supported", "partial"}:
+                    validate_artifact(
+                        self.task,
+                        Answer(values=integrated.values),
+                        self.env.state.options.artifact_contract,
+                        allow_partial=integrated.status == "partial",
+                    )
+            elif role not in CONTRACTS:
                 validate_artifact(self.task, answer, self.env.state.options.artifact_contract)
+            elif scope is not None:
+                task_evidence = TaskEvidenceValues.model_validate(answer.values)
+                refs = {ref for finding in task_evidence.findings for ref in finding.evidence_refs}
+                if (
+                    not refs <= evidence
+                    or (not task_evidence.findings and not task_evidence.unresolved_questions)
+                    or (task_evidence.proposed_values and not task_evidence.findings)
+                ):
+                    raise ArtifactContractError(
+                        "TaskEvidence requires observed SQL references or explicit unresolved questions"
+                    )
+            elif self.method == "hybrid_v2_1" and role == "verify":
+                verdict = V21VerificationValues.model_validate(answer.values)
+                refs = set(verdict.evidence_refs)
+                if not refs <= evidence or (verdict.claims_supported and not refs):
+                    raise ArtifactContractError("v2.1 verification requires own SQL evidence")
             elif self.reliable and role in {"critique", "verify"}:
                 refs = set(answer.values["evidence_refs"])
                 positive = (

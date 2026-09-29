@@ -13,7 +13,9 @@ class ArtifactContractError(UnexpectedModelBehavior, ValueError):
     pass
 
 
-def validate_artifact(task: TaskInput, answer: Answer, policy: str = "public-v1") -> Answer:
+def validate_artifact(
+    task: TaskInput, answer: Answer, policy: str = "public-v1", *, allow_partial: bool = False
+) -> Answer:
     if policy == "legacy-v1":
         return answer
     values, tables = answer.values, task.tables
@@ -34,7 +36,7 @@ def validate_artifact(task: TaskInput, answer: Answer, policy: str = "public-v1"
     if not table:
         return answer
     required = {row[key] for row in tables[table]}
-    if set(values) != required:
+    if (not set(values) <= required) or (not allow_partial and set(values) != required):
         raise ArtifactContractError(
             f"public-v1: identifier coverage mismatch; missing={sorted(required - set(values))}, "
             f"unexpected={sorted(set(values) - required)}"

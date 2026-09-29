@@ -167,12 +167,42 @@ class ScriptedProvider:
                         "task_id": "t1",
                         "objective": "Read the schedule_jobs start times",
                         "local_scope": "schedule_jobs table only",
+                        **(
+                            {
+                                "allowed_tables": ["schedule_jobs"],
+                                "output_schema": "TaskEvidence",
+                                "budgets": {
+                                    "requests": 12,
+                                    "tool_calls": 6,
+                                    "total_tokens": 30000,
+                                    "seconds": 3,
+                                },
+                            }
+                            if self.method == "hybrid_v2_1"
+                            else {}
+                        ),
                         "definition_of_done": ["return every job's start time from its release"],
                     },
                     {
                         "task_id": "t2",
                         "objective": "Package the complete values mapping",
-                        "local_scope": "the t1 output only",
+                        "local_scope": "the t1 output and schedule_jobs table"
+                        if self.method == "hybrid_v2_1"
+                        else "the t1 output only",
+                        **(
+                            {
+                                "allowed_tables": ["schedule_jobs"],
+                                "output_schema": "TaskEvidence",
+                                "budgets": {
+                                    "requests": 12,
+                                    "tool_calls": 6,
+                                    "total_tokens": 30000,
+                                    "seconds": 3,
+                                },
+                            }
+                            if self.method == "hybrid_v2_1"
+                            else {}
+                        ),
                         "definition_of_done": ["values cover every job ID exactly once"],
                         "dependencies": ["t1"],
                     },
@@ -212,6 +242,18 @@ class ScriptedProvider:
             return self.response({"values": {"0": 0}}, info)
         if role == "task":
             values = {str(row[0]): row[1] for row in result["rows"]}
+            if self.method == "hybrid_v2_1":
+                values = {
+                    "proposed_values": values,
+                    "findings": [
+                        {
+                            "claim": "Public starts match releases",
+                            "evidence_refs": [result["evidence_ref"]],
+                        }
+                    ],
+                    "assumptions": [],
+                    "unresolved_questions": [],
+                }
         elif role == "plan":
             values = {"plan": "Read id and release from schedule_jobs and return all IDs."}
         elif role == "critique":
@@ -234,6 +276,30 @@ class ScriptedProvider:
                 "reason": "Read the public start times",
                 "evidence_refs": refs,
                 "evaluation": evaluation,
+            }
+        elif role == "integrate" and self.method == "hybrid_v2_1":
+            return self.response(
+                {
+                    "values": values,
+                    "status": "supported",
+                    "claims": [
+                        {
+                            "claim": "Start times match public releases",
+                            "evidence_refs": [result["evidence_ref"]],
+                        }
+                    ],
+                    "assumptions": [],
+                    "unresolved_questions": [],
+                },
+                info,
+            )
+        elif role == "verify" and self.method == "hybrid_v2_1":
+            values = {
+                "status": "supported",
+                "claims_supported": True,
+                "gaps_disclosed": True,
+                "reason": "Checked public starts",
+                "evidence_refs": [result["evidence_ref"]],
             }
         elif role == "verify":
             if scenario == "verifier_reject":

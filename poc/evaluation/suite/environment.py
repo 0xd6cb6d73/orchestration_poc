@@ -72,7 +72,7 @@ class TaskEnvironment:
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
 
-    def query(self, sql: str) -> dict[str, Any]:
+    def query(self, sql: str, *, allowed_tables: frozenset[str] | None = None) -> dict[str, Any]:
         """Run read-only SQLite SQL. Use LIMIT/OFFSET to paginate.
 
         Default: 200 rows / 64KB. Task prompts may specify larger bounds.
@@ -91,6 +91,28 @@ class TaskEnvironment:
             return int(ticks > 20000)
 
         self.db.set_progress_handler(progress, 1000)
+        if allowed_tables is not None:
+
+            def authorize_scoped(
+                action: int,
+                arg1: str | None,
+                arg2: str | None,
+                database: str | None,
+                source: str | None,
+            ) -> int:
+                if action == sqlite3.SQLITE_READ and arg1 not in allowed_tables:
+                    return sqlite3.SQLITE_DENY
+                # Replay closes over the whole public authorization snapshot. A
+                # scoped task may invoke it only when all of that data is allowed.
+                if (
+                    action == sqlite3.SQLITE_FUNCTION
+                    and (arg2 or "").lower() == "authz_replay"
+                    and not set(self.schema) <= allowed_tables
+                ):
+                    return sqlite3.SQLITE_DENY
+                return self._authorize(action, arg1, arg2, database, source)
+
+            self.db.set_authorizer(authorize_scoped)
         with trace.get_tracer(__name__).start_as_current_span("evaluation.query") as span:
             span.set_attribute("openinference.span.kind", "TOOL")
             span.set_attribute("evaluation.phase", self.state.phase)
@@ -116,6 +138,9 @@ class TaskEnvironment:
                         else str(exc)
                     )
                 }
+            finally:
+                if allowed_tables is not None:
+                    self.db.set_authorizer(self._authorize)
             call["result"] = result
             span.set_attribute("output.value", json.dumps(result))
             return result

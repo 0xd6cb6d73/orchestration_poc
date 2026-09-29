@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic_ai import ModelMessage, ModelResponse, TextPart, ToolCallPart
@@ -38,7 +39,7 @@ def model() -> FunctionModel:
     async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         prompt = str(messages)
         if "decompose it into between 2 and 8" in prompt:
-            values = {
+            values: dict[str, Any] = {
                 "parent_objective": "Return the value of x.",
                 "tasks": [
                     {
@@ -57,6 +58,18 @@ def model() -> FunctionModel:
                 ],
                 "integration_definition_of_done": ["values cover the data table row"],
             }
+            if "TaskEvidence" in prompt:
+                for task in cast(list[dict[str, Any]], values["tasks"]):
+                    task.update(
+                        allowed_tables=["data"],
+                        output_schema="TaskEvidence",
+                        budgets={
+                            "requests": 12,
+                            "tool_calls": 6,
+                            "total_tokens": 30000,
+                            "seconds": 120,
+                        },
+                    )
         elif "Judge this proposed" in prompt or "Audit this scoped task output" in prompt:
             values = dict.fromkeys(
                 ("validity", "evidence", "usefulness", "novelty", "constraint_satisfaction"), 4
@@ -85,6 +98,52 @@ def model() -> FunctionModel:
             values = {"plan": "SELECT x FROM data"}
         else:
             values = {"x": 7}
+        if (
+            "Return proposed_values only for this task" in (info.instructions or "")
+            or "Return final values plus status" in (info.instructions or "")
+            or "Independently check each claim" in (info.instructions or "")
+        ):
+            role = (
+                "task"
+                if "Return proposed_values" in (info.instructions or "")
+                else "integrate"
+                if "Return final values" in (info.instructions or "")
+                else "verify"
+            )
+            refs = re.findall(rf"query:{role}:[A-Za-z0-9_-]+:[0-9]+", prompt)
+            query_seen = "SQL result:" in prompt or "ToolReturnPart" in prompt
+            if not refs or not query_seen:
+                if info.function_tools:
+                    return ModelResponse(
+                        parts=[ToolCallPart("query", {"sql": "SELECT x FROM data"})]
+                    )
+                return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
+            if role == "task":
+                values = {
+                    "proposed_values": {"x": 7},
+                    "findings": [{"claim": "x is 7", "evidence_refs": [refs[-1]]}],
+                    "assumptions": [],
+                    "unresolved_questions": [],
+                }
+            elif role == "integrate":
+                answer = {
+                    "values": {"x": 7},
+                    "status": "supported",
+                    "claims": [{"claim": "x is 7", "evidence_refs": [refs[-1]]}],
+                    "assumptions": [],
+                    "unresolved_questions": [],
+                }
+                if info.output_tools:
+                    return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
+                return ModelResponse(parts=[TextPart(json.dumps(answer))])
+            else:
+                values = {
+                    "status": "supported",
+                    "claims_supported": True,
+                    "gaps_disclosed": True,
+                    "evidence_refs": [refs[-1]],
+                    "reason": "Checked x",
+                }
         answer = {"values": values}
         if info.output_tools:
             return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, answer)])
@@ -113,6 +172,7 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
                 "speculative": 3,
                 "hybrid_v1": 5,
                 "hybrid_v2": 10,
+                "hybrid_v2_1": 14,
             }[method]
         )
         kinds = {e["orchestration"]["event_type"] for e in events if "orchestration" in e}
@@ -128,6 +188,16 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
                 "verification.completed",
                 "delivery.gated",
             },
+            "hybrid_v2_1": {
+                "candidate.released",
+                "candidate.selected",
+                "claim.acquired",
+                "task.completed",
+                "worker.attached",
+                "hybrid_v2_1.plan_selected",
+                "verification.completed",
+                "delivery.gated",
+            },
             "hybrid_v2": {
                 "candidate.released",
                 "candidate.selected",
@@ -140,7 +210,7 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
             },
         }
         assert required[method] <= kinds, kinds
-        assert len(env.state.phases) == usage.requests
+        assert len(env.state.phases) == (10 if method == "hybrid_v2_1" else usage.requests)
     finally:
         env.close()
 
@@ -153,7 +223,9 @@ async def test_workers_share_request_ceiling(method: str) -> None:
     try:
         # hybrid_v2 terminates budget-aware before re-claiming a spent budget; the
         # other strategies still hit the provider-side usage limit.
-        expected = StageBudgetExhausted if method == "hybrid_v2" else UsageLimitExceeded
+        expected = (
+            StageBudgetExhausted if method in {"hybrid_v2", "hybrid_v2_1"} else UsageLimitExceeded
+        )
         with pytest.raises(expected):
             await ADAPTERS[method](TASK, env, model(), {}, Budget(requests=1), usage)
         assert usage.requests == 1
@@ -168,6 +240,7 @@ def test_every_runtime_mode_has_both_protocols() -> None:
     assert "hybrid_v1" in ADAPTERS
     assert "hybrid_v2" in ADAPTERS
     assert "hybrid_v2-json" in ADAPTERS
+    assert "hybrid_v2_1-json" in ADAPTERS
 
 
 async def test_cancelled_trial_cleans_scheduler_directory(
@@ -218,12 +291,40 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
                                             "task_id": "t1",
                                             "objective": "Look up x",
                                             "local_scope": "data table",
+                                            **(
+                                                {
+                                                    "allowed_tables": ["data"],
+                                                    "output_schema": "TaskEvidence",
+                                                    "budgets": {
+                                                        "requests": 12,
+                                                        "tool_calls": 6,
+                                                        "total_tokens": 30000,
+                                                        "seconds": 120,
+                                                    },
+                                                }
+                                                if method == "hybrid_v2_1"
+                                                else {}
+                                            ),
                                             "definition_of_done": ["return the row"],
                                         },
                                         {
                                             "task_id": "t2",
                                             "objective": "Package the answer",
                                             "local_scope": "the t1 output only",
+                                            **(
+                                                {
+                                                    "allowed_tables": ["data"],
+                                                    "output_schema": "TaskEvidence",
+                                                    "budgets": {
+                                                        "requests": 12,
+                                                        "tool_calls": 6,
+                                                        "total_tokens": 30000,
+                                                        "seconds": 120,
+                                                    },
+                                                }
+                                                if method == "hybrid_v2_1"
+                                                else {}
+                                            ),
                                             "definition_of_done": ["values equal the row"],
                                             "dependencies": ["t1"],
                                         },
@@ -257,7 +358,7 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
                 TASK, env, FunctionModel(respond), {}, Budget(tool_calls=1), usage
             )
         assert env.tool_calls == 1
-        expected_requests = 5 if method == "hybrid_v2" else 3
+        expected_requests = 5 if method in {"hybrid_v2", "hybrid_v2_1"} else 3
         assert usage.requests == expected_requests
     finally:
         env.close()

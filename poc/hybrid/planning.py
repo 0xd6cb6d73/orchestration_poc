@@ -34,6 +34,7 @@ class PlannedTask(BaseModel):
     task_id: str
     objective: str
     local_scope: str
+    allowed_tables: tuple[str, ...] = ()
     out_of_scope: tuple[str, ...] = ()
     definition_of_done: tuple[str, ...]
     dependencies: tuple[str, ...] = ()
@@ -85,7 +86,13 @@ def _parse_task(raw: Any, problems: list[str], index: int) -> PlannedTask | None
     fields: dict[str, Any] = dict(cast(Mapping[str, Any], raw))
     if "task_id" not in fields:
         fields["task_id"] = f"t{index + 1}"
-    for field in ("definition_of_done", "out_of_scope", "dependencies", "evidence_requirements"):
+    for field in (
+        "definition_of_done",
+        "out_of_scope",
+        "dependencies",
+        "evidence_requirements",
+        "allowed_tables",
+    ):
         if field in fields:
             normalized = _normalize_criteria(fields[field])
             if isinstance(normalized, str):
@@ -127,6 +134,19 @@ def plan_problems(
         done = [item for item in task.definition_of_done if item.strip()]
         if not done:
             problems.append(f"task {task.task_id}: definition_of_done needs at least one entry")
+        if len(set(task.allowed_tables)) != len(task.allowed_tables):
+            problems.append(f"task {task.task_id}: duplicate allowed_tables")
+        if any(not table.strip() for table in task.allowed_tables):
+            problems.append(f"task {task.task_id}: allowed_tables must not contain empty names")
+        if any(
+            key not in {"requests", "tool_calls", "total_tokens", "seconds"}
+            or type(value) is not int
+            or value <= 0
+            for key, value in task.budgets.items()
+        ):
+            problems.append(
+                f"task {task.task_id}: budgets require positive integer requests, tool_calls, total_tokens, or seconds"
+            )
         if not task.output_schema.strip():
             problems.append(f"task {task.task_id}: output_schema must not be empty")
         for dependency in task.dependencies:

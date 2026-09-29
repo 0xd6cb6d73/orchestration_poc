@@ -37,6 +37,7 @@ REQUIRED_PHASES: dict[str, set[str]] = {
     "speculative": {"proposal", "reconcile"},
     "hybrid_v1": {"proposal", "critique", "verify"},
     "hybrid_v2": {"orchestrate", "task", "critique", "integrate", "verify"},
+    "hybrid_v2_1": {"orchestrate", "task", "critique", "integrate", "verify"},
     "sql-baseline": set(),
 }
 REQUIRED_EVENTS = {
@@ -45,6 +46,13 @@ REQUIRED_EVENTS = {
     "managed_pool": {"assignment.created", "assignment.completed"},
     "speculative": {"candidate.completed", "reconciliation.completed"},
     "hybrid_v1": {"candidate.selected", "verification.completed", "delivery.gated"},
+    "hybrid_v2_1": {
+        "candidate.released",
+        "candidate.selected",
+        "hybrid_v2_1.plan_selected",
+        "verification.completed",
+        "delivery.gated",
+    },
     "hybrid_v2": {
         "candidate.released",
         "candidate.selected",
@@ -222,7 +230,7 @@ def _checks(
     if scenario in rejected:
         expected: tuple[type[BaseException], ...] = (UnexpectedModelBehavior,)
         if scenario in {"critic_contract", "false_approval", "foreign_evidence"} or (
-            scenario == "malformed_artifact" and probe.strategy == "hybrid_v1"
+            scenario == "malformed_artifact" and probe.strategy in {"hybrid_v1", "hybrid_v2_1"}
         ):
             expected = (CollaborationError,)
         elif scenario == "verifier_reject":
@@ -333,7 +341,7 @@ def _checks(
                 and attempts[0]["worker_id"] != attempts[1]["worker_id"]
                 and attempts[1]["assignment_generation"] > attempts[0]["assignment_generation"]
             )
-        if probe.strategy in {"hybrid_v1", "hybrid_v2"}:
+        if probe.strategy in {"hybrid_v1", "hybrid_v2", "hybrid_v2_1"}:
             refs = [e["evidence"]["ref"] for e in events if "evidence" in e]
             checks["independent_evidence"] = len(refs) >= (
                 2 if scenario == "proposal_loss" else 3

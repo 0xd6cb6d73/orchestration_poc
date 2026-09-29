@@ -1536,7 +1536,7 @@ class Runtime:
                 decision = parse_decision(
                     decision_result["results"][f"decision_{task.task_id}"]["result"]["content"]
                 )
-                validate_decision(decision, orchestrator_plan)
+                validate_decision(decision, orchestrator_plan, pending_task_id=task.task_id)
                 if decision.decision == "escalate":
                     self.db.record_event(
                         EventRecord(
