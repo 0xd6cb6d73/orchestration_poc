@@ -40,12 +40,28 @@ in each matrix or on the CLI. Each matrix runs one model and one strategy in its
 own optional SDK environment; keep the model endpoint and model ID the same
 when comparing their reports.
 
-`tests/test_framework_benchmark_cli.py` runs the real benchmark command for both
-families against a local OpenAI-compatible fixture. It checks SQL tool access,
-exact grading, report coverage, request counts and token usage for each installed
-backend. The fixture supplies a known feasible answer, so passing this test
+`tests/test_framework_benchmark_cli.py` runs the real benchmark command for
+scheduling, routing, and authorization against a local OpenAI-compatible
+fixture. It checks SQL tool access, exact grading, report coverage, request
+counts, and token usage for each installed backend. The fixture supplies a known feasible answer, so passing this test
 verifies the evaluation path, not live-model task performance. Run it in each
 backend's optional dependency environment before a live sweep.
+
+## Authorization evaluation
+
+Use `configs/evaluation-framework-authorization-{pydantic,strands,llamaindex}.json`
+with the matching optional dependency environment above. These matrices select
+the authorization family, three development seeds, one repetition, and a larger
+exploratory budget of 300 model requests, 400 SQL calls, and 100 million tokens.
+They currently allow 60 minutes per trial, 900 seconds per model request, and
+65,536 output tokens per request. The wall-clock budget is still exploratory;
+early live trials exposed adapter and model-continuation failures before a
+reliable task-cost limit could be determined. Use `--seeds 0` for a single
+reproducible pilot.
+
+The fixture test uses a known authorization witness to verify the CLI and grader.
+For live trial findings and trace-level causes, see
+[the authorization evaluation investigation](framework-authorization-evaluation.md).
 
 ## Headless app request
 
