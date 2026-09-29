@@ -38,6 +38,7 @@ REQUIRED_PHASES: dict[str, set[str]] = {
     "hybrid_v1": {"proposal", "critique", "verify"},
     "hybrid_v2": {"orchestrate", "task", "critique", "integrate", "verify"},
     "hybrid_v2_1": {"orchestrate", "task", "critique", "integrate", "verify"},
+    "hybrid_v2_2": {"orchestrate", "task", "critique", "integrate", "verify"},
     "sql-baseline": set(),
 }
 REQUIRED_EVENTS = {
@@ -46,6 +47,12 @@ REQUIRED_EVENTS = {
     "managed_pool": {"assignment.created", "assignment.completed"},
     "speculative": {"candidate.completed", "reconciliation.completed"},
     "hybrid_v1": {"candidate.selected", "verification.completed", "delivery.gated"},
+    "hybrid_v2_2": {
+        "candidate.released",
+        "hybrid_v2_2.plan_selected",
+        "verification.completed",
+        "delivery.gated",
+    },
     "hybrid_v2_1": {
         "candidate.released",
         "candidate.selected",
@@ -230,7 +237,8 @@ def _checks(
     if scenario in rejected:
         expected: tuple[type[BaseException], ...] = (UnexpectedModelBehavior,)
         if scenario in {"critic_contract", "false_approval", "foreign_evidence"} or (
-            scenario == "malformed_artifact" and probe.strategy in {"hybrid_v1", "hybrid_v2_1"}
+            scenario == "malformed_artifact"
+            and probe.strategy in {"hybrid_v1", "hybrid_v2_1", "hybrid_v2_2"}
         ):
             expected = (CollaborationError,)
         elif scenario == "verifier_reject":
@@ -317,9 +325,10 @@ def _checks(
             checks["controller_events"] = REQUIRED_EVENTS.get(probe.strategy, set()) <= kinds
             if probe.policy == "concurrent-v1":
                 first = sorted(env.state.phases, key=lambda p: p.get("branch_index", 0))[:2]
-                checks["overlapping_branches"] = len(first) == 2 and max(
-                    p["start_seconds"] for p in first
-                ) < min(p["start_seconds"] + p["elapsed_seconds"] for p in first)
+                if probe.strategy != "hybrid_v2_2":
+                    checks["overlapping_branches"] = len(first) == 2 and max(
+                        p["start_seconds"] for p in first
+                    ) < min(p["start_seconds"] + p["elapsed_seconds"] for p in first)
                 reservations = [
                     e["budget_reservation"] for e in events if "budget_reservation" in e
                 ]
@@ -341,7 +350,7 @@ def _checks(
                 and attempts[0]["worker_id"] != attempts[1]["worker_id"]
                 and attempts[1]["assignment_generation"] > attempts[0]["assignment_generation"]
             )
-        if probe.strategy in {"hybrid_v1", "hybrid_v2", "hybrid_v2_1"}:
+        if probe.strategy in {"hybrid_v1", "hybrid_v2", "hybrid_v2_1", "hybrid_v2_2"}:
             refs = [e["evidence"]["ref"] for e in events if "evidence" in e]
             checks["independent_evidence"] = len(refs) >= (
                 2 if scenario == "proposal_loss" else 3

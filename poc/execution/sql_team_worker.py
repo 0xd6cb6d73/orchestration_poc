@@ -220,11 +220,15 @@ class TeamWorker:
         self.pool_shares: dict[str, float] | None = None
         self.pool_planned: dict[str, int] = {}
         self.consumed = 0.0
-        if method in {"hybrid_v2", "hybrid_v2_1"}:
+        if method in {"hybrid_v2", "hybrid_v2_1", "hybrid_v2_2"}:
             shares = env.state.options.hybrid_pool_weights or ROLE_POOLS["hybrid_v2"]
             self.pool_shares = dict(shares)
             self.pool_planned = dict(POOL_PLANNED)
-            self.pool_planned["orchestrate"] = env.state.options.hybrid_plan_fanout
+            self.pool_planned["orchestrate"] = (
+                2 + env.state.options.hybrid_max_decision_rounds
+                if method == "hybrid_v2_2"
+                else env.state.options.hybrid_plan_fanout
+            )
             self.pool_planned["critique"] = env.state.options.hybrid_plan_fanout + 2
             self.index = 0
         else:
@@ -264,7 +268,9 @@ class TeamWorker:
         )
         deadline = state.started + (budget.seconds - reserve) * cumulative
         scope_state = (
-            _scoped_task.get() if self.method == "hybrid_v2_1" and role == "task" else None
+            _scoped_task.get()
+            if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "task"
+            else None
         )
         if scope_state is not None and "seconds" in scope_state.task.budgets:
             deadline = min(deadline, scope_state.started_at + scope_state.task.budgets["seconds"])
@@ -391,7 +397,7 @@ class TeamWorker:
                     raise PhaseTimeout("stage completed after its return deadline")
                 record["status"] = "completed"
                 if role not in CONTRACTS and not (
-                    self.method == "hybrid_v2_1" and role == "integrate"
+                    self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "integrate"
                 ):
                     validate_artifact(self.task, answer, state.options.artifact_contract)
                     state.candidate(answer, "output")
@@ -441,13 +447,15 @@ class TeamWorker:
         budget: Budget,
     ) -> Answer:
         scope_state = (
-            _scoped_task.get() if self.method == "hybrid_v2_1" and role == "task" else None
+            _scoped_task.get()
+            if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "task"
+            else None
         )
         scope = scope_state.task if scope_state is not None else None
         contract = TaskEvidenceOutput if scope is not None else CONTRACTS.get(role, Answer)
-        if self.method == "hybrid_v2_1" and role == "integrate":
+        if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "integrate":
             contract = V21Answer
-        if self.method == "hybrid_v2_1" and role == "verify":
+        if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "verify":
             contract = V21VerificationOutput
         elif self.reliable and role in {"critique", "verify"}:
             contract = (
@@ -466,30 +474,34 @@ class TeamWorker:
                 "SQL evidence_ref values from your own queries. If evidence is absent, "
                 "leave findings empty and explain the gap in unresolved_questions."
             )
-        if self.method == "hybrid_v2_1" and role == "integrate":
+        if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "integrate":
             instructions += (
                 " Return final values plus status supported, partial, or inconclusive; "
                 "list evidence-backed claims, assumptions, and unresolved questions. "
                 "Cite your own SQL evidence_ref for each asserted claim. If coverage "
                 "is incomplete, disclose the gap rather than assert a full answer."
             )
-        if self.method == "hybrid_v2_1" and role == "verify":
+        if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "verify":
             instructions += (
                 " Independently check each claim and coverage. Distinguish disproved "
                 "claims from claims not yet checked. Return claims_supported, "
                 "gaps_disclosed, status, reason, and your own SQL evidence_refs."
             )
         if role == "orchestrate":
-            # The orchestrator is physically tool-less: it plans and decides from the
-            # task and the schema summary; it never queries and never investigates.
+            # The v2.2 planner receives only the request and a capability summary.
+            # Earlier variants also receive the SQL schema summary.
             instructions += (
-                " You have no SQL access. The schema summary in this prompt is "
+                " You have no SQL access or SQL schema. Leave table selection, queries, "
+                "and factual investigation to specialist workers."
+                if self.method == "hybrid_v2_2"
+                else " You have no SQL access. The schema summary in this prompt is "
                 "authoritative for what tables and columns exist."
             )
         else:
             instructions += " Use read-only SQLite to inspect the public data as needed."
         if self.reliable and (
-            role == "critique" or (role == "verify" and self.method != "hybrid_v2_1")
+            role == "critique"
+            or (role == "verify" and self.method not in {"hybrid_v2_1", "hybrid_v2_2"})
         ):
             instructions += (
                 " Decision protocol supported-v1: distinguish structural validity, supported "
@@ -502,13 +514,14 @@ class TeamWorker:
             if scope is not None
             else self.env.schema
         )
-        prompt = (
-            self.task.prompt
-            + "\nRole task: "
-            + instruction
-            + "\nSQL schema: "
-            + json.dumps(visible_schema)
-        )
+        prompt = self.task.prompt + "\nRole task: " + instruction
+        if self.method == "hybrid_v2_2" and role == "orchestrate":
+            prompt += (
+                "\nSpecialist capabilities: independent read-only SQL investigation, "
+                "evidence-backed task reports, integration, and independent verification."
+            )
+        else:
+            prompt += "\nSQL schema: " + json.dumps(visible_schema)
         errors: dict[str, int] = {}
         evidence: set[str] = set()
 
@@ -530,7 +543,10 @@ class TeamWorker:
                 if (
                     (self.reliable and role in {"critique", "verify"})
                     or scope is not None
-                    or (self.method == "hybrid_v2_1" and role in {"integrate", "verify"})
+                    or (
+                        self.method in {"hybrid_v2_1", "hybrid_v2_2"}
+                        and role in {"integrate", "verify"}
+                    )
                 ):
                     ref = f"query:{role}:{self.evidence_namespace or self.index}:{self.tool_calls}"
                     evidence.add(ref)
@@ -543,10 +559,10 @@ class TeamWorker:
         def check_output(output: BaseModel) -> Answer:
             answer = (
                 V21Answer.model_validate(output.model_dump())
-                if self.method == "hybrid_v2_1" and role == "integrate"
+                if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "integrate"
                 else Answer.model_validate(output.model_dump())
             )
-            if self.method == "hybrid_v2_1" and role == "integrate":
+            if self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "integrate":
                 integrated = V21Answer.model_validate(answer)
                 refs = {ref for claim in integrated.claims for ref in claim.evidence_refs}
                 if not refs <= evidence or (
@@ -589,7 +605,7 @@ class TeamWorker:
                     raise ArtifactContractError(
                         "TaskEvidence requires observed SQL references or explicit unresolved questions"
                     )
-            elif self.method == "hybrid_v2_1" and role == "verify":
+            elif self.method in {"hybrid_v2_1", "hybrid_v2_2"} and role == "verify":
                 verdict = V21VerificationValues.model_validate(answer.values)
                 refs = set(verdict.evidence_refs)
                 if not refs <= evidence or (verdict.claims_supported and not refs):

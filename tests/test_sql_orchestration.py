@@ -173,6 +173,7 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
                 "hybrid_v1": 5,
                 "hybrid_v2": 10,
                 "hybrid_v2_1": 14,
+                "hybrid_v2_2": 11,
             }[method]
         )
         kinds = {e["orchestration"]["event_type"] for e in events if "orchestration" in e}
@@ -185,6 +186,15 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
                 "candidate.released",
                 "candidate.selected",
                 "claim.acquired",
+                "verification.completed",
+                "delivery.gated",
+            },
+            "hybrid_v2_2": {
+                "candidate.released",
+                "claim.acquired",
+                "task.completed",
+                "worker.attached",
+                "hybrid_v2_2.plan_selected",
                 "verification.completed",
                 "delivery.gated",
             },
@@ -210,7 +220,9 @@ async def test_all_methods_execute_real_controllers(method: str, suffix: str) ->
             },
         }
         assert required[method] <= kinds, kinds
-        assert len(env.state.phases) == (10 if method == "hybrid_v2_1" else usage.requests)
+        assert len(env.state.phases) == (
+            7 if method == "hybrid_v2_2" else 10 if method == "hybrid_v2_1" else usage.requests
+        )
     finally:
         env.close()
 
@@ -224,7 +236,9 @@ async def test_workers_share_request_ceiling(method: str) -> None:
         # hybrid_v2 terminates budget-aware before re-claiming a spent budget; the
         # other strategies still hit the provider-side usage limit.
         expected = (
-            StageBudgetExhausted if method in {"hybrid_v2", "hybrid_v2_1"} else UsageLimitExceeded
+            StageBudgetExhausted
+            if method in {"hybrid_v2", "hybrid_v2_1", "hybrid_v2_2"}
+            else UsageLimitExceeded
         )
         with pytest.raises(expected):
             await ADAPTERS[method](TASK, env, model(), {}, Budget(requests=1), usage)
@@ -241,6 +255,7 @@ def test_every_runtime_mode_has_both_protocols() -> None:
     assert "hybrid_v2" in ADAPTERS
     assert "hybrid_v2-json" in ADAPTERS
     assert "hybrid_v2_1-json" in ADAPTERS
+    assert "hybrid_v2_2-json" in ADAPTERS
 
 
 async def test_cancelled_trial_cleans_scheduler_directory(
@@ -340,6 +355,24 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
             return ModelResponse(parts=[TextPart('{"sql":"SELECT x FROM data"}')])
         if "Develop a solution plan" in prompt:
             return ModelResponse(parts=[TextPart('{"values":{"plan":"SELECT x FROM data"}}')])
+        if method == "hybrid_v2_2" and "Execute ONLY this scoped task" in prompt:
+            refs = re.findall(r"query:task:[A-Za-z0-9_-]+:[0-9]+", prompt)
+            return ModelResponse(
+                parts=[
+                    TextPart(
+                        json.dumps(
+                            {
+                                "values": {
+                                    "proposed_values": {"x": 7},
+                                    "findings": [{"claim": "x is 7", "evidence_refs": [refs[-1]]}],
+                                    "assumptions": [],
+                                    "unresolved_questions": [],
+                                }
+                            }
+                        )
+                    )
+                ]
+            )
         return ModelResponse(
             parts=[
                 TextPart(
@@ -358,7 +391,9 @@ async def test_workers_share_tool_ceiling(method: str) -> None:
                 TASK, env, FunctionModel(respond), {}, Budget(tool_calls=1), usage
             )
         assert env.tool_calls == 1
-        expected_requests = 5 if method in {"hybrid_v2", "hybrid_v2_1"} else 3
+        expected_requests = (
+            4 if method == "hybrid_v2_2" else 5 if method in {"hybrid_v2", "hybrid_v2_1"} else 3
+        )
         assert usage.requests == expected_requests
     finally:
         env.close()

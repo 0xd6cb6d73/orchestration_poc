@@ -146,6 +146,7 @@ class ScriptedProvider:
         if (
             self.concurrent
             and scenario == "healthy"
+            and self.method != "hybrid_v2_2"
             and role in {"plan", "proposal", "orchestrate"}
             and len(self.initial_workers) < 2
         ):
@@ -165,8 +166,12 @@ class ScriptedProvider:
                 "tasks": [
                     {
                         "task_id": "t1",
-                        "objective": "Read the schedule_jobs start times",
-                        "local_scope": "schedule_jobs table only",
+                        "objective": "Establish the requested start times"
+                        if self.method == "hybrid_v2_2"
+                        else "Read the schedule_jobs start times",
+                        "local_scope": "requested start-time evidence"
+                        if self.method == "hybrid_v2_2"
+                        else "schedule_jobs table only",
                         **(
                             {
                                 "allowed_tables": ["schedule_jobs"],
@@ -185,8 +190,12 @@ class ScriptedProvider:
                     },
                     {
                         "task_id": "t2",
-                        "objective": "Package the complete values mapping",
-                        "local_scope": "the t1 output and schedule_jobs table"
+                        "objective": "Assess coverage of the candidate mapping"
+                        if self.method == "hybrid_v2_2"
+                        else "Package the complete values mapping",
+                        "local_scope": "support for the t1 finding"
+                        if self.method == "hybrid_v2_2"
+                        else "the t1 output and schedule_jobs table"
                         if self.method == "hybrid_v2_1"
                         else "the t1 output only",
                         **(
@@ -242,7 +251,7 @@ class ScriptedProvider:
             return self.response({"values": {"0": 0}}, info)
         if role == "task":
             values = {str(row[0]): row[1] for row in result["rows"]}
-            if self.method == "hybrid_v2_1":
+            if self.method in {"hybrid_v2_1", "hybrid_v2_2"}:
                 values = {
                     "proposed_values": values,
                     "findings": [
@@ -277,7 +286,7 @@ class ScriptedProvider:
                 "evidence_refs": refs,
                 "evaluation": evaluation,
             }
-        elif role == "integrate" and self.method == "hybrid_v2_1":
+        elif role == "integrate" and self.method in {"hybrid_v2_1", "hybrid_v2_2"}:
             return self.response(
                 {
                     "values": values,
@@ -293,7 +302,7 @@ class ScriptedProvider:
                 },
                 info,
             )
-        elif role == "verify" and self.method == "hybrid_v2_1":
+        elif role == "verify" and self.method in {"hybrid_v2_1", "hybrid_v2_2"}:
             values = {
                 "status": "supported",
                 "claims_supported": True,

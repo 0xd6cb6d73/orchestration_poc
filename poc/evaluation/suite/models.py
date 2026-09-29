@@ -71,6 +71,7 @@ class Matrix(StrictModel):
                 "hybrid_v1": {"proposal", "critique", "verify"},
                 "hybrid_v2": {"orchestrate", "task", "critique", "integrate", "verify"},
                 "hybrid_v2_1": {"orchestrate", "task", "critique", "integrate", "verify"},
+                "hybrid_v2_2": {"orchestrate", "task", "critique", "integrate", "verify"},
             }
             allowed_phases = (
                 {"draft", "review", "finalize"}
@@ -79,7 +80,7 @@ class Matrix(StrictModel):
             )
             if method in team_phases:
                 allowed_phases = team_phases[method] | {"solve"}
-                if method in {"hybrid_v2", "hybrid_v2_1"}:
+                if method in {"hybrid_v2", "hybrid_v2_1", "hybrid_v2_2"}:
                     if options.stage_weights is not None:
                         raise ValueError(
                             "hybrid_v2 uses hybrid_pool_weights, not positional stage_weights"

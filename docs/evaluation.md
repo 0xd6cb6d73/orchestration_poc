@@ -162,6 +162,8 @@ controllers with trial-local authority and storage; they do not run the incident
 | `speculative` | Two authorized independent candidate submissions, followed by a model reconciliation and persisted reconciliation decision |
 | `hybrid_v1` | Two sealed board-claimed proposals, fresh critiques, controller selection, independent model verification, and the existing acceptance/delivery gates |
 | `hybrid_v2` | An LLM orchestrator decomposes the task into 2–8 small scoped tasks (with per-task scope and definition of done), two sealed plan candidates are judged and deterministically selected, tasks run in dependency waves with per-task critiques, an orchestrator decision loop (accept/revise/add/escalate) drives bounded revisions, and integration flows through the existing independent verification and delivery gates |
+| `hybrid_v2_1` | Evidence-oriented tasks with planner-assigned SQL table scopes and limits, dependency audits, partial-answer disclosure, and independent claim verification; see [v2.1 architecture](hybrid-v2.1-architecture.md) |
+| `hybrid_v2_2` | One conceptual, schema-free delegation plan is structurally validated and dispatched; specialists choose SQL sources, while evidence audits and final verification follow v2.1; see [v2.2 architecture](hybrid-v2.2-architecture.md) |
 
 Every method also has a `-json` variant. Discover registered strategies (including plugins):
 
@@ -476,7 +478,7 @@ cannot be borrowed. Default weights are:
 | DAG, board, pool | plan, solve | .20, .80 |
 | speculative | proposal, proposal, reconcile | .35, .35, .30 |
 | hybrid | proposal, proposal, critique, critique, verify | .30, .30, .12, .12, .16 |
-| hybrid_v2 | orchestrate, task, critique, integrate, verify (role pools) | .24, .30, .34, .05, .07 |
+| hybrid_v2, hybrid_v2_1, hybrid_v2_2 | orchestrate, task, critique, integrate, verify (role pools) | .24, .30, .34, .05, .07 |
 
 An explicit `stage_weights` list may override these; it must match the stage count
 and sum to one. These defaults are hypotheses to evaluate, not tuned success claims.

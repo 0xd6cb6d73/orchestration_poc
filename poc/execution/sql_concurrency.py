@@ -62,11 +62,15 @@ class ConcurrentTeamWorker:
         self.pool_planned: dict[str, int] = {}
         self.consumed = 0.0
         self.reserved = {"requests": 0, "tool_calls": 0, "total_tokens": 0}
-        if method in {"hybrid_v2", "hybrid_v2_1"}:
+        if method in {"hybrid_v2", "hybrid_v2_1", "hybrid_v2_2"}:
             shares = env.state.options.hybrid_pool_weights or ROLE_POOLS["hybrid_v2"]
             self.pool_shares = dict(shares)
             self.pool_planned = dict(POOL_PLANNED)
-            self.pool_planned["orchestrate"] = env.state.options.hybrid_plan_fanout
+            self.pool_planned["orchestrate"] = (
+                2 + env.state.options.hybrid_max_decision_rounds
+                if method == "hybrid_v2_2"
+                else env.state.options.hybrid_plan_fanout
+            )
             self.pool_planned["critique"] = env.state.options.hybrid_plan_fanout + 2
             self.index = 0
         else:
