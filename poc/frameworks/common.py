@@ -174,7 +174,10 @@ class RunBridge:
         *,
         responded: bool = False,
     ) -> None:
-        reservation = self.model_reservations.pop(request_id)
+        reservation = self.model_reservations.pop(request_id, None)
+        if reservation is None:
+            # A terminal close may already have reserved this in-flight call as unknown.
+            return
         if responded:
             self.environment.state.request_responses += 1
         if input_tokens is None or output_tokens is None or (input_tokens == output_tokens == 0):
@@ -255,6 +258,10 @@ class RunBridge:
         self.event("task.failed" if error else "task.succeeded", scope, result=result, error=error)
 
     def close(self) -> None:
+        # Some native runtimes return from cancellation before a provider task's
+        # finally block runs. Preserve uncertainty in the terminal report.
+        for request_id in tuple(self.model_reservations):
+            self.finish_model_request(request_id, None, None)
         for scope in self.scopes.values():
             self.environment.absorb(scope.environment)
             scope.environment.close()

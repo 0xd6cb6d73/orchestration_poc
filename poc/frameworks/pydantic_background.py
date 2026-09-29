@@ -67,7 +67,7 @@ async def _run_agent(bridge: RunBridge, scope: TaskScope, model: Model | str) ->
             "You may launch more than one independent delegation in a model response. "
             "The background tool's initial acknowledgement is not its result. "
             "Wait for actual child results. Do not repeat or poll pending delegations. "
-            "Call finish_task with JSON output once the task is complete, then reply done."
+            "Call finish_task with JSON output once the task is complete."
         ),
         capabilities=capabilities,
     )
@@ -119,7 +119,7 @@ async def _run_agent(bridge: RunBridge, scope: TaskScope, model: Model | str) ->
         bridge.event("task.finish_accepted", scope, used_result_ids=used_result_ids)
         return {"accepted": True}
 
-    result = await agent.run(
+    async with agent.iter(
         initial_prompt(bridge, scope),
         model_settings=bridge.settings,
         usage=bridge.usage,
@@ -127,12 +127,19 @@ async def _run_agent(bridge: RunBridge, scope: TaskScope, model: Model | str) ->
             request_limit=bridge.budget.requests,
             total_tokens_limit=bridge.budget.total_tokens,
         ),
-    )
+    ) as agent_run:
+        async for _ in agent_run:
+            # The tool node has executed when the next node is yielded. Stop before
+            # that next model request can run after an accepted submission.
+            if scope.finished is not None:
+                break
     if scope.active_children:
         raise RuntimeError("native run ended with unfinished child tasks")
     if scope.finished is None:
         raise RuntimeError("native run ended without accepted finish_task")
-    bridge.event("model.run_completed", scope, native_run_id=str(result.run_id))
+    bridge.event(
+        "model.run_stopped", scope, native_run_id=agent_run.run_id, reason="accepted_finish_task"
+    )
     return scope.finished
 
 

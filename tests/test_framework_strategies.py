@@ -221,6 +221,12 @@ async def test_pydantic_background_replans_on_early_result() -> None:
         )
         assert answer.values == {"x": 7}
         records = [e["framework"] for e in events if "framework" in e]
+        for i, record in enumerate(records):
+            if record["event_type"] == "task.finish_accepted":
+                assert not any(
+                    later["event_type"] == "model.request" and later["task_id"] == record["task_id"]
+                    for later in records[i + 1 :]
+                )
         c_dispatch = next(i for i, e in enumerate(records) if e.get("instruction") == "C")
         a_id = next(e["task_id"] for e in records if e.get("instruction") == "A")
         a_terminal = next(
@@ -707,6 +713,65 @@ async def test_llamaindex_reports_native_budget_failure_as_budget_exhausted(
         await run(bridge)
 
 
+async def test_llamaindex_wall_timeout_reports_inflight_usage_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("llama_index")
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+
+    from poc.frameworks import evaluation
+
+    assert evaluation.llamaindex_workflows is ADAPTERS["llamaindex_workflows"]
+
+    async def slow_completion(request: web.Request) -> web.Response:
+        await request.json()
+        await asyncio.sleep(3)
+        return web.json_response({})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", slow_completion)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = cast(tuple[str, int], runner.addresses[0])[1]
+        monkeypatch.setenv("POC_TEST_OPENAI_URL", f"http://127.0.0.1:{port}/v1")
+        monkeypatch.setenv("POC_TEST_OPENAI_KEY", "fixture")
+        spec = ModelSpec(
+            name="fixture",
+            model_class="baseline",
+            model="fixture",
+            base_url_env="POC_TEST_OPENAI_URL",
+            api_key_env="POC_TEST_OPENAI_KEY",
+        )
+        case = TaskCase(
+            id="framework-timeout",
+            family="ledger",
+            seed=0,
+            split="dev",
+            difficulty="standard",
+            input=TASK,
+            expected={"x": 7},
+        )
+        matrix = Matrix(
+            models=[spec],
+            strategies=["llamaindex_workflows"],
+            families=["ledger"],
+            seeds=[0],
+            budget=Budget(seconds=1, request_timeout_seconds=5),
+        )
+        trial = await run_trial(case, spec, "llamaindex_workflows", 0, matrix)
+        assert trial["status"] == "timeout"
+        assert trial["request_attempts"] == 1
+        assert trial["request_responses"] == 0
+        assert trial["usage_complete"] is False
+        assert trial["unreported_token_reserve"] > 0
+    finally:
+        await runner.cleanup()
+
+
 def test_framework_result_accepts_direct_json_object() -> None:
     from pydantic import ValidationError
 
@@ -723,6 +788,32 @@ def test_framework_result_accepts_direct_json_object() -> None:
     assert result_answer('{"values":{"x":7}}').values == {"x": 7}
     with pytest.raises(ValidationError):
         result_answer("[1,2,3]")
+
+
+def test_terminal_close_reserves_inflight_model_usage_as_unknown() -> None:
+    from poc.frameworks.common import RunBridge
+
+    env = TaskEnvironment(TASK, 10)
+    events: list[dict[str, Any]] = []
+    env.state.emit = events.append
+    usage = RunUsage()
+    bridge = RunBridge(TASK, env, Budget(total_tokens=100000), usage, {})
+    scope = bridge.start_task("root", TASK.prompt)
+    request_id = bridge.begin_model_request([{"role": "user", "content": "test"}], scope)
+    try:
+        bridge.close()
+        reserved = env.state.unreported_token_reserve
+        assert reserved > 0
+        assert env.state.usage_complete is False
+        assert any(
+            event.get("framework", {}).get("event_type") == "model.usage_unknown"
+            for event in events
+        )
+        bridge.finish_model_request(request_id, 10, 5, scope, responded=True)
+        assert env.state.unreported_token_reserve == reserved
+        assert env.state.request_responses == 0
+    finally:
+        env.close()
 
 
 async def test_pydantic_cancelled_model_request_marks_usage_incomplete() -> None:
