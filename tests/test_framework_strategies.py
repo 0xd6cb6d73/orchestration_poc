@@ -112,7 +112,10 @@ async def test_native_strategy_runs_evaluation_tool_boundary(
         )
         assert answer.values == {"x": 7}
         assert env.tool_calls == 1
-        assert calls >= 3
+        if strategy == "llamaindex_workflows":
+            assert calls == 2
+        else:
+            assert calls >= 3
         case = TaskCase(
             id="framework-fixture",
             family="ledger",
@@ -711,6 +714,85 @@ async def test_llamaindex_reports_native_budget_failure_as_budget_exhausted(
     bridge = RunBridge(TASK, env, Budget(total_tokens=1000), RunUsage(), {}, spec)
     with pytest.raises(UsageLimitExceeded):
         await run(bridge)
+
+
+async def test_llamaindex_rejected_finish_remains_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("llama_index")
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+
+    from poc.frameworks.evaluation import llamaindex_workflows
+
+    calls = 0
+
+    async def completion(request: web.Request) -> web.Response:
+        nonlocal calls
+        await request.json()
+        calls += 1
+        output = "[1,2,3]" if calls == 1 else '{"values":{"x":7}}'
+        return web.json_response(
+            {
+                "id": f"cmpl-{calls}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "fixture",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{calls}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "finish_task",
+                                        "arguments": json.dumps(
+                                            {"output": output, "used_result_ids": []}
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", completion)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = cast(tuple[str, int], runner.addresses[0])[1]
+        monkeypatch.setenv("POC_TEST_OPENAI_URL", f"http://127.0.0.1:{port}/v1")
+        monkeypatch.setenv("POC_TEST_OPENAI_KEY", "fixture")
+        spec = ModelSpec(
+            name="fixture",
+            model_class="baseline",
+            model="fixture",
+            base_url_env="POC_TEST_OPENAI_URL",
+            api_key_env="POC_TEST_OPENAI_KEY",
+        )
+        env = TaskEnvironment(TASK, 10)
+        env.state.model_spec = spec
+        try:
+            answer = await asyncio.wait_for(
+                llamaindex_workflows(TASK, env, "fixture", {}, Budget(), RunUsage()), 10
+            )
+            assert answer.values == {"x": 7}
+            assert calls == 2
+        finally:
+            env.close()
+    finally:
+        await runner.cleanup()
 
 
 async def test_llamaindex_wall_timeout_reports_inflight_usage_unknown(

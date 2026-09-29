@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from llama_index.core.agent.workflow import FunctionAgent
 from llama_index.core.agent.workflow.workflow_events import AgentWorkflowStartEvent
+from llama_index.core.tools import FunctionTool
 from llama_index.llms.openai_like import OpenAILike  # pyright: ignore[reportMissingTypeStubs]
 from pydantic_ai.exceptions import UsageLimitExceeded
 from workflows import Context, Workflow, step
@@ -116,20 +117,32 @@ class NativeWorkflow(Workflow):
         async def finish_task(output: str, used_result_ids: list[str]) -> str:
             """Propose final JSON output after all children are terminal."""
             if scope.active_children:
-                return json.dumps({"accepted": False, "pending": sorted(scope.active_children)})
+                raise ValueError(
+                    json.dumps({"accepted": False, "pending": sorted(scope.active_children)})
+                )
             if not set(used_result_ids) <= scope.completed_children:
-                return json.dumps({"accepted": False, "reason": "unknown result ID"})
+                raise ValueError(json.dumps({"accepted": False, "reason": "unknown result ID"}))
             try:
                 result_answer(output)
-            except Exception:
-                return json.dumps(
-                    {"accepted": False, "reason": "output must be a JSON object of answer fields"}
-                )
+            except Exception as exc:
+                raise ValueError(
+                    json.dumps(
+                        {
+                            "accepted": False,
+                            "reason": "output must be a JSON object of answer fields",
+                        }
+                    )
+                ) from exc
             scope.finished = output
             self.bridge.event("task.finish_accepted", scope, used_result_ids=used_result_ids)
             return json.dumps({"accepted": True})
 
-        tools: list[Any] = [query_sql, finish_task]
+        # Native return_direct stops the FunctionAgent on an accepted submission.
+        # Rejected submissions raise tool errors, which remain retryable.
+        tools: list[Any] = [
+            query_sql,
+            FunctionTool.from_defaults(async_fn=finish_task, return_direct=True),
+        ]
         if scope.role == "leaf" and self.bridge.approvals is not None:
 
             async def write_ledger(entry: str) -> str:
@@ -152,7 +165,7 @@ class NativeWorkflow(Workflow):
                 f"You are a {scope.role}. Use tools to solve the task. You may delegate "
                 "independent work in parallel. A started acknowledgement is not a result. "
                 "Wait for child completion messages. Call finish_task with JSON output "
-                "only after all children finish, then reply done."
+                "only after all children finish."
             ),
             tools=tools,
             llm=self.llm,

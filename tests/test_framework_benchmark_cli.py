@@ -146,7 +146,7 @@ async def test_framework_benchmark_cli(
         assert process.returncode == 0, (stdout.decode()[-2000:], stderr.decode()[-2000:])
         report = read_report(output)
         repetitions = 1 if family == "authorization" else 2
-        if backend == "pydantic":
+        if backend in {"pydantic", "llamaindex"}:
             assert model_calls == 2 * repetitions
         assert report["coverage"] == {
             "expected": repetitions,
