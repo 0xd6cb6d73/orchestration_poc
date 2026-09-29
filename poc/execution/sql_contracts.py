@@ -107,6 +107,7 @@ class ArchitectureOptions(StrictModel):
     hybrid_pool_weights: dict[str, float] | None = None
     speculative_failure_policy: Literal["fail", "return_first_submitted"] = "fail"
     stage_weights: list[float] | None = None
+    framework_max_tasks: int = Field(default=16, ge=1)
 
     @model_validator(mode="after")
     def valid_stage_weights(self) -> ArchitectureOptions:

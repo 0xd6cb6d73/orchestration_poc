@@ -81,6 +81,7 @@ async def run_trial(
     env.state = TrialState(case.input, matrix.architecture_options.get(strategy), emit)
     # Both timeout scopes share an absolute deadline, including setup time.
     env.state.started = started
+    env.state.model_spec = spec
     deadline = started + matrix.budget.seconds
     answer = Answer(values={})
     error: str | None = None
@@ -98,9 +99,16 @@ async def run_trial(
         context = span.get_span_context()
         trace_id = format(context.trace_id, "032x") if context.is_valid else None
         try:
-            model = "test" if strategy == "sql-baseline" else resolve_model(spec)
+            selected_adapter = ADAPTERS[strategy]
+            model = (
+                "test"
+                if strategy == "sql-baseline"
+                else spec.model
+                if getattr(selected_adapter, "native_model_spec", False)
+                else resolve_model(spec)
+            )
             async with asyncio.timeout(max(0, deadline - perf_counter())):
-                answer = await ADAPTERS[strategy](
+                answer = await selected_adapter(
                     case.input.model_copy(deep=True),
                     env,
                     model,

@@ -1,0 +1,38 @@
+{
+  "models": [
+    {
+      "name": "framework-model",
+      "model_class": "7B",
+      "model": "meta-llama/llama-3.1-8b-instruct",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "settings": {
+        "temperature": 0
+      }
+    }
+  ],
+  "families": [
+    "scheduling",
+    "routing"
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "split": "dev",
+  "difficulty": "standard",
+  "repetitions": 2,
+  "budget": {
+    "requests": 40,
+    "tool_calls": 80,
+    "total_tokens": 100000,
+    "seconds": 300
+  },
+  "max_concurrency": 1,
+  "strategies": [
+    "llamaindex_workflows"
+  ]
+}

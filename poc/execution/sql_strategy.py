@@ -98,6 +98,15 @@ class ContextBoundModel(WrapperModel):
         self.completion_limit = completion_limit
         self.role_profiles = role_profiles or {}
 
+    @property
+    def context_window(self) -> int | None:
+        """Configured admission limit, including on newer Pydantic AI wrappers."""
+        return self._configured_context_window
+
+    @context_window.setter
+    def context_window(self, value: int | None) -> None:
+        self._configured_context_window = value
+
     def admit(
         self,
         messages: list[ModelMessage],

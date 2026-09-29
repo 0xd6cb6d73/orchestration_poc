@@ -12,7 +12,7 @@ from typing import Any
 from opentelemetry import trace
 
 from poc.evaluation.suite.diagnostics import diagnose
-from poc.evaluation.suite.models import Answer, ArchitectureOptions, TaskInput
+from poc.evaluation.suite.models import Answer, ArchitectureOptions, ModelSpec, TaskInput
 from poc.execution.sql_ports import (
     PhaseTimeout as PhaseTimeout,
 )
@@ -32,6 +32,7 @@ class TrialState:
         emit: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.task = task
+        self.model_spec: ModelSpec | None = None
         self.options = options or ArchitectureOptions()
         self.emit: Callable[[dict[str, Any]], None] = emit or (lambda event: None)
         self.started = perf_counter()

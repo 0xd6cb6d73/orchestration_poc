@@ -402,6 +402,10 @@ cases contain about 61 MB of public evidence; all data is generated from checked
 code and can be exported under ignored `var/`. Agents can replay configuration changes
 through SQL, and hidden requests check the resulting access behavior.
 
+The [native framework POC guide](docs/framework-strategies.md) explains the Strands,
+Pydantic AI Harness, and LlamaIndex Workflows evaluation strategies and their current
+conformance results.
+
 See [the evaluation suite guide](docs/evaluation.md) for seeded reconciliation, dependency,
 access-policy, resource-constrained scheduling and vehicle-routing tasks; six configurable small-model entries;
 single-agent/review comparisons under shared budgets; and Phoenix datasets, experiments and traces.

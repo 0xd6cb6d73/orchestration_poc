@@ -1,0 +1,38 @@
+{
+  "models": [
+    {
+      "name": "deepseek-v4-flash-0731",
+      "model_class": "frontier-flash",
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "base_url_env": "OPENAI_BASE_URL",
+      "api_key_env": "OPENAI_API_KEY",
+      "context_window": 1048576,
+      "settings": {
+        "temperature": 0
+      }
+    }
+  ],
+  "strategies": [
+    "pydantic_background"
+  ],
+  "families": [
+    "authorization"
+  ],
+  "seeds": [
+    0,
+    1,
+    2
+  ],
+  "split": "dev",
+  "difficulty": "standard",
+  "repetitions": 1,
+  "max_concurrency": 1,
+  "budget": {
+    "requests": 300,
+    "tool_calls": 400,
+    "total_tokens": 100000000,
+    "seconds": 1800,
+    "request_timeout_seconds": 900,
+    "max_output_tokens": 65536
+  }
+}
